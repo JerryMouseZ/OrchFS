@@ -86,31 +86,31 @@ extern "C"{
 
 
 // device
-#define ORCH_DEV_NVM_PATH     "/dev/dax0.0"
-#define ORCH_DEV_SSD_PATH     "/dev/nvme12n1"
+#define ORCH_DEV_NVM_PATH     "/dev/dax0.1"
+#define ORCH_DEV_SSD_PATH     "/dev/nvme1n1"
 
 // threads
-#define ORCH_CONFIG_NVMTHD     5
-#define ORCH_CONFIG_SSDTHD     32
+#define ORCH_CONFIG_NVMTHD     4
+#define ORCH_CONFIG_SSDTHD     16
 
 // SPLIT
 #define ORCH_MAX_SPLIT_BLK     1
 
 #define ORCH_INODE_BITLOCK_SLOTS        65536
 #define ORCH_INODE_RW_SLOTS			    65536
-// #define ORCH_MAX_NAME				    231
+#define ORCH_MAX_NAME				    231
 #define ORCH_MAGIC_NAME            	    "ComFS_v1.0"
 #define ORCH_MAGIC_NUM            	    0x37356217
 
 #define ORCH_FAILSAFE_NFRAMES		    32
 
-#define FILEBENCH
+// #define FILEBENCH
 // #define SSD_NOT_PARALLEL
 #ifdef FILEBENCH
     // pass
 #else
     // #define MIGRATTE_ON
-    #define COUNT_ON
+    // #define COUNT_ON
     // #define COUNT_TIME
 #endif
 

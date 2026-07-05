@@ -126,7 +126,7 @@
 #ifdef _STAT_VER
 #define ALIAS_FXSTAT __fxstat
 #else 
-#define ALIAS_STAT fstat 
+#define ALIAS_FSTAT fstat
 #endif
 
 #define ALIAS_STAT64 stat64 

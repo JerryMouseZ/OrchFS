@@ -7,7 +7,10 @@ set(ProjectName OrchFS)
 project(${ProjectName})
 
 
-add_definitions(-O3 -fPIC -mclwb -mclflushopt -Wall -pthread -mavx512f)
+add_definitions(-O3 -fPIC -mclwb -mclflushopt -Wall -pthread -mavx512f -fcommon
+    -Wno-error=implicit-function-declaration
+    -Wno-error=incompatible-pointer-types
+    -Wno-error=int-conversion)
 # set(CMAKE_CXX_STANDARD 17)
 # set(CMAKE_CXX_STANDARD_REQUIRED True)
 

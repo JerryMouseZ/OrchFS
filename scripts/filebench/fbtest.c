@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
 
 void get_new_cmd(char new_cmd[], char* cmd, const char* argv[], int argv_num)
 {
