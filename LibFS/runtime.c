@@ -362,7 +362,7 @@ int64_t get_unused_fd(int64_t inode_id, int mode)
 
             orch_rt.fd_info[now_fd_cur].used_flag = FD_USED;
             orch_rt.fd_info[now_fd_cur].rw_offset = 0;
-            orch_rt.fd_info[now_fd_cur].flags = 0;
+			orch_rt.fd_info[now_fd_cur].flags = mode;
             orch_rt.fd_info[now_fd_cur].open_inot_idx = inot_idx;
             pthread_spin_unlock(&(orch_rt.fd_lock));
             // fprintf(stderr,"unlock: %d\n",i);
@@ -373,10 +373,8 @@ int64_t get_unused_fd(int64_t inode_id, int mode)
     pthread_spin_unlock(&(orch_rt.fd_lock));
     goto open_file_num_error;
 open_file_num_error:
-    printf("The open file is too much\n");
-    fflush(stdout);
-    assert(1==0);
-    return -1;
+	errno = EMFILE;
+	return -1;
 }
 
 void release_fd(int fd)

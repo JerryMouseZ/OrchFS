@@ -8,13 +8,44 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/vfs.h>
+#include <dirent.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <sched.h>
 
-#include "lib_dir.h"
-#include "orchfs.h"
-#include "runtime.h"
+#include "async_adapter.h"
 #include <boost/preprocessor/seq/for_each.hpp>
 #include "../config/config.h"
-#include "ffile.h"
+
+/* The preload boundary remains synchronous, but every OrchFS operation now
+ * crosses the C++20 client Runtime through this blocking adapter. */
+#define orchfs_open orchfs_async_open
+#define orchfs_openat orchfs_async_openat
+#define orchfs_close orchfs_async_close
+#define orchfs_read orchfs_async_read
+#define orchfs_write orchfs_async_write
+#define orchfs_pread orchfs_async_pread
+#define orchfs_pwrite orchfs_async_pwrite
+#define orchfs_lseek orchfs_async_lseek
+#define orchfs_stat orchfs_async_stat
+#define orchfs_fstat orchfs_async_fstat
+#define orchfs_statfs orchfs_async_statfs
+#define orchfs_fstatfs orchfs_async_fstatfs
+#define orchfs_truncate orchfs_async_truncate
+#define orchfs_ftruncate orchfs_async_ftruncate
+#define orchfs_fsync orchfs_async_fsync
+#define orchfs_fcntl orchfs_async_fcntl
+#define orchfs_mkdir orchfs_async_mkdir
+#define orchfs_rmdir orchfs_async_rmdir
+#define orchfs_unlink orchfs_async_unlink
+#define orchfs_rename orchfs_async_rename
+#define orchfs_opendir orchfs_async_opendir
+#define orchfs_readdir orchfs_async_readdir
+#define orchfs_closedir orchfs_async_closedir
 // #define WRAPPER_DEBUG
 
 // #ifdef __cplusplus       
@@ -29,6 +60,59 @@
 
 #define ORCH_FD_OFFSET 1048576
 // #define ORCH_FD_OFFSET 10000000
+
+static int has_orchfs_prefix(const char *path)
+{
+	return path != NULL && strncmp(path, "/Or", 3) == 0 &&
+		(path[3] == '/' || path[3] == '\0');
+}
+
+static const char *strip_orchfs_prefix(const char *path)
+{
+	return path[3] == '\0' ? "/" : path + 3;
+}
+
+static int open_needs_mode(int flags)
+{
+	if((flags & O_CREAT) != 0)
+		return 1;
+#ifdef O_TMPFILE
+	if((flags & O_TMPFILE) == O_TMPFILE)
+		return 1;
+#endif
+	return 0;
+}
+
+static int should_fallback_relative_path(int adapter_was_ready)
+{
+	/* If a live OrchFS session fails with a transport or storage error, silently
+	 * retrying in the host namespace can corrupt an unrelated same-named file.
+	 * Only a genuine lookup miss, or an adapter that was absent before the call,
+	 * is an intentional relative-path fallback. */
+	return orchfs_async_adapter_allow_host_fallback(adapter_was_ready, errno);
+}
+
+static int should_fallback_openat_relative_path(int adapter_was_ready,
+						 int dirfd)
+{
+	/* A relative path paired with an OrchFS virtual descriptor names only the
+	 * OrchFS namespace.  Passing that descriptor to libc would replace the
+	 * useful OrchFS error with EBADF (and could cross namespaces if descriptor
+	 * encodings ever change).  AT_FDCWD is the sole ambiguous relative case. */
+	return dirfd == AT_FDCWD &&
+		should_fallback_relative_path(adapter_was_ready);
+}
+
+static int should_fallback_mutating_relative_path(int adapter_was_ready)
+{
+	/* Once a live OrchFS namespace has selected this operation, an ENOENT is
+	 * authoritative. Retrying rename in the host cwd could move an unrelated
+	 * same-named host file. Preserve host-only operation when the adapter was
+	 * unavailable before it had ever connected, but never cross namespaces
+	 * after an OrchFS lookup was attempted successfully. */
+	return !adapter_was_ready &&
+		should_fallback_relative_path(adapter_was_ready);
+}
 
 // int64_t all_read_size;
 
@@ -66,6 +150,7 @@
 #define ALIAS_FFLUSH	fflush 
 
 #define ALIAS_FSTATFS	fstatfs 
+#define ALIAS_STATFS	statfs
 #define ALIAS_FDATASYNC	fdatasync 
 #define ALIAS_FCNTL		fcntl 
 #define ALIAS_FCNTL2	__fcntl64_nocancel_adjusted 
@@ -171,6 +256,7 @@
 // #endif
 
 #define RETT_FSTATFS	int
+#define RETT_STATFS	int
 #define RETT_FDATASYNC	int
 #define RETT_FCNTL		int
 #define RETT_FCNTL2		int
@@ -284,6 +370,7 @@
 // #endif
 
 #define INTF_FSTATFS	int fd, struct statfs *buf
+#define INTF_STATFS	const char *path, struct statfs *buf
 #define INTF_FDATASYNC	int fd
 #define INTF_FCNTL		int fd, int cmd, ...
 #define INTF_FCNTL2		int fd, int cmd, void *arg
@@ -398,6 +485,7 @@
 // #endif
 
 #define M_INTF_FSTATFS	int fd, struct statfs *buf
+#define M_INTF_STATFS	const char *path, struct statfs *buf
 #define M_INTF_FDATASYNC	int fd
 #define M_INTF_FCNTL		int fd, int cmd, ...
 #define M_INTF_FCNTL2		int fd, int cmd, void *arg
@@ -471,19 +559,19 @@
 
 
 #ifdef _STAT_VER
-#define ORCHFS_ALL_OPS	(OPEN) (LIBC_OPEN64) (OPENAT) (CREAT) (CLOSE) (ACCESS) \
-						(SEEK) (TRUNC) (FTRUNC) (LINK) (UNLINK) (FSYNC) \
+#define ORCHFS_ALL_OPS	(OPEN) (OPEN64) (LIBC_OPEN64) (OPENAT) (CREAT) (CLOSE) (ACCESS) \
+						(SEEK) (SEEK64) (TRUNC) (FTRUNC) (FTRUNC64) (LINK) (UNLINK) (FSYNC) \
 						(READ) (READ2) (WRITE) (PREAD) (PREAD64) (PWRITE) (PWRITE64) (XSTAT) (STAT64) (FXSTAT) (FSTAT64) (LSTAT) (RENAME)\
-						(MKDIR) (RMDIR) (FSTATFS) (FDATASYNC) (FCNTL) (FCNTL2) \
-						(OPENDIR) (CLOSEDIR) (READDIR) (READDIR64) (ERROR) (SYNC_FILE_RANGE) \
-						(FOPEN) (FPUTS) (FGETS) (FWRITE) (FREAD) (FCLOSE) (FSEEK) (FFLUSH)
+						(MKDIR) (RMDIR) (STATFS) (FSTATFS) (FDATASYNC) (FCNTL) (FCNTL2) \
+						(OPENDIR) (CLOSEDIR) (READDIR) (READDIR64) (SYNC_FILE_RANGE) \
+							(FOPEN) (FOPEN64) (FPUTS) (FGETS) (FWRITE) (FREAD) (FCLOSE) (FSEEK) (FFLUSH)
 #else 
-#define ORCHFS_ALL_OPS	(OPEN) (LIBC_OPEN64) (OPENAT) (CREAT) (CLOSE) (ACCESS) \
-						(SEEK) (TRUNC) (FTRUNC) (LINK) (UNLINK) (FSYNC) \
+#define ORCHFS_ALL_OPS	(OPEN) (OPEN64) (LIBC_OPEN64) (OPENAT) (CREAT) (CLOSE) (ACCESS) \
+						(SEEK) (SEEK64) (TRUNC) (FTRUNC) (FTRUNC64) (LINK) (UNLINK) (FSYNC) \
 						(READ) (READ2) (WRITE) (PREAD) (PREAD64) (PWRITE) (PWRITE64) (STAT) (STAT64) (FSTAT) (FSTAT64) (LSTAT) (RENAME)\
-						(MKDIR) (RMDIR) (FSTATFS) (FDATASYNC) (FCNTL) (FCNTL2) \
-						(OPENDIR) (CLOSEDIR) (READDIR) (READDIR64) (ERROR) (SYNC_FILE_RANGE) \
-						(FOPEN) (FPUTS) (FGETS) (FWRITE) (FREAD) (FCLOSE) (FSEEK) (FFLUSH)
+						(MKDIR) (RMDIR) (STATFS) (FSTATFS) (FDATASYNC) (FCNTL) (FCNTL2) \
+						(OPENDIR) (CLOSEDIR) (READDIR) (READDIR64) (SYNC_FILE_RANGE) \
+							(FOPEN) (FOPEN64) (FPUTS) (FGETS) (FWRITE) (FREAD) (FCLOSE) (FSEEK) (FFLUSH)
 #endif
 
 
@@ -500,13 +588,65 @@ static struct real_ops{
 	#define DEC_REL_SYSCALL(op) 	real_##op##_t op;
 	#define DEC_REL_SYSCALL_WRAP(r, data, elem) 	DEC_REL_SYSCALL(elem)
 	BOOST_PP_SEQ_FOR_EACH(DEC_REL_SYSCALL_WRAP, placeholder, ORCHFS_ALL_OPS)
-} real_ops;
+} real_ops_storage;
 
-void insert_real_op(){
-	#define FILL_REL_SYSCALL(op) 	real_ops.op = dlsym(RTLD_NEXT, MK_STR3(ALIAS_##op));
+static atomic_int real_ops_state = ATOMIC_VAR_INIT(0);
+static _Thread_local int resolving_real_ops;
+
+static void insert_real_op(void)
+{
+	int state = atomic_load_explicit(&real_ops_state, memory_order_acquire);
+	if(state == 2)
+		return;
+
+	int expected = 0;
+	if(!atomic_compare_exchange_strong_explicit(
+			&real_ops_state, &expected, 1,
+			memory_order_acq_rel, memory_order_acquire)){
+		/* dlsym is not expected to re-enter these wrappers, but returning the
+		 * partially populated table avoids a same-thread deadlock if a loader
+		 * implementation does so. Other threads wait until publication. */
+		if(resolving_real_ops)
+			return;
+		while(atomic_load_explicit(&real_ops_state,
+									  memory_order_acquire) != 2)
+			sched_yield();
+		return;
+	}
+
+	resolving_real_ops = 1;
+	#define FILL_REL_SYSCALL(op) do { \
+		void *symbol = dlsym(RTLD_NEXT, MK_STR3(ALIAS_##op)); \
+		_Static_assert(sizeof(real_ops_storage.op) == sizeof(symbol), \
+					   "POSIX function pointer size mismatch"); \
+		memcpy(&real_ops_storage.op, &symbol, sizeof(symbol)); \
+	} while(0);
 	#define FILL_REL_SYSCALL_WRAP(r, data, elem) 	FILL_REL_SYSCALL(elem)
 	BOOST_PP_SEQ_FOR_EACH(FILL_REL_SYSCALL_WRAP, placeholder, ORCHFS_ALL_OPS)
+	/* These glibc-private entry points are absent on some releases. Their
+	 * public equivalents have the same contract used by the wrappers. */
+	if(real_ops_storage.LIBC_OPEN64 == NULL)
+		real_ops_storage.LIBC_OPEN64 = real_ops_storage.OPEN64;
+	if(real_ops_storage.READ2 == NULL)
+		real_ops_storage.READ2 = real_ops_storage.READ;
+	if(real_ops_storage.FCNTL2 == NULL){
+		_Static_assert(sizeof(real_ops_storage.FCNTL2) ==
+					   sizeof(real_ops_storage.FCNTL),
+					   "POSIX function pointer size mismatch");
+		memcpy(&real_ops_storage.FCNTL2, &real_ops_storage.FCNTL,
+			   sizeof(real_ops_storage.FCNTL2));
+	}
+	resolving_real_ops = 0;
+	atomic_store_explicit(&real_ops_state, 2, memory_order_release);
 }
+
+static struct real_ops *get_real_ops(void)
+{
+	insert_real_op();
+	return &real_ops_storage;
+}
+
+#define real_ops (*get_real_ops())
 #define OP_DEFINE(op)		RETT_##op ALIAS_##op(INTF_##op)
 
 static int inited = 0;
@@ -517,7 +657,7 @@ OP_DEFINE(OPEN){
 		insert_real_op();
 	}
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	// fprintf(stderr,"open call\n");
 	// fprintf(stderr,"open %s\n",path);
@@ -525,7 +665,8 @@ OP_DEFINE(OPEN){
 	if(*path == '\\' || *path != '/' || path[1] == '\\' || dirflag){
 		// printf("myopen call! %s %d\n", path, oflag & O_CREAT);
 		int ret;
-		if(oflag & O_CREAT){
+		int adapter_was_ready = orchfs_async_adapter_ready();
+		if(open_needs_mode(oflag)){
 			// fprintf(stderr,"open 111111\n");
 			va_list ap;
 			mode_t mode;
@@ -534,19 +675,17 @@ OP_DEFINE(OPEN){
 			//printf("222222\n");
 			PRINT_FUNC;
 
-			char * p = path;
+			const char * p = path;
 			while(*p == '\\'){
 				p ++;
 			}
-			if(p[1] == '\\'){
-				p++;
-				*p = '/';
-			}
 			if(dirflag)
-				p+=3;
+					p=strip_orchfs_prefix(path);
 			ret = orchfs_open(p, oflag, mode);
+			va_end(ap);
 			// fprintf(stderr,"O_CREAT open ret=%d\n",ret+1024);
-			if(ret == -1 && *path != '\\' && !dirflag){
+			if(ret == -1 && *path != '\\' && !dirflag &&
+			   should_fallback_relative_path(adapter_was_ready)){
 				return real_ops.OPEN(path, oflag, mode);
 			}
 		}
@@ -555,61 +694,29 @@ OP_DEFINE(OPEN){
 			if(*path=='\\')
 				ret = orchfs_open(path + 1, oflag);
 			else if(dirflag)
-				ret = orchfs_open(path + 3, oflag);
+					ret = orchfs_open(strip_orchfs_prefix(path), oflag);
 			else ret=orchfs_open(path,oflag);
 			// printf("open ret=%d\n",ret);
-			if(ret == -1 && *path != '\\' &&!dirflag){
+			if(ret == -1 && *path != '\\' && !dirflag &&
+			   should_fallback_relative_path(adapter_was_ready)){
 
 				return real_ops.OPEN(path, oflag);
 			}
 		}
 		if(ret == -1){
-			exit(0);
-			int len=strlen(path);
-			//printf("len=%d path[len-4]=%c path[len-3]=%c path[len-2]=%c path[len-1]=%c\n",len,path[len-4],path[len-3],path[len-2],path[len-1]);
-			char newpath[20];
-			strcpy(newpath,path);
-			// if(path[len-4]=='.'&&path[len-3]=='s'&&path[len-2]=='s'&&path[len-1]=='t')
-			// {
-			// 	newpath[len-3]='l';newpath[len-2]='d';newpath[len-1]='b';newpath[len]='\0';
-			// }
-			// printf("my open error\n");
-			// printf("test open again!\n");
-			// printf("open again path=%s dirflag=%d\n",newpath,dirflag);
-			// va_list ap;
-			// oflag|=O_CREAT;
-			// oflag|=O_RDWR;
-			if(*path=='\\')
-				ret = orchfs_open(newpath + 1, oflag);
-			else if(dirflag)
-				ret = orchfs_open(newpath + 3, oflag);
-			else ret=orchfs_open(newpath,oflag);
-			// fprintf(stderr,"open again ret=%d\n",ret+1024);
-			// if(oflag & O_CREAT)
-			// 	printf("O_CREAT\n");
-			// if(oflag & O_RDONLY)
-			// 	printf("O_RDONLY\n");
-			// if(oflag & O_WRONLY)
-			// 	printf("O_WRONLY\n");
-			// if(oflag & O_RDWR)
-			// 	printf("O_RDWR\n");
-			// if(oflag & O_APPEND)
-			// 	printf("O_APPEND\n");
-			// if(oflag & O_SYNC)
-			// 	printf("O_SYNC\n");
-			// exit(0);
-			return ret;
+			return -1;
 		}
 		return ret + ORCH_FD_OFFSET;
 	}
 	else{
 		// fprintf(stderr,"real open:%s\n",path);
-		if(oflag & O_CREAT){
+		if(open_needs_mode(oflag)){
 			va_list ap;
-			mode_t mode;
-			va_start(ap, oflag);
-			mode = va_arg(ap, mode_t);
-			return real_ops.OPEN(path, oflag, mode);
+				mode_t mode;
+				va_start(ap, oflag);
+				mode = va_arg(ap, mode_t);
+				va_end(ap);
+				return real_ops.OPEN(path, oflag, mode);
 		}
 		else{
 			int ret_fd = real_ops.OPEN(path, oflag);
@@ -620,11 +727,27 @@ OP_DEFINE(OPEN){
 	}
 }
 
+OP_DEFINE(OPEN64){
+	if(open_needs_mode(oflag)){
+		va_list ap;
+		va_start(ap, oflag);
+		mode_t mode = va_arg(ap, mode_t);
+		va_end(ap);
+		return open(path, oflag, mode);
+	}
+	return open(path, oflag);
+}
+
 
 OP_DEFINE(LIBC_OPEN64){
-	fprintf(stderr,"libc_open call\n");
-	fflush(stdout);
-	exit(1);
+	if(open_needs_mode(oflag)){
+		va_list ap;
+		va_start(ap, oflag);
+		mode_t mode = va_arg(ap, mode_t);
+		va_end(ap);
+		return open(path, oflag, mode);
+	}
+	return open(path, oflag);
 	// printf("libc_open %s\n",path);
 // 	int dirflag=0;
 // 	if(path[0]=='/'&&path[1]='O'&&path[2]=='r')
@@ -687,40 +810,57 @@ OP_DEFINE(LIBC_OPEN64){
 }
 
 OP_DEFINE(OPENAT){
-	printf("openat call %s\n",path);
-	fflush(stdout);
 	// printf("openat %s\n",path);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
+	if(*path != '/' && *path != '\\' && dirfd != AT_FDCWD &&
+	   dirfd < ORCH_FD_OFFSET){
+		if(open_needs_mode(oflag)){
+			va_list ap;
+			va_start(ap, oflag);
+			mode_t mode = va_arg(ap, mode_t);
+			va_end(ap);
+			return real_ops.OPENAT(dirfd, path, oflag, mode);
+		}
+		return real_ops.OPENAT(dirfd, path, oflag);
+	}
 	if(*path == '\\' || *path != '/' || dirflag){
 		//printf("my openat\n");
 		int ret;
-		if(oflag & O_CREAT){
+		int adapter_was_ready = orchfs_async_adapter_ready();
+		int adapter_dirfd = dirfd >= ORCH_FD_OFFSET ?
+							dirfd - ORCH_FD_OFFSET : dirfd;
+		if(open_needs_mode(oflag)){
 			va_list ap;
 			mode_t mode;
 			va_start(ap, oflag);
 			mode = va_arg(ap, mode_t);
 			PRINT_FUNC;
 			if(*path=='\\')
-				ret = orchfs_openat(dirfd - ORCH_FD_OFFSET,path + 1, oflag, mode);
+				ret = orchfs_openat(adapter_dirfd,path + 1, oflag, mode);
 			else if(dirflag)
-				ret = orchfs_openat(dirfd - ORCH_FD_OFFSET,path + 3, oflag, mode);
-			else ret = orchfs_openat(dirfd - ORCH_FD_OFFSET,path, oflag, mode);
+					ret = orchfs_openat(adapter_dirfd,strip_orchfs_prefix(path), oflag, mode);
+			else ret = orchfs_openat(adapter_dirfd,path, oflag, mode);
+			va_end(ap);
 			//ret = orchfs_openat(dirfd - ORCH_FD_OFFSET, (*path == '\\')? path + 1 : path, oflag, mode);
-			if(ret == -1 && *path != '\\' && !dirflag){
+			if(ret == -1 && *path != '\\' && !dirflag &&
+			   should_fallback_openat_relative_path(adapter_was_ready,
+									 dirfd)){
 				return real_ops.OPENAT(dirfd, path, oflag, mode);
 			}
 		}
 		else{
 			PRINT_FUNC;
 			if(*path=='\\')
-				ret = orchfs_openat(dirfd - ORCH_FD_OFFSET,path + 1, oflag);
+				ret = orchfs_openat(adapter_dirfd,path + 1, oflag);
 			else if(dirflag)
-				ret = orchfs_openat(dirfd - ORCH_FD_OFFSET,path + 3, oflag);
-			else ret = orchfs_openat(dirfd - ORCH_FD_OFFSET,path, oflag);
+					ret = orchfs_openat(adapter_dirfd,strip_orchfs_prefix(path), oflag);
+			else ret = orchfs_openat(adapter_dirfd,path, oflag);
 			//ret = orchfs_openat(dirfd - ORCH_FD_OFFSET, (*path == '\\')? path + 1 : path, oflag);
-			if(ret == -1 && *path != '\\' && !dirflag){
+			if(ret == -1 && *path != '\\' && !dirflag &&
+			   should_fallback_openat_relative_path(adapter_was_ready,
+									 dirfd)){
 				return real_ops.OPENAT(dirfd, path, oflag);
 			}
 		}
@@ -730,12 +870,13 @@ OP_DEFINE(OPENAT){
 		return ret + ORCH_FD_OFFSET;
 	}
 	else{
-		if(oflag & O_CREAT){
+		if(open_needs_mode(oflag)){
 			va_list ap;
-			mode_t mode;
-			va_start(ap, oflag);
-			mode = va_arg(ap, mode_t);
-			return real_ops.OPENAT(dirfd, path, oflag, mode);
+				mode_t mode;
+				va_start(ap, oflag);
+				mode = va_arg(ap, mode_t);
+				va_end(ap);
+				return real_ops.OPENAT(dirfd, path, oflag, mode);
 		}
 		else{
 			return real_ops.OPENAT(dirfd, path, oflag);
@@ -748,26 +889,25 @@ OP_DEFINE(CREAT){
 	// fflush(stdout);
 	// printf("creat path=%s\n",path);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		PRINT_FUNC;
 		// printf("my creat\n");
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
-			ret = orchfs_open(path + 1,O_CREAT, mode);
+			ret = orchfs_open(path + 1,O_WRONLY | O_CREAT | O_TRUNC, mode);
 		else if(dirflag)
-			ret = orchfs_open(path + 3,O_CREAT, mode);
+			ret = orchfs_open(strip_orchfs_prefix(path),O_WRONLY | O_CREAT | O_TRUNC, mode);
 		else 
-			ret = orchfs_open(path, O_CREAT, mode);
+			ret = orchfs_open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
 		//int ret = orchfs_open((*path == '\\')? path + 1 : path, O_CREAT, mode);
-		if(ret == -1 && *path != '\\' && !dirflag){
+		if(ret == -1 && *path != '\\' && !dirflag &&
+		   should_fallback_relative_path(adapter_was_ready)){
 			return real_ops.CREAT(path, mode);
 		}
-		if(ret != -1){
-			orchfs_close(ret);
-		}
-		return 0;
+		return ret == -1 ? -1 : ret + ORCH_FD_OFFSET;
 	}
 	else{
 		return real_ops.CREAT(path, mode);
@@ -793,32 +933,24 @@ OP_DEFINE(ACCESS){
 	// printf("access %s\n",pathname);
 	// fflush(stdout);
 	int dirflag=0;
-	if(pathname[0]=='/'&&pathname[1]=='O'&&pathname[2]=='r')
+	if(has_orchfs_prefix(pathname))
 		dirflag=1;
 	if(*pathname == '\\' || *pathname != '/' ||dirflag){
 		// PRINT_FUNC;
 		// printf("my access %d\n",dirflag);
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*pathname=='\\')
-		{
-			ret = orchfs_open(pathname + 1, mode);
-		}
+			ret = orchfs_async_access(pathname + 1, mode);
 		else if(dirflag)
-		{
-			ret = orchfs_open(pathname + 3, mode);
-		}
-		else 
-		{
-			ret = orchfs_open(pathname, mode);
-		}
-		//int ret = orchfs_access((*pathname == '\\')? pathname + 1 : pathname, mode);
-		if(ret == -1 && *pathname != '\\' && !dirflag){
+			ret = orchfs_async_access(strip_orchfs_prefix(pathname), mode);
+		else
+			ret = orchfs_async_access(pathname, mode);
+		if(ret == -1 && *pathname != '\\' && !dirflag &&
+		   should_fallback_relative_path(adapter_was_ready)){
 			return real_ops.ACCESS(pathname, mode);
 		}
-		if(ret != -1){
-			return 0;
-		}
-		return -1;
+		return ret;
 	}
 	else{
 		return real_ops.ACCESS(pathname, mode);
@@ -839,25 +971,34 @@ OP_DEFINE(SEEK){
 	}
 }
 
+OP_DEFINE(SEEK64){
+	if(file >= ORCH_FD_OFFSET)
+		return (off64_t)orchfs_lseek(file - ORCH_FD_OFFSET,
+									 (off_t)offset, whence);
+	return real_ops.SEEK64(file, offset, whence);
+}
+
 OP_DEFINE(TRUNC){
 	// printf("trunc call\n");
 	// fflush(stdout);
 	// printf("trunc path=%s length=%d\n",path,length);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		PRINT_FUNC;
 		//printf("my trunc\n");
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_truncate(path + 1, length);
 		else if(dirflag)
-			ret = orchfs_truncate(path + 3, length);
+				ret = orchfs_truncate(strip_orchfs_prefix(path), length);
 		else ret = orchfs_truncate(path, length);
 		if(ret == -1){
-			if(*path != '\\' && !dirflag){
+				if(*path != '\\' && !dirflag &&
+				   should_fallback_relative_path(adapter_was_ready)){
 				return real_ops.TRUNC(path, length);
 			}
 			return -1;
@@ -870,25 +1011,43 @@ OP_DEFINE(TRUNC){
 }
 
 OP_DEFINE(FTRUNC){
-	printf("ftrunc call\n");
-	fflush(stdout);
-	//printf("fd=%d\n",file);
-	// int op = 0;
-	// if(file >= ORCH_FD_OFFSET){
-	// 	PRINT_FUNC;
-	// 	//printf("my frunc\n");
-	// 	return orchfs_ftruncate(file - ORCH_FD_OFFSET, length, op);
-	// }
-	// else{
-	// 	return real_ops.FTRUNC(file, length);
-	// }
+	if(file >= ORCH_FD_OFFSET){
+		PRINT_FUNC;
+		return orchfs_ftruncate(file - ORCH_FD_OFFSET, length);
+	}
+	return real_ops.FTRUNC(file, length);
+}
+
+OP_DEFINE(FTRUNC64){
+	if(file >= ORCH_FD_OFFSET)
+		return orchfs_ftruncate(file - ORCH_FD_OFFSET, (off_t)length);
+	return real_ops.FTRUNC64(file, length);
 }
 
 /*LINk*/
 OP_DEFINE(LINK){
-	printf("link call\n");
-	fflush(stdout);
-	return 0;
+	/* The async protocol does not implement hard links yet.  Never report a
+	 * successful link without changing the namespace.  Explicit OrchFS paths
+	 * fail deterministically; for an ambiguous relative source, preserve the
+	 * wrapper's usual OrchFS-first routing before falling back to libc. */
+	if(*path1 == '\\' || *path2 == '\\' ||
+	   has_orchfs_prefix(path1) || has_orchfs_prefix(path2)){
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+	if(*path1 != '/' || *path2 != '/'){
+		struct stat source_stat;
+		if(*path1 != '/'){
+			int adapter_was_ready = orchfs_async_adapter_ready();
+			if(orchfs_stat(path1, &source_stat) == 0){
+				errno = EOPNOTSUPP;
+				return -1;
+			}
+			if(!should_fallback_relative_path(adapter_was_ready))
+				return -1;
+		}
+	}
+	return real_ops.LINK(path1, path2);
 	//printf("path1=%s path2=%s\n",path1,path2);
 	// int dirflag=0;
 	// if(path1[0]=='/'&&path1[1]=='O'&&path1[2]=='r')
@@ -918,19 +1077,21 @@ OP_DEFINE(UNLINK){
 	// printf("unlink path=%s\n",path);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		PRINT_FUNC;
 		//printf("my unlink\n");
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_unlink(path + 1);
 		else if(dirflag)
-			ret = orchfs_unlink(path + 3);
+			ret = orchfs_unlink(strip_orchfs_prefix(path));
 		else ret = orchfs_unlink(path);
 		if(ret == -1){
-			if(*path != '\\' && !dirflag){
+				if(*path != '\\' && !dirflag &&
+				   should_fallback_relative_path(adapter_was_ready)){
 				return real_ops.UNLINK(path);
 			}
 			return -1;
@@ -950,8 +1111,7 @@ OP_DEFINE(FSYNC){
 	// printf("fsync fd=%d\n",file);
 	// fflush(stdout);
 	if(file >= ORCH_FD_OFFSET){
-		// printf("my fsync\n");
-		return 0;
+		return orchfs_fsync(file - ORCH_FD_OFFSET);
 	}
 	else{
 		return real_ops.FSYNC(file);
@@ -1077,21 +1237,22 @@ OP_DEFINE(XSTAT){
 	// printf("xstat path=%s\n",path);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		PRINT_FUNC;
 		//printf("my stat\n");
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_stat( path + 1, buf);
 		else if(dirflag)
-			ret = orchfs_stat( path + 3, buf);
+				ret = orchfs_stat(strip_orchfs_prefix(path), buf);
 		else ret = orchfs_stat( path , buf);
 		if(ret == -1){
-			// if(*path != '\\' && !dirflag){
-			// 	return real_ops.XSTAT(_STAT_VER, path, buf);
-			// }
+			if(*path != '\\' && !dirflag && should_fallback_relative_path(adapter_was_ready)){
+				return real_ops.XSTAT(_STAT_VER, path, buf);
+			}
 			return -1;
 		}
 		return 0;
@@ -1110,21 +1271,22 @@ OP_DEFINE(STAT){
 	// printf("stat path=%s\n",path);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		PRINT_FUNC;
 		//printf("my stat\n");
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_stat( path + 1, buf);
 		else if(dirflag)
-			ret = orchfs_stat( path + 3, buf);
+				ret = orchfs_stat(strip_orchfs_prefix(path), buf);
 		else ret = orchfs_stat( path , buf);
 		if(ret == -1){
-			// if(*path != '\\' && !dirflag){
-			// 	return real_ops.STAT(path, buf);
-			// }
+			if(*path != '\\' && !dirflag && should_fallback_relative_path(adapter_was_ready)){
+				return real_ops.STAT(path, buf);
+			}
 			return -1;
 		}
 		return 0;
@@ -1141,20 +1303,21 @@ OP_DEFINE(STAT64){
 	// fprintf(stderr,"stat64 path=%s\n",path);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		PRINT_FUNC;
 		//printf("my stat64\n");
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_stat( path + 1, (struct stat*)buf);
 		else if(dirflag)
-			ret = orchfs_stat( path + 3, (struct stat*)buf);
+				ret = orchfs_stat(strip_orchfs_prefix(path), (struct stat*)buf);
 		else ret = orchfs_stat( path , (struct stat*)buf);
 		if(ret == -1){
-			if(*path != '\\' && !dirflag){
-				return real_ops.STAT64(path, (struct stat*)buf);
+			if(*path != '\\' && !dirflag && should_fallback_relative_path(adapter_was_ready)){
+				return real_ops.STAT64(path, buf);
 			}
 			return -1;
 		}
@@ -1205,7 +1368,7 @@ OP_DEFINE(FSTAT64){
 		return orchfs_fstat(file - ORCH_FD_OFFSET, (struct stat*)buf);
 	}
 	else{
-		return real_ops.FSTAT64(file, (struct stat*)buf);
+		return real_ops.FSTAT64(file, buf);
 	}
 }
 
@@ -1216,19 +1379,21 @@ OP_DEFINE(LSTAT){
 	// fprintf(stderr,"lstat path=%s\n",path);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
-	if(*path == '\\' || *path != '/'){
+	if(*path == '\\' || *path != '/' || dirflag){
 		PRINT_FUNC;
 		//printf("my lstat\n");
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_stat( path + 1,buf);
 		else if(dirflag)
-			ret = orchfs_stat( path + 3,buf);
+				ret = orchfs_stat(strip_orchfs_prefix(path),buf);
 		else ret = orchfs_stat( path , buf);
 		if(ret == -1){
-			if(*path != '\\' && !dirflag){
+			if(*path != '\\' && !dirflag &&
+			   should_fallback_relative_path(adapter_was_ready)){
 				return real_ops.LSTAT(path, buf);
 			}
 			return -1;
@@ -1241,32 +1406,30 @@ OP_DEFINE(LSTAT){
 }
 
 OP_DEFINE(RENAME){
-	// printf("oldname=%s newname=%s\n",old,new);
-	// fflush(stdout);
-	int dirflag=0;
-	if(old[0]=='/'&&old[1]=='O'&&old[2]=='r')
-		dirflag=1;
-	if(*old == '\\' || *old != '/' || dirflag){
-		PRINT_FUNC;
-		//printf("my rename\n");
-		char *p=new;
-		if(*old=='\\') old=old+1;
-		if(dirflag) old=old+3;
-		if(*new=='\\') new=new+1;
-		if(new[0]=='/'&&new[1]=='O'&&new[2]=='r') new=new+3;
-		//printf("old=%s new=%s\n",old,new);
-		if(orchfs_rename( old, new) == -1)
-		{
-			if(*p != '\\'){
-				return real_ops.RENAME(new, new);
-			}
-			return -1;
-		}
-		return 0;
-	}
-	else{
+	const char *original_old = old;
+	const char *original_new = new;
+	int old_prefix = has_orchfs_prefix(old);
+	int new_prefix = has_orchfs_prefix(new);
+	int old_is_orch = *old == '\\' || *old != '/' || old_prefix;
+	int new_is_orch = *new == '\\' || *new != '/' || new_prefix;
+	if(!old_is_orch && !new_is_orch)
 		return real_ops.RENAME(old, new);
+	if(old_is_orch != new_is_orch){
+		errno = EXDEV;
+		return -1;
 	}
+	PRINT_FUNC;
+	if(*old=='\\') old++;
+	else if(old_prefix) old=strip_orchfs_prefix(old);
+	if(*new=='\\') new++;
+	else if(new_prefix) new=strip_orchfs_prefix(new);
+	int adapter_was_ready = orchfs_async_adapter_ready();
+	int result = orchfs_rename(old, new);
+	if(result == -1 && *original_old != '\\' && !old_prefix &&
+	   *original_new != '\\' && !new_prefix &&
+	   should_fallback_mutating_relative_path(adapter_was_ready))
+		return real_ops.RENAME(original_old, original_new);
+	return result;
 }
 
 OP_DEFINE(MKDIR){
@@ -1274,25 +1437,24 @@ OP_DEFINE(MKDIR){
 	// printf("mkdir path=%s mode=%d\n",path,mode);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' ||dirflag){
 		// fprintf(stderr,"my mkdir\n");
 		// PRINT_FUNC;
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_mkdir(path + 1, mode);
 		else if(dirflag)
-			ret = orchfs_mkdir(path + 3, mode);
+				ret = orchfs_mkdir(strip_orchfs_prefix(path), mode);
 		else 
 			ret = orchfs_mkdir(path , mode);
 		// fprintf(stderr,"mkdir over\n");
 		if(ret == -1){
-			// if(*path != '\\' && !dirflag){
-			// 	return real_ops.MKDIR(path, mode);
-			// }
-			// printf("mkdir error1\n");
-			// fflush(stdout);
+			if(*path != '\\' && !dirflag && should_fallback_relative_path(adapter_was_ready)){
+				return real_ops.MKDIR(path, mode);
+			}
 			return -1;
 		}
 		// fprintf(stderr,"mkdir return\n");
@@ -1308,23 +1470,23 @@ OP_DEFINE(RMDIR){
 	// printf("rmdir path=%s\n",path);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		// PRINT_FUNC;
 		int ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_rmdir(path + 1);
 		else if(dirflag)
-			ret = orchfs_rmdir(path + 3);
+				ret = orchfs_rmdir(strip_orchfs_prefix(path));
 		else 
 			ret = orchfs_rmdir(path);
 		// fprintf(stderr,"mkdir over\n");
 		if(ret == -1){
-			// if(*path != '\\' && !dirflag){
-			// 	return real_ops.MKDIR(path, mode);
-			// }
-			fprintf(stderr,"rmdir error\n");
+			if(*path != '\\' && !dirflag && should_fallback_relative_path(adapter_was_ready)){
+				return real_ops.RMDIR(path);
+			}
 			return -1;
 		}
 		// fprintf(stderr,"mkdir return\n");
@@ -1341,6 +1503,21 @@ OP_DEFINE(RMDIR){
 	{
 		return real_ops.RMDIR(path);
 	}
+}
+
+OP_DEFINE(STATFS){
+	int dirflag = has_orchfs_prefix(path);
+	if(*path == '\\' || *path != '/' || dirflag){
+		const char *adapter_path = *path == '\\' ? path + 1 :
+								 dirflag ? strip_orchfs_prefix(path) : path;
+		int adapter_was_ready = orchfs_async_adapter_ready();
+		int result = orchfs_statfs(adapter_path, buf);
+		if(result == -1 && *path != '\\' && !dirflag &&
+		   should_fallback_relative_path(adapter_was_ready))
+			return real_ops.STATFS(path, buf);
+		return result;
+	}
+	return real_ops.STATFS(path, buf);
 }
 
 OP_DEFINE(FSTATFS){
@@ -1362,8 +1539,7 @@ OP_DEFINE(FDATASYNC){
 	// fflush(stdout);
 	//printf("fd=%d\n",fd);
 	if(fd >= ORCH_FD_OFFSET){
-		//printf("my fdatasync\n");
-		return 0;
+		return orchfs_fsync(fd - ORCH_FD_OFFSET);
 	}
 	else{
 		return real_ops.FDATASYNC(fd);
@@ -1376,78 +1552,102 @@ OP_DEFINE(FCNTL){
 	// exit(0);
 	// printf("fd=%d\n",fd);
 	va_list ap;
-	int ret;
 	if(fd >= ORCH_FD_OFFSET){
 		PRINT_FUNC;
-		//printf("my fcntl\n");
-		switch (cmd)
-		{
-		case F_GETFD :
-			return FD_CLOEXEC;
-			break;
-		case F_GETFL :
-			// printf("got GETFL!\n");
-			ret = orchfs_fcntl(fd - ORCH_FD_OFFSET, cmd);
-			return ret;
-			break;
-		case F_SETFD :
-			return 0;
-			break;
-		case F_SETFL :
+		if(cmd == F_SETFD || cmd == F_SETFL){
 			va_start(ap, cmd);
-			int val = va_arg(ap, int);
-			return orchfs_fcntl(fd - ORCH_FD_OFFSET, cmd, val);
-			break;
-		case F_SET_RW_HINT:
-			return 0;
-			break;
-		default:
-			return 0;
-			break;
+			int value = va_arg(ap, int);
+			va_end(ap);
+			return orchfs_fcntl(fd - ORCH_FD_OFFSET, cmd, value);
 		}
+		return orchfs_fcntl(fd - ORCH_FD_OFFSET, cmd);
 	}
 	else{
-		va_list ap;
+		int result;
 		va_start(ap, cmd);
-		switch (cmd)
-		{
-		case F_GETFD :
-		case F_GETFL :
-			real_ops.FCNTL(fd, cmd);
-			break;
-		case F_SETFD :
-		case F_SETFL :
-			
-			real_ops.FCNTL(fd, cmd, va_arg(ap, int));
-		case F_SET_RW_HINT:
-			return real_ops.FCNTL(fd, cmd, va_arg(ap, void*));
-			break;
-		default:
-			return real_ops.FCNTL(fd, cmd);
-			break;
+		if(cmd == F_DUPFD || cmd == F_SETFD || cmd == F_SETFL
+#ifdef F_DUPFD_CLOEXEC
+		   || cmd == F_DUPFD_CLOEXEC
+#endif
+#ifdef F_SETOWN
+		   || cmd == F_SETOWN
+#endif
+#ifdef F_SETSIG
+		   || cmd == F_SETSIG
+#endif
+#ifdef F_SETLEASE
+		   || cmd == F_SETLEASE
+#endif
+#ifdef F_NOTIFY
+		   || cmd == F_NOTIFY
+#endif
+#ifdef F_SETPIPE_SZ
+		   || cmd == F_SETPIPE_SZ
+#endif
+#ifdef F_ADD_SEALS
+		   || cmd == F_ADD_SEALS
+#endif
+		){
+			int value = va_arg(ap, int);
+			result = real_ops.FCNTL(fd, cmd, value);
+		}else if(cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW
+#ifdef F_OFD_GETLK
+			 || cmd == F_OFD_GETLK
+#endif
+#ifdef F_OFD_SETLK
+			 || cmd == F_OFD_SETLK
+#endif
+#ifdef F_OFD_SETLKW
+			 || cmd == F_OFD_SETLKW
+#endif
+#ifdef F_GETOWN_EX
+			 || cmd == F_GETOWN_EX
+#endif
+#ifdef F_SETOWN_EX
+			 || cmd == F_SETOWN_EX
+#endif
+#ifdef F_GET_RW_HINT
+			 || cmd == F_GET_RW_HINT
+#endif
+#ifdef F_SET_RW_HINT
+			 || cmd == F_SET_RW_HINT
+#endif
+#ifdef F_GET_FILE_RW_HINT
+			 || cmd == F_GET_FILE_RW_HINT
+#endif
+#ifdef F_SET_FILE_RW_HINT
+			 || cmd == F_SET_FILE_RW_HINT
+#endif
+		){
+			void *value = va_arg(ap, void *);
+			result = real_ops.FCNTL(fd, cmd, value);
+		}else{
+			result = real_ops.FCNTL(fd, cmd);
 		}
+		va_end(ap);
+		return result;
 	}
-	return 0;
 }
 
 OP_DEFINE(OPENDIR){
 	// printf("opendir %s\n",path);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		// PRINT_FUNC;
 		// printf("my opendir\n");
 		DIR* ret;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		if(*path=='\\')
 			ret = orchfs_opendir(path + 1);
 		else if(dirflag)
-			ret = orchfs_opendir(path + 3);
+				ret = orchfs_opendir(strip_orchfs_prefix(path));
 		else 
 			ret = orchfs_opendir(path );
 		if(ret == NULL){
-			if(*path != '\\' && !dirflag){
+			if(*path != '\\' && !dirflag && should_fallback_relative_path(adapter_was_ready)){
 				return real_ops.OPENDIR(path);
 			}
 			return NULL;
@@ -1465,7 +1665,7 @@ OP_DEFINE(OPENDIR){
 OP_DEFINE(CLOSEDIR){
 	// printf("closedir call fd=%d\n",(int)(uint64_t)dirp);
 	// fflush(stdout);
-	if((uint64_t)dirp < ORCH_MAX_FD){
+	if(orchfs_async_is_directory(dirp)){
 		PRINT_FUNC;
 		//printf("my closedir\n");
 		return orchfs_closedir((DIR*) ((uint64_t)dirp));
@@ -1478,7 +1678,7 @@ OP_DEFINE(CLOSEDIR){
 OP_DEFINE(READDIR){
 	// printf("readdir call, fd=%d\n",(int)(uint64_t)dirp);
 	// fflush(stdout);
-	if((uint64_t)dirp < ORCH_MAX_FD){
+	if(orchfs_async_is_directory(dirp)){
 		PRINT_FUNC;
 		// struct dirent* ret = orchfs_readdir((DIR*) ((uint64_t)dirp));
 		// printf("my readdir ret %lld %d\n",ret,sizeof(ret));
@@ -1492,40 +1692,12 @@ OP_DEFINE(READDIR){
 }
 
 OP_DEFINE(READDIR64){
-	// printf("readdir64 call\n");
-	// fflush(stdout);
-	exit(0);
-	//printf("fd=%d\n",(int)(uint64_t)dirp);
-	// if((uint64_t)dirp < ORCH_MAX_FD){
-	// 	PRINT_FUNC;
-	// 	//printf("my readdir64\n");
-	// 	return (struct dirent64*)orchfs_readdir((DIR*) ((uint64_t)dirp));
-	// }
-	// else{
-	// 	return real_ops.READDIR64(dirp);
-	// }
+	if(orchfs_async_is_directory(dirp)){
+		PRINT_FUNC;
+		return orchfs_async_readdir64(dirp);
+	}
+	return real_ops.READDIR64(dirp);
 }
-
-// static int err;
-
-OP_DEFINE(ERROR){
-	// printf("error call\n");
-	// fflush(stdout);
-	return real_ops.ERROR();
-	// if(real_ops.ERROR==0){
-	// 	insert_real_op();
-	// }
-	// if(*orchfs_errno() == 0){
-	// 	return real_ops.ERROR();
-	// }
-	// else{
-	// 	// err = *orchfs_errno();
-	// 	// *orchfs_errno() = 0;
-	// 	// return &err;
-	// 	exit(0);
-	// }
-}
-
 
 OP_DEFINE(SYNC_FILE_RANGE){
 	// printf("sync_file_range call\n");
@@ -1533,8 +1705,10 @@ OP_DEFINE(SYNC_FILE_RANGE){
 	//printf("fd=%d\n",fd);
 	if(fd >= ORCH_FD_OFFSET ){
 		PRINT_FUNC;
-		//printf("my sync_file_range\n");
-		return 0;
+		(void)offset;
+		(void)nbytes;
+		(void)flags;
+		return orchfs_fsync(fd - ORCH_FD_OFFSET);
 	}
 	else{
 		return real_ops.SYNC_FILE_RANGE(fd, offset, nbytes, flags);
@@ -1544,23 +1718,114 @@ OP_DEFINE(SYNC_FILE_RANGE){
 // /*******************************************************
 //  * File stream functions
 //  *******************************************************/
+struct orchfs_async_cookie {
+	int fd;
+};
+
+static ssize_t orchfs_cookie_read(void *cookie, char *buffer, size_t length)
+{
+	return orchfs_async_read(((struct orchfs_async_cookie*)cookie)->fd,
+							 buffer, length);
+}
+
+static ssize_t orchfs_cookie_write(void *cookie, const char *buffer,
+							  size_t length)
+{
+	return orchfs_async_write(((struct orchfs_async_cookie*)cookie)->fd,
+							  buffer, length);
+}
+
+static int orchfs_cookie_seek(void *cookie, off64_t *offset, int whence)
+{
+	off_t result = orchfs_async_lseek(
+		((struct orchfs_async_cookie*)cookie)->fd, (off_t)*offset, whence);
+	if(result == (off_t)-1)
+		return -1;
+	*offset = (off64_t)result;
+	return 0;
+}
+
+static int orchfs_cookie_close(void *cookie)
+{
+	struct orchfs_async_cookie *state = cookie;
+	int result = orchfs_async_close(state->fd);
+	int saved_errno = errno;
+	free(state);
+	errno = saved_errno;
+	return result;
+}
+
+static FILE *orchfs_async_fopen(const char *path, const char *mode)
+{
+	if(mode == NULL || mode[0] == '\0'){
+		errno = EINVAL;
+		return NULL;
+	}
+	int flags;
+	switch(mode[0]){
+	case 'r':
+		flags = O_RDONLY;
+		break;
+	case 'w':
+		flags = O_WRONLY | O_CREAT | O_TRUNC;
+		break;
+	case 'a':
+		flags = O_WRONLY | O_CREAT | O_APPEND;
+		break;
+	default:
+		errno = EINVAL;
+		return NULL;
+	}
+	if(strchr(mode, '+') != NULL)
+		flags = (flags & ~O_ACCMODE) | O_RDWR;
+	if(strchr(mode, 'x') != NULL)
+		flags |= O_EXCL;
+	if(strchr(mode, 'e') != NULL)
+		flags |= O_CLOEXEC;
+
+	struct orchfs_async_cookie *cookie = malloc(sizeof(*cookie));
+	if(cookie == NULL)
+		return NULL;
+	cookie->fd = orchfs_async_open(path, flags, (mode_t)0666);
+	if(cookie->fd == -1){
+		free(cookie);
+		return NULL;
+	}
+	cookie_io_functions_t functions = {
+		.read = orchfs_cookie_read,
+		.write = orchfs_cookie_write,
+		.seek = orchfs_cookie_seek,
+		.close = orchfs_cookie_close,
+	};
+	FILE *stream = fopencookie(cookie, mode, functions);
+	if(stream == NULL){
+		int saved_errno = errno;
+		(void)orchfs_async_close(cookie->fd);
+		free(cookie);
+		errno = saved_errno;
+	}
+	return stream;
+}
+
 OP_DEFINE(FOPEN){
 	// printf("fopen call! %s\n",path);
 	// fflush(stdout);
 	int dirflag=0;
-	if(path[0]=='/'&&path[1]=='O'&&path[2]=='r')
+	if(has_orchfs_prefix(path))
 		dirflag=1;
 	if(*path == '\\' || *path != '/' || dirflag){
 		FILE * ret = NULL;
+		int adapter_was_ready = orchfs_async_adapter_ready();
 		//printf("my fopen\n");
 		PRINT_FUNC;
 		if(*path=='\\')
-			ret = _fopen(path + 1, mode);
+			ret = orchfs_async_fopen(path + 1, mode);
 		else if(dirflag)
-			ret = _fopen(path + 3, mode);
-		else ret = _fopen(path , mode);
+				ret = orchfs_async_fopen(strip_orchfs_prefix(path), mode);
+		else ret = orchfs_async_fopen(path , mode);
 		//ret = _fopen((*path == '\\')? path + 1 : path, mode);
-		if(ret == NULL && *path != '\\' && !dirflag){
+		if(ret == NULL && *path != '\\' && !dirflag &&
+		   should_fallback_relative_path(adapter_was_ready)){
 			return real_ops.FOPEN(path, mode);
 		}
 		return ret;
@@ -1568,101 +1833,37 @@ OP_DEFINE(FOPEN){
 	else{
 		return real_ops.FOPEN(path, mode);
 	}
-	return real_ops.FOPEN(path, mode);
+}
+
+OP_DEFINE(FOPEN64){
+	return fopen(path, mode);
 }
 
 /*op*/
 OP_DEFINE(FPUTS){
-	// printf("fputs call\n");
-	// fflush(stdout);
-	if(1){
-		if((stream->_flags & _IO_MAGIC_MASK) == _IO_MAGIC_ORCHFS){
-			//printf("my fputs\n");
-			PRINT_FUNC;
-			return _fputs(str, stream);
-		}
-	}
 	return real_ops.FPUTS(str, stream);
 }
 OP_DEFINE(FGETS){
-	// printf("fgets call\n");
-	// fflush(stdout);
-	if(stream){
-		if((stream->_flags & _IO_MAGIC_MASK) == _IO_MAGIC_ORCHFS){
-			PRINT_FUNC;
-			//printf("my fgets\n");
-			return _fgets(str, n, stream);
-		}
-	}
 	return real_ops.FGETS(str, n, stream);
 }
 
 OP_DEFINE(FWRITE){
-	// char* buf_char = buf;
-	// printf("fwrite call: %d\n",length);
-	// printf("fd0: %d\n",fp->_fileno);
-	fflush(stdout);
-	if(1){
-		if((fp->_flags & _IO_MAGIC_MASK) == _IO_MAGIC_ORCHFS)
-		{
-			// PRINT_FUNC;
-			// printf("my fwrite %d %d\n",length, nmemb);
-			return _fwrite(buf, length, nmemb, fp);
-			// return nmemb;
-		}
-	}
 	return real_ops.FWRITE(buf, length, nmemb, fp);
 }
 
 OP_DEFINE(FREAD){
-	// printf("fread call: %d\n",length);
-	fflush(stdout);
-	if(fp){
-		if((fp->_flags & _IO_MAGIC_MASK) == _IO_MAGIC_ORCHFS){
-			PRINT_FUNC;
-			//printf("my fread\n");
-			return _fread(buf, length, nmemb, fp);
-		}
-	}
 	return real_ops.FREAD(buf, length, nmemb, fp);
 }
 
 OP_DEFINE(FCLOSE){
-	// printf("fclose call\n");
-	// fflush(stdout);
-	if(fp){
-		if((fp->_flags & _IO_MAGIC_MASK) == _IO_MAGIC_ORCHFS){
-			PRINT_FUNC;
-			//printf("my fclose\n");
-			return _fclose(fp);
-		}
-	}
 	return real_ops.FCLOSE(fp);
 }
 
 OP_DEFINE(FSEEK){
-	// printf("fseek call\n");
-	// fflush(stdout);
-	if(fp){
-		if((fp->_flags & _IO_MAGIC_MASK) == _IO_MAGIC_ORCHFS){
-			PRINT_FUNC;
-			//printf("my fseek\n");
-			return _fseek(fp, offset, whence);
-		}
-	}
 	return real_ops.FSEEK(fp, offset, whence);
 }
 
 OP_DEFINE(FFLUSH){
-	// printf("fflush call\n");
-	// fflush(stdout);
-	if(fp){
-		if((fp->_flags & _IO_MAGIC_MASK) == _IO_MAGIC_ORCHFS){
-			PRINT_FUNC;
-			//printf("my fflush\n");
-			return _fflush(fp);
-		}
-	}
 	return real_ops.FFLUSH(fp);
 }
 
@@ -1672,37 +1873,46 @@ OP_DEFINE(FFLUSH){
 // 	return real_ops.MMAP(addr, len, prot, flags, file, off);
 // }
 
-static __attribute__((constructor(100) )) void init_method(void)
+static __attribute__((constructor(200))) void init_method(void)
 {
-	//printf("1111\n");
-    if(real_ops.ERROR == 0){
+	if(real_ops.OPEN == NULL){
 		insert_real_op();
-		inited = 1;
 	}
+	inited = real_ops.OPEN != NULL;
 
 	// printf("Starting to initialize ctFS. \nInstalling real syscalls...\n");
     // fprintf(stderr,"Real syscall installed. Initializing ORCHFS...\n");
 #ifdef ORCHFS_ATOMIC_WRITE
 	printf("Atomic write is enabled!\n");
 #endif
-	if(real_ops.ERROR != 0){
-		// orchfs_init(0);
-		// printf("------------ORCHFS init----------------\n");
-		init_libfs();
-		fprintf(stderr,"OrchFS initialized. \nNow the program begins.\n");
-		fflush(stdout);
+	if(inited){
+		if(orchfs_async_adapter_init() != 0){
+			int saved_errno = errno;
+			fprintf(stderr,
+					"OrchFS async client initialization failed: %s "
+					"(endpoint %s)\n",
+					strerror(saved_errno),
+					getenv("ORCHFS_ASYNC_ENDPOINT") ?
+						getenv("ORCHFS_ASYNC_ENDPOINT") :
+						"/tmp/orchfs-kfs.sock");
+			errno = saved_errno;
+		}
 		return;
 	}
 	printf("Fialed to init\n");
 	inited = 0;
 }
 
-static __attribute__((destructor(101))) void over_method(void)
+static __attribute__((destructor(200))) void over_method(void)
 {
-	close_libfs();
-	// fprintf(stderr,"libFS over %"PRId64"\n",all_read_size);
-	fprintf(stderr,"libFS over\n");
-	fflush(stdout);
+	/* libc may run DSO finalizers before its global stdio cleanup.  Flush while
+	 * the cookie callbacks still have a live Runtime/session; otherwise buffered
+	 * fwrite data could reach the callback only after adapter shutdown. */
+	int saved_errno = errno;
+	if(real_ops.FFLUSH != NULL)
+		(void)real_ops.FFLUSH(NULL);
+	orchfs_async_adapter_shutdown();
+	errno = saved_errno;
 }
 
 #ifdef __cplusplus

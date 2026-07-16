@@ -1,0 +1,171 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+
+#include "orchfs/async/result.hpp"
+#include "orchfs/async/range_arbiter.hpp"
+#include "orchfs/async/rpc_protocol.hpp"
+#include "orchfs/async/task.hpp"
+
+namespace orchfs::async {
+
+class Runtime;
+class Session;
+class File;
+class Directory;
+
+struct ClientOptions {
+  std::string endpoint{"/tmp/orchfs-kfs.sock"};
+  std::size_t ring_capacity{64};
+  std::size_t data_slot_size{1024U * 1024U};
+};
+
+struct FileStat {
+  std::uint64_t device{};
+  std::uint64_t inode{};
+  std::uint64_t mode{};
+  std::uint64_t link_count{};
+  std::uint64_t uid{};
+  std::uint64_t gid{};
+  std::uint64_t rdev{};
+  std::int64_t size{};
+  std::int64_t block_size{};
+  std::int64_t blocks{};
+  std::int64_t atime_seconds{};
+  std::int64_t atime_nanoseconds{};
+  std::int64_t mtime_seconds{};
+  std::int64_t mtime_nanoseconds{};
+  std::int64_t ctime_seconds{};
+  std::int64_t ctime_nanoseconds{};
+};
+
+struct FileSystemStat {
+  std::uint64_t type{};
+  std::uint64_t block_size{};
+  std::uint64_t blocks{};
+  std::uint64_t blocks_free{};
+  std::uint64_t blocks_available{};
+  std::uint64_t files{};
+  std::uint64_t files_free{};
+  std::uint64_t name_length{};
+  std::uint64_t fragment_size{};
+  std::uint64_t flags{};
+};
+
+struct DirEntry {
+  std::uint64_t inode{};
+  std::int64_t offset{};
+  std::uint8_t type{};
+  std::string name;
+};
+
+class Client {
+ public:
+  Client() noexcept = default;
+  Client(Client&&) noexcept;
+  Client& operator=(Client&&) noexcept;
+  Client(const Client&) = delete;
+  Client& operator=(const Client&) = delete;
+  ~Client();
+
+  static Task<Result<Client>> connect(Runtime& runtime,
+                                      ClientOptions options = {});
+
+  Task<Result<File>> open(std::string path, int flags,
+                          std::uint32_t mode = 0644);
+  Task<Result<File>> open_at(const Directory& directory,
+                             std::string path, int flags,
+                             std::uint32_t mode = 0644);
+  Task<Result<Directory>> open_directory(std::string path);
+  // Duplicate an already-open directory File into an independent directory
+  // cursor. Resolution is anchored by the remote file handle, so pathname
+  // rename/recreate races cannot change the inode selected for openat().
+  Task<Result<Directory>> open_directory(const File& file);
+  Task<Result<FileStat>> stat(std::string path);
+  Task<Result<void>> make_directory(std::string path,
+                                    std::uint32_t mode = 0755);
+  Task<Result<void>> remove_directory(std::string path);
+  Task<Result<void>> unlink(std::string path);
+  Task<Result<void>> rename(std::string old_path,
+                            std::string new_path);
+  Task<Result<void>> truncate(std::string path, std::uint64_t size);
+  Task<Result<void>> shutdown();
+
+  [[nodiscard]] bool valid() const noexcept;
+
+ private:
+  explicit Client(std::shared_ptr<Session> session) noexcept;
+  std::shared_ptr<Session> session_;
+
+  friend class File;
+  friend class Directory;
+};
+
+class File {
+ public:
+  File() noexcept = default;
+  File(File&&) noexcept;
+  File& operator=(File&&) noexcept;
+  File(const File&) = delete;
+  File& operator=(const File&) = delete;
+  ~File();
+
+  Task<Result<std::size_t>> read(std::span<std::byte> buffer);
+  Task<Result<std::size_t>> write(std::span<const std::byte> buffer);
+  Task<Result<std::size_t>> read_at(std::uint64_t offset,
+                                    std::span<std::byte> buffer);
+  Task<Result<std::size_t>> write_at(std::uint64_t offset,
+                                     std::span<const std::byte> buffer);
+  Task<Result<std::uint64_t>> seek(std::int64_t offset, int whence);
+  Task<Result<FileStat>> stat();
+  Task<Result<FileSystemStat>> statfs();
+  Task<Result<void>> truncate(std::uint64_t size);
+  Task<Result<void>> sync();
+  Task<Result<int>> get_flags();
+  Task<Result<void>> set_flags(int flags);
+  Task<Result<void>> close();
+
+  [[nodiscard]] bool valid() const noexcept;
+
+ private:
+  Task<Result<std::size_t>> read_unlocked(std::span<std::byte> buffer);
+  Task<Result<std::size_t>> write_unlocked(
+      std::span<const std::byte> buffer);
+  Task<Result<std::uint64_t>> seek_unlocked(std::int64_t offset, int whence);
+
+  File(std::shared_ptr<Session> session, RemoteHandle handle) noexcept;
+  std::shared_ptr<Session> session_;
+  RemoteHandle handle_{kInvalidRemoteHandle};
+  RangeArbiter offset_gate_;
+
+  friend class Client;
+};
+
+class Directory {
+ public:
+  Directory() noexcept = default;
+  Directory(Directory&&) noexcept;
+  Directory& operator=(Directory&&) noexcept;
+  Directory(const Directory&) = delete;
+  Directory& operator=(const Directory&) = delete;
+  ~Directory();
+
+  Task<Result<std::size_t>> next_batch(std::span<DirEntry> entries);
+  Task<Result<void>> close();
+
+  [[nodiscard]] bool valid() const noexcept;
+
+ private:
+  Directory(std::shared_ptr<Session> session, RemoteHandle handle) noexcept;
+  std::shared_ptr<Session> session_;
+  RemoteHandle handle_{kInvalidRemoteHandle};
+
+  friend class Client;
+};
+
+}  // namespace orchfs::async

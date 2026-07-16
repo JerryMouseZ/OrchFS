@@ -24,6 +24,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <assert.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -34,6 +38,13 @@
 void init_libfs();
 
 void close_libfs();
+
+/* KFS hosts the authoritative filesystem core in async/server mode.  These
+ * entry points reuse the LibFS metadata implementation without opening or
+ * closing the devices a second time. */
+void init_libfs_server_core();
+
+void close_libfs_server_core();
 
 void read_from_file(int fd, int64_t file_start_byte, int64_t read_len, void* read_buf);
 
@@ -67,19 +78,44 @@ int orchfs_stat(const char *pathname, struct stat *buf);
 
 int orchfs_fstat(int fd, struct stat *buf);
 
-int orchfs_lseek(int fd, int offset, int whence);
+int orchfs_lseek(int fd, int64_t offset, int whence);
 
 struct dirent * orchfs_readdir(DIR *dirp);
 
 DIR* orchfs_opendir(const char *_pathname);
 
+DIR* orchfs_fdopendir(int fd);
+
+int orchfs_dirfd(DIR *dirp);
+
 int orchfs_closedir(DIR *dirp);
 
 int orchfs_truncate(const char *path, size_t length);
+
+int orchfs_ftruncate(int fd, size_t length);
+
+int orchfs_fsync(int fd);
+
+int64_t orchfs_tell(int fd);
+
+int64_t orchfs_fd_inode_id(int fd);
+
+enum orchfs_file_type {
+	ORCHFS_FILE_TYPE_ERROR = -1,
+	ORCHFS_FILE_TYPE_UNKNOWN = 0,
+	ORCHFS_FILE_TYPE_DIRECTORY = 1,
+	ORCHFS_FILE_TYPE_REGULAR = 2,
+};
+
+/* Return a stable public file type for an already-open legacy descriptor. */
+int orchfs_fd_file_type(int fd);
 
 int orchfs_rename(const char *oldpath, const char *newpath);
 
 int orchfs_fcntl(int fd, int cmd, ...);
 
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -64,6 +64,9 @@ void delete_dir_cache(dir_cache_pt dir_cache, char* path_arr[],
 int64_t search_dir_cache(dir_cache_pt dir_cache, char* path_arr[],
                     int path_part_num, int64_t start_dir_inoid);
 
+/* Discard every cached pathname while retaining the cache object itself.
+ * Callers must hold orch_rt.dir_cache_lock for writing. */
+void clear_dir_cache(dir_cache_pt dir_cache);
 
 void free_dir_cache(dir_cache_pt dir_cache);
 

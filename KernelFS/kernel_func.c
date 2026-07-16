@@ -12,6 +12,11 @@
 #include "../config/socket_config.h"
 #include "../config/config.h"
 
+#ifdef ORCHFS_ENABLE_ASYNC_SERVER
+#include "async_server_bridge.h"
+#include "../LibFS/orchfs.h"
+#endif
+
 #ifdef __cplusplus       
 extern "C"{
 #endif
@@ -51,6 +56,20 @@ void init_kernelFS()
 	init_kernel_log();
 	// printf("log init!\n");
 	// fflush(stdout);
+
+#ifdef ORCHFS_ENABLE_ASYNC_SERVER
+	/* The authoritative LibFS core uses the KFS-owned devices and must be
+	 * initialized only after the legacy allocation/socket services are live. */
+	init_libfs_server_core();
+	int async_error = orchfs_async_server_start();
+	if(async_error != 0)
+	{
+		fprintf(stderr, "start async KFS server error: %s (%d)\n",
+				strerror(async_error), async_error);
+		close_kernelFS();
+		exit(1);
+	}
+#endif
 }
 
 
@@ -58,6 +77,17 @@ void close_kernelFS()
 {
 
 	fprintf(stderr,"close begin!\n");
+#ifdef ORCHFS_ENABLE_ASYNC_SERVER
+	/* Stop accepting RPCs and drain every coroutine before releasing the
+	 * filesystem state they reference. The core may still issue allocation
+	 * messages while closing, so the legacy KFS services remain live here. */
+	int async_error = orchfs_async_server_stop();
+	if(async_error != 0)
+		fprintf(stderr, "stop async KFS server error: %s (%d)\n",
+				strerror(async_error), async_error);
+	close_libfs_server_core();
+	fprintf(stderr,"async server close!\n");
+#endif
 	free_kernel_recv_info();
 	free_kernel_send_info();
 	fprintf(stderr,"socket close!\n");

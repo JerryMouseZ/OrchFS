@@ -257,6 +257,10 @@ void destroy_io_thread_pool()
 	{
 		pthread_join(pool->tid_info_pt[i], NULL);
 	}
+	for(int i = 0; i < MIGRATE_THREADS; i++)
+	{
+		pthread_join(pool->migthd_info_pt[i], NULL);
+	}
 	fprintf(stderr,"join threads!\n");
 	
 	// free
@@ -267,6 +271,9 @@ void destroy_io_thread_pool()
 		pool->task_list_end[i] = NULL;
 	}
     free(pool->tid_info_pt);
+	free(pool->migthd_info_pt);
+	pool->tid_info_pt = NULL;
+	pool->migthd_info_pt = NULL;
 	fprintf(stderr,"clear space!\n");
 }
 

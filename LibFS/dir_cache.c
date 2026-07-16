@@ -87,6 +87,13 @@ int64_t search_dir_cache(dir_cache_pt dir_cache, char* path_arr[],
         return value[0];
 }
 
+void clear_dir_cache(dir_cache_pt dir_cache)
+{
+    free_radix_tree(dir_cache->cache_rdtree_pt);
+    dir_cache->cache_rdtree_pt = init_radix_tree();
+    dir_cache->now_dir_sum = 0;
+}
+
 void free_dir_cache(dir_cache_pt dir_cache)
 {
     dir_cache->now_dir_sum = 0;

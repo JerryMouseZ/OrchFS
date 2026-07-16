@@ -1,4 +1,5 @@
 #include "lib_dir.h"
+#include "dir_cache.h"
 #include "index.h"
 #include "meta_cache.h"
 #include "lib_inode.h"
@@ -50,7 +51,7 @@ int count_path_part_num(char* pathname)
     return path_part_num;
 }
 
-void split_path(char* pathname, char* path_arr[])
+int split_path(char* pathname, char* path_arr[])
 {
     int len = strlen(pathname);
     
@@ -80,6 +81,11 @@ void split_path(char* pathname, char* path_arr[])
             int filename_len = end0 - begin0 + 1;
             
             path_arr[arr_cur] = malloc(filename_len + 1);
+            if(path_arr[arr_cur] == NULL)
+            {
+                errno = ENOMEM;
+                return -1;
+            }
             memcpy(path_arr[arr_cur], pathname + begin0, filename_len);
             path_arr[arr_cur][filename_len] = '\0';
             
@@ -87,6 +93,7 @@ void split_path(char* pathname, char* path_arr[])
             begin0 = i+1;
         }
     }
+    return 0;
 }
 
 /* Query the directory file and return the inode ID
@@ -106,17 +113,31 @@ inode_id_t do_search_path(char* path_arr[], int path_part_num, inode_id_t start_
     {
         int now_dir_fd = get_unused_fd(now_dir_inoid, O_RDWR);
         if(now_dir_fd == -1)
-            goto dir_open_error;
+            return -1;
         orch_inode_pt now_ino_pt = fd_to_inodept(now_dir_fd);
         
         // It must be a directory file
         if(now_ino_pt->i_type != DIR_FILE)
+        {
+            release_fd(now_dir_fd);
+            errno = ENOTDIR;
             return -1;
+        }
         
         int64_t now_dir_fsize = now_ino_pt->i_size;
-        orch_dirent_pt dir_file_pt = malloc(now_dir_fsize);
+        if(now_dir_fsize < 0 || now_dir_fsize % DIRENT_SIZE != 0)
+        {
+            release_fd(now_dir_fd);
+            errno = EIO;
+            return -1;
+        }
+        orch_dirent_pt dir_file_pt = malloc((size_t)now_dir_fsize);
         if(dir_file_pt == NULL)
-            goto malloc_error;
+        {
+            release_fd(now_dir_fd);
+            errno = ENOMEM;
+            return -1;
+        }
 
         file_lock_rdlock(now_dir_fd);
         read_from_file(now_dir_fd, 0, now_dir_fsize, (void*)dir_file_pt);
@@ -143,21 +164,16 @@ inode_id_t do_search_path(char* path_arr[], int path_part_num, inode_id_t start_
 
         // not found
         if(find_flag == 0)
-            goto not_found;
+        {
+            errno = ENOENT;
+            return -1;
+        }
     }
     pthread_rwlock_wrlock(&(orch_rt.dir_cache_lock));
     insert_dir_cache(orch_rt.dir_to_inoid_cache, path_arr, path_part_num, 
                             start_dir_inoid, now_dir_inoid);
     pthread_rwlock_unlock(&(orch_rt.dir_cache_lock));
     return now_dir_inoid;
-dir_open_error:
-    printf("can not get dirent file fd!\n");
-    exit(1);
-not_found:
-    return -1;
-malloc_error:
-    printf("alloc memory error!\n");
-    exit(1);
 }
 
 
@@ -252,22 +268,35 @@ inode_id_t do_path_to_inode(char* pathname, inode_id_t start_dir_ino, int create
     int path_part_num = count_path_part_num(pathname);
 
     char** path_arr = malloc(path_part_num * sizeof(char*));
+    if(path_arr == NULL)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
     for(int i = 0; i < path_part_num; i++)
         path_arr[i] = NULL;
-    split_path(pathname, path_arr);
+    if(split_path(pathname, path_arr) != 0)
+    {
+        free_path_arr(path_arr, path_part_num);
+        return -1;
+    }
     
     pthread_rwlock_rdlock(&(orch_rt.dir_cache_lock));
     int64_t ret_inoid = search_dir_cache(orch_rt.dir_to_inoid_cache, path_arr,
                             path_part_num, start_dir_ino);
     pthread_rwlock_unlock(&(orch_rt.dir_cache_lock));
     if(ret_inoid != -1)
+    {
+        free_path_arr(path_arr, path_part_num);
         return ret_inoid;
+    }
 
     inode_id_t target_inoid = do_search_path(path_arr, path_part_num-1, start_dir_ino);
     if(target_inoid == -1)
     {
-        fprintf(stderr,"cannot search path! %s\n",pathname);
         free_path_arr(path_arr, path_part_num);
+        if(errno == 0)
+            errno = ENOENT;
         return -1;
     }
     else
@@ -277,14 +306,36 @@ inode_id_t do_path_to_inode(char* pathname, inode_id_t start_dir_ino, int create
             // printf("not create!\n");
             int now_dir_fd = get_unused_fd(target_inoid, O_RDWR);
             if(now_dir_fd == -1)
-                goto dir_open_error;
+            {
+                free_path_arr(path_arr, path_part_num);
+                return -1;
+            }
             orch_inode_pt now_ino_pt = fd_to_inodept(now_dir_fd);
+            if(now_ino_pt->i_type != DIR_FILE)
+            {
+                release_fd(now_dir_fd);
+                free_path_arr(path_arr, path_part_num);
+                errno = ENOTDIR;
+                return -1;
+            }
             
             // Allocate space for directory files
             int64_t now_dir_fsize = now_ino_pt->i_size;
-            orch_dirent_pt dir_file_pt = malloc(now_dir_fsize);
+            if(now_dir_fsize < 0 || now_dir_fsize % DIRENT_SIZE != 0)
+            {
+                release_fd(now_dir_fd);
+                free_path_arr(path_arr, path_part_num);
+                errno = EIO;
+                return -1;
+            }
+            orch_dirent_pt dir_file_pt = malloc((size_t)now_dir_fsize);
             if(dir_file_pt == NULL)
-                goto malloc_error;
+            {
+                release_fd(now_dir_fd);
+                free_path_arr(path_arr, path_part_num);
+                errno = ENOMEM;
+                return -1;
+            }
 
             file_lock_rdlock(now_dir_fd);
             read_from_file(now_dir_fd, 0, now_dir_fsize, (void*)dir_file_pt);
@@ -340,12 +391,6 @@ inode_id_t do_path_to_inode(char* pathname, inode_id_t start_dir_ino, int create
         }
     }
     return -1;
-dir_open_error:
-    printf("can not get dirent file fd!\n");
-    exit(1);
-malloc_error:
-    printf("alloc memory error! -222\n");
-    exit(1);
 }
 
 /* 
@@ -452,9 +497,18 @@ int create_dirent(char* pathname)
         return -1;
     int path_part_num = count_path_part_num(pathname);
     char** path_arr = malloc(path_part_num * sizeof(char*));
+    if(path_arr == NULL)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
     for(int i = 0; i < path_part_num; i++)
         path_arr[i] = NULL;
-    split_path(pathname, path_arr);
+    if(split_path(pathname, path_arr) != 0)
+    {
+        free_path_arr(path_arr, path_part_num);
+        return -1;
+    }
 
     inode_id_t start_dir_ino = -1;
     if(pathname[0] == '/')
@@ -604,9 +658,18 @@ int delete_dirent(char* pathname, int ftype)
     // split the directory
     int path_part_num = count_path_part_num(pathname);
     char** path_arr = malloc(path_part_num * sizeof(char*));
+    if(path_arr == NULL)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
     for(int i = 0; i < path_part_num; i++)
         path_arr[i] = NULL;
-    split_path(pathname, path_arr);
+    if(split_path(pathname, path_arr) != 0)
+    {
+        free_path_arr(path_arr, path_part_num);
+        return -1;
+    }
 
     inode_id_t start_dir_ino = -1;
     if(pathname[0] == '/')
@@ -724,65 +787,123 @@ dir_open_error:
     exit(1);
 }
 
-void file_rename(char* target_dir, char* target_fname, char* changed_fname)
+int file_rename(inode_id_t target_dir_inode, const char* target_fname,
+                const char* changed_fname)
 {
-    // Find the directory file that needs to be modified
-    inode_id_t target_ino_id = path_to_inode(target_dir, NOT_CREATE_PATH);
-    if(target_ino_id == -1)
-        goto can_not_rename;
-    
-    int now_dir_fd = get_unused_fd(target_ino_id, O_RDWR);
-    if(now_dir_fd == -1)
-        goto dir_open_error;
+    if(target_fname == NULL || changed_fname == NULL)
+    {
+        errno = EFAULT;
+        return -1;
+    }
+
+    const size_t target_len = strlen(target_fname);
+    const size_t changed_len = strlen(changed_fname);
+    if(target_len == 0 || changed_len == 0 ||
+       strcmp(target_fname, ".") == 0 || strcmp(target_fname, "..") == 0 ||
+       strcmp(changed_fname, ".") == 0 || strcmp(changed_fname, "..") == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if(target_len > ORCH_DIRENT_NAME_MAX ||
+       changed_len > ORCH_DIRENT_NAME_MAX)
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if(target_dir_inode < 0)
+    {
+        errno = ENOENT;
+        return -1;
+    }
+
+    int now_dir_fd = get_unused_fd(target_dir_inode, O_RDWR);
+    if(now_dir_fd < 0)
+        return -1;
+
     orch_inode_pt now_ino_pt = fd_to_inodept(now_dir_fd);
-
-    // Verify that the file must be a directory file
     if(now_ino_pt->i_type != DIR_FILE)
-        goto not_dirent;
-        
-    int64_t now_dir_fsize = now_ino_pt->i_size;
-    orch_dirent_pt dir_file_pt = malloc(now_dir_fsize);
-    if(dir_file_pt == NULL)
-        goto malloc_error;
+    {
+        release_fd(now_dir_fd);
+        errno = ENOTDIR;
+        return -1;
+    }
 
-    // read the direct file
-    file_lock_rdlock(now_dir_fd);
+    const int64_t now_dir_fsize = now_ino_pt->i_size;
+    if(now_dir_fsize < DIRENT_SIZE * 2 ||
+       now_dir_fsize % DIRENT_SIZE != 0 ||
+       (uint64_t)now_dir_fsize > (uint64_t)SIZE_MAX)
+    {
+        release_fd(now_dir_fd);
+        errno = EIO;
+        return -1;
+    }
+
+    orch_dirent_pt dir_file_pt = malloc((size_t)now_dir_fsize);
+    if(dir_file_pt == NULL)
+    {
+        release_fd(now_dir_fd);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    int result = -1;
+    int saved_errno = 0;
+    int64_t source_pos = -1;
+    int64_t destination_pos = -1;
+
+    /* Keep cache readers out across the directory mutation and cache reset.
+     * This makes the namespace update atomic from path_to_inode's viewpoint. */
+    pthread_rwlock_wrlock(&(orch_rt.dir_cache_lock));
+    file_lock_wrlock(now_dir_fd);
     read_from_file(now_dir_fd, 0, now_dir_fsize, (void*)dir_file_pt);
     all_read_size += now_dir_fsize;
-    file_lock_unlock(now_dir_fd);
 
-    int64_t dir_num = now_dir_fsize / DIRENT_SIZE;
+    const int64_t dir_num = now_dir_fsize / DIRENT_SIZE;
     for(int64_t j = 0; j < dir_num; j++)
     {
         if(dir_file_pt[j].d_type == INVALID_T)
             continue;
-        int cmp_ans = strcmp(target_fname, dir_file_pt[j].d_name);
-        
-        if(cmp_ans == 0 && dir_file_pt[j].d_type != INVALID_T)
-        {
-            dir_file_pt[j].d_namelen = strlen(changed_fname);
-            memcpy(dir_file_pt[j].d_name, changed_fname, dir_file_pt[j].d_namelen+1);
-            file_lock_wrlock(now_dir_fd);
-            
-            write_into_file(now_dir_fd, DIRENT_SIZE*j, DIRENT_SIZE, dir_file_pt + j);
-            file_lock_unlock(now_dir_fd);
-            break;
-        }
+        if(strcmp(target_fname, dir_file_pt[j].d_name) == 0)
+            source_pos = j;
+        if(strcmp(changed_fname, dir_file_pt[j].d_name) == 0)
+            destination_pos = j;
     }
 
-    release_fd(now_dir_fd);
+    if(source_pos < 0)
+    {
+        saved_errno = ENOENT;
+        goto unlock;
+    }
+    if(strcmp(target_fname, changed_fname) == 0)
+    {
+        result = 0;
+        goto unlock;
+    }
+    if(destination_pos >= 0)
+    {
+        /* The legacy inode/link-count model cannot safely implement POSIX
+         * replacement while preserving open destination handles.  Rejecting
+         * the collision prevents duplicate names and wrong-inode lookups. */
+        saved_errno = EEXIST;
+        goto unlock;
+    }
+
+    dir_file_pt[source_pos].d_namelen = (unsigned short)changed_len;
+    memset(dir_file_pt[source_pos].d_name, 0,
+           sizeof(dir_file_pt[source_pos].d_name));
+    memcpy(dir_file_pt[source_pos].d_name, changed_fname, changed_len);
+    write_into_file(now_dir_fd, DIRENT_SIZE * source_pos, DIRENT_SIZE,
+                    dir_file_pt + source_pos);
+    clear_dir_cache(orch_rt.dir_to_inoid_cache);
+    result = 0;
+
+unlock:
+    file_lock_unlock(now_dir_fd);
+    pthread_rwlock_unlock(&(orch_rt.dir_cache_lock));
     free(dir_file_pt);
-    return;
-not_dirent:
-    printf("The target_dir is not dirent file\n");
-    exit(1);
-can_not_rename:
-    printf("can not rename --- target_dir not found!\n");
-    exit(1);
-malloc_error:
-    printf("alloc memory error!\n");
-    exit(1);
-dir_open_error:
-    printf("can not get dirent file fd!\n");
-    exit(1);
+    release_fd(now_dir_fd);
+    if(result != 0)
+        errno = saved_errno != 0 ? saved_errno : EIO;
+    return result;
 }

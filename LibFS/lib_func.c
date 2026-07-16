@@ -9,16 +9,24 @@
 #include "runtime.h"
 #include "lib_log.h"
 #include "lib_shm.h"
+#include "index.h"
 #include "../KernelFS/device.h"
 #include "../KernelFS/type.h"
 #include "../config/config.h"
 #include "../config/shm_type.h"
 
-void init_libfs()
+static int libfs_initialized;
+static int libfs_owns_device;
+
+static void init_libfs_common(int own_device)
 {
+	if(libfs_initialized)
+		return;
+	libfs_owns_device = own_device;
 	assert(sizeof(struct orch_dirent) == DIRENT_SIZE);
 
-	device_init();
+	if(libfs_owns_device)
+		device_init();
 
 	// fprintf(stderr,"init_lib_socket_info!\n");
     init_lib_socket_info();
@@ -46,8 +54,9 @@ void init_libfs()
 	// fprintf(stderr,"magic_num: %lld %lld %lld\n",sb->magic_num[0],sb->magic_num[1],sb->magic_num[2]);
 	if(sb->magic_num[0] != ORCH_MAGIC_NUM || sb->magic_num[1] != ORCH_MAGIC_NUM || sb->magic_num[2] != ORCH_MAGIC_NUM ) 
 		goto fs_type_error;
-    change_current_dir_ino(sb->root_inode, sb->root_inode);
+	change_current_dir_ino(sb->root_inode, sb->root_inode);
 	free(sb);
+	libfs_initialized = 1;
 
 	// orch_inode_pt check = malloc(ORCH_INODE_SIZE);
 	// read_data_from_devs(check, ORCH_INODE_SIZE, OFFSET_INODE);
@@ -61,8 +70,25 @@ fs_type_error:
 	exit(1);
 }
 
-void close_libfs()
+void init_libfs()
 {
+	init_libfs_common(1);
+}
+
+void init_libfs_server_core()
+{
+	init_libfs_common(0);
+}
+
+static void close_libfs_common()
+{
+	if(!libfs_initialized)
+		return;
+
+	/* Both the normal I/O workers and the migration workers can still touch the
+	 * runtime, metadata cache, extent allocator, shared-memory transport, and
+	 * device.  Stop and join them before releasing any of those dependencies. */
+	destroy_io_thread_pool();
 
     free_mem_log();
 
@@ -72,19 +98,18 @@ void close_libfs()
 	// fprintf(stderr,"will close kernelfs2!\n");
     return_all_ext();
 
-	// fprintf(stderr,"will close kernelfs3!\n");
-
-    free_lib_socket_info();
-
-	// fprintf(stderr,"will close kernelfs4!\n");
+	// The migration worker holds pointers into orch_rt, so runtime state is
+	// released only after every worker has been joined.
 	free_runtime_info();
 
-    destroy_io_thread_pool();
+	free_lib_socket_info();
 
 	// fprintf(stderr,"will close kernelfs5!\n");
 	close_lib_shm();
 
-    device_close();
+    if(libfs_owns_device)
+		device_close();
+	libfs_initialized = 0;
 
 	// fprintf(stderr,"will close kernelfs6!\n");
 
@@ -92,16 +117,47 @@ void close_libfs()
 	// req_kernelfs_close();
 }
 
+void close_libfs()
+{
+	close_libfs_common();
+}
+
+void close_libfs_server_core()
+{
+	close_libfs_common();
+}
+
 int orchfs_open (const char *pathname, int oflag, ...)
 {
 	// printf("open: %s %d %d!\n",pathname,oflag & O_CREAT,lib_register_pid);
-	int file_create_flag = 0;
+	if(pathname == NULL)
+	{
+		errno = EFAULT;
+		return -1;
+	}
+	if(*pathname == '\0')
+	{
+		errno = ENOENT;
+		return -1;
+	}
+	int64_t ret_ino_id;
 	if(oflag & O_CREAT)
 	{
-		file_create_flag = CREATE_PATH;
+		/* Resolve first so O_EXCL is meaningful and a cold directory cache does
+		 * not create a duplicate entry for an already existing file. */
+		ret_ino_id = path_to_inode(pathname, NOT_CREATE_PATH);
+		if(ret_ino_id >= 0 && (oflag & O_EXCL))
+		{
+			errno = EEXIST;
+			return -1;
+		}
+		if(ret_ino_id < 0)
+			ret_ino_id = path_to_inode(pathname, CREATE_PATH);
 	}
-
-	int64_t ret_ino_id = path_to_inode(pathname, file_create_flag);
+	else
+	{
+		ret_ino_id = path_to_inode(pathname, NOT_CREATE_PATH);
+	}
 	// fprintf(stderr,"ret_ino_id: %lld\n",ret_ino_id);
 	int ret_fd = -1;
 	if(ret_ino_id == -1)
@@ -120,36 +176,65 @@ int orchfs_open (const char *pathname, int oflag, ...)
 can_not_create_file:
 	// printf("can_not_create_file! --- %s\n",pathname);
 	// fflush(stdout);
+	if(errno == 0)
+		errno = ENOENT;
 	return -1;
 too_many_open_files:
 	printf("too_many_open_files!\n");
 	fflush(stdout);
+	if(errno == 0)
+		errno = EMFILE;
 	return -1;
 }
 
 int orchfs_openat (int dirfd, const char *pathname, int mode, ...)
 {
 	// printf("openat: %s!\n",pathname);
-	int file_create_flag = 0;
-	if(mode & O_CREAT)
+	if(pathname == NULL)
 	{
-		file_create_flag = CREATE_PATH;
+		errno = EFAULT;
+		return -1;
 	}
+	if(*pathname == '\0')
+	{
+		errno = ENOENT;
+		return -1;
+	}
+	/* POSIX ignores dirfd for absolute paths. */
+	if(*pathname == '/')
+		return orchfs_open(pathname, mode, 0);
 
 	int64_t dir_ino_id = -1;
 	if(*pathname != '/')
 	{
-		if(dirfd >= ORCH_MAX_FD || dirfd < 0)
+		if(dirfd >= ORCH_MAX_FD || dirfd < 0 ||
+		   orch_rt.fd_info[dirfd].used_flag != FD_USED)
 			goto dirfd_error;
-		orch_inode_pt dir_ino_pt = fd_to_inodeid(dirfd);
-		int64_t dir_ino_id = fd_to_inodeid(dirfd);
-		if((dir_ino_pt->i_mode & S_IFDIR) == 0)
+		orch_inode_pt dir_ino_pt = fd_to_inodept(dirfd);
+		dir_ino_id = fd_to_inodeid(dirfd);
+		if(dir_ino_pt->i_type != DIR_FILE)
 			goto file_mode_error;
 	}
-	else
-		goto file_path_error;
 
-	int64_t ret_ino_id = path_to_inode_fromdir(dir_ino_id, pathname, file_create_flag);
+	int64_t ret_ino_id;
+	if(mode & O_CREAT)
+	{
+		ret_ino_id = path_to_inode_fromdir(
+			dir_ino_id, pathname, NOT_CREATE_PATH);
+		if(ret_ino_id >= 0 && (mode & O_EXCL))
+		{
+			errno = EEXIST;
+			return -1;
+		}
+		if(ret_ino_id < 0)
+			ret_ino_id = path_to_inode_fromdir(
+				dir_ino_id, pathname, CREATE_PATH);
+	}
+	else
+	{
+		ret_ino_id = path_to_inode_fromdir(
+			dir_ino_id, pathname, NOT_CREATE_PATH);
+	}
 	int ret_fd = -1;
 	if(ret_ino_id == -1)
 		goto can_not_create_file;
@@ -160,19 +245,19 @@ int orchfs_openat (int dirfd, const char *pathname, int mode, ...)
 			goto too_many_open_files;
 		return ret_fd;
 	}
-	return -1;
-file_path_error:
-	printf("The type of file path is error!\n");
-	exit(1);
 dirfd_error:
-	printf("dirent fd is error!\n");
-	exit(1);
+	errno = EBADF;
+	return -1;
 file_mode_error:
-	printf("The file mode is not dirent!\n");
-	exit(1);
+	errno = ENOTDIR;
+	return -1;
 can_not_create_file:
+	if(errno == 0)
+		errno = ENOENT;
 	return -1;
 too_many_open_files:
+	if(errno == 0)
+		errno = EMFILE;
 	return -1;
 }
 
@@ -210,14 +295,14 @@ int orchfs_close(int fd)
 // 	orch_rt.blk_time = 0;
 // #endif
 
-	int64_t now_file_inoid = fd_to_inodeid(fd);
-	if(fd >= ORCH_MAX_FD || now_file_inoid == -1)
-		goto fd_error;
+	if(fd < 0 || fd >= ORCH_MAX_FD ||
+	   orch_rt.fd_info[fd].used_flag != FD_USED)
+	{
+		errno = EBADF;
+		return -1;
+	}
 	release_fd(fd);
 	return 0;
-fd_error:
-	printf("The fd is error!\n");
-	exit(1);
 }
 
 int64_t orchfs_pread(int fd, void *buf, int64_t read_len, int64_t offset)
@@ -552,50 +637,73 @@ int orchfs_fstat(int fd, struct stat *buf)
     return 0;
 }
 
-int orchfs_lseek(int fd, int offset, int whence)
+int orchfs_lseek(int fd, int64_t offset, int whence)
 {
-	if(fd >= ORCH_MAX_FD )
+	if(fd < 0 || fd >= ORCH_MAX_FD ||
+	   orch_rt.fd_info[fd].used_flag != FD_USED)
 	{
-		// orch_rt.errorn = EBADF;
+		errno = EBADF;
 		return -1;
 	}
-	int64_t now_file_off = get_fd_file_offset(fd);
-	orch_inode_pt ino_pt = fd_to_inodept(fd);
+	int64_t base;
 	switch (whence)
 	{
 	case SEEK_SET:
-		change_fd_file_offset(fd, offset);
-		// orch_rt.fd[fd].offset[op] = offset;
+		base = 0;
 		break;
 
 	case SEEK_CUR:
-
-		// orch_rt.fd[fd].offset[op] += offset;
-		if(now_file_off + offset < 0)
-		{
-			// orch_rt.fd[fd].offset[op] = 0;
-			change_fd_file_offset(fd, 0);
-		}
-		else
-		{
-			change_fd_file_offset(fd, now_file_off + offset);
-		}
+		base = get_fd_file_offset(fd);
 		break;
 
 	case SEEK_END:
-		if(ino_pt->i_size + offset < ino_pt->i_size)
-			change_fd_file_offset(fd, ino_pt->i_size + offset);
-		// orch_rt.fd[fd].offset[op] = orch_rt.fd[fd].inode->i_size[op] + offset;
-		//dax_stop_access(orch_rt.mpk[MPK_DEFAULT]);
+		base = fd_to_inodept(fd)->i_size;
 		break;
 	
 	default:
-		// orch_rt.errorn = EINVAL;
+		errno = EINVAL;
 		return -1;
-		break;
 	}
 
+	int64_t new_offset;
+	if(__builtin_add_overflow(base, offset, &new_offset))
+	{
+		errno = EOVERFLOW;
+		return -1;
+	}
+	if(new_offset < 0)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	change_fd_file_offset(fd, new_offset);
 	return 0;
+}
+
+/*
+ * A directory stream is an encoded OrchFS descriptor, not a libc DIR object.
+ * Store fd + 1 so descriptor zero remains distinguishable from the NULL error
+ * return.  Normal file descriptors keep their existing integer values.
+ */
+static DIR *orchfs_encode_dirfd(int fd)
+{
+	if(fd < 0 || fd >= ORCH_MAX_FD)
+	{
+		errno = EBADF;
+		return NULL;
+	}
+	return (DIR *)(uintptr_t)((uint64_t)fd + 1);
+}
+
+int orchfs_dirfd(DIR *dirp)
+{
+	uintptr_t encoded = (uintptr_t)dirp;
+	if(encoded == 0 || encoded > ORCH_MAX_FD)
+	{
+		errno = EBADF;
+		return -1;
+	}
+	return (int)(encoded - 1);
 }
 
 DIR* orchfs_opendir(const char *_pathname)
@@ -612,21 +720,53 @@ DIR* orchfs_opendir(const char *_pathname)
 	if(ino_pt->i_type != DIR_FILE)
 	{
 		orchfs_close(ret_fd);
-		// orch_rt.errorn = ENOTDIR;
+		errno = ENOTDIR;
 		// printf("aaaaaaaaaa\n");
 		// fflush(stdout);
 		return NULL;
 	}
 	change_fd_file_offset(ret_fd, DIRENT_SIZE*2);
-	return (DIR*)(uint64_t)ret_fd;
+	return orchfs_encode_dirfd(ret_fd);
+}
+
+DIR* orchfs_fdopendir(int fd)
+{
+	if(fd < 0 || fd >= ORCH_MAX_FD ||
+	   orch_rt.fd_info[fd].used_flag != FD_USED)
+	{
+		errno = EBADF;
+		return NULL;
+	}
+
+	orch_inode_pt ino_pt = fd_to_inodept(fd);
+	if(ino_pt->i_type != DIR_FILE)
+	{
+		errno = ENOTDIR;
+		return NULL;
+	}
+
+	/*
+	 * Directory iteration owns an independent file offset.  Duplicate the
+	 * already-resolved inode instead of looking its pathname up again: the
+	 * source may have been renamed or unlinked since it was opened.
+	 */
+	int directory_fd = get_unused_fd(fd_to_inodeid(fd), O_RDONLY);
+	if(directory_fd < 0)
+	{
+		if(errno == 0)
+			errno = EMFILE;
+		return NULL;
+	}
+	change_fd_file_offset(directory_fd, DIRENT_SIZE*2);
+	return orchfs_encode_dirfd(directory_fd);
 }
 
 
 /*target*/
 struct dirent * orchfs_readdir(DIR *dirp)
 {
-	int fd = (int)(uint64_t)dirp;
-	if(fd >= ORCH_MAX_FD || fd < 0)
+	int fd = orchfs_dirfd(dirp);
+	if(fd < 0)
 	{
 		return NULL;
 	}
@@ -688,7 +828,8 @@ struct dirent * orchfs_readdir(DIR *dirp)
 
 int orchfs_closedir(DIR *dirp)
 {
-	return orchfs_close((int)(uint64_t)dirp);
+	int fd = orchfs_dirfd(dirp);
+	return fd < 0 ? -1 : orchfs_close(fd);
 }
 
 int orchfs_truncate(const char *path, size_t length)
@@ -700,24 +841,109 @@ int orchfs_truncate(const char *path, size_t length)
 		return -1;
     }
 	int now_fd = get_unused_fd(ret_ino_id, O_RDWR);
-    orch_inode_pt ino_pt = fd_to_inodept(now_fd);
+	if(now_fd < 0)
+		return -1;
+	int ret = orchfs_ftruncate(now_fd, length);
+	int saved_errno = errno;
+	release_fd(now_fd);
+	errno = saved_errno;
+	return ret;
+}
 
-	// 截断操作
-	file_lock_wrlock(now_fd);
-	if(length > ino_pt->i_size)
+int orchfs_ftruncate(int fd, size_t length)
+{
+	if(fd < 0 || fd >= ORCH_MAX_FD || orch_rt.fd_info[fd].used_flag != FD_USED)
+	{
+		errno = EBADF;
+		return -1;
+	}
+	if((orch_rt.fd_info[fd].flags & O_ACCMODE) == O_RDONLY)
+	{
+		errno = EBADF;
+		return -1;
+	}
+	orch_inode_pt ino_pt = fd_to_inodept(fd);
+	if(ino_pt->i_type != SIMPLE_FILE)
+	{
+		errno = EISDIR;
+		return -1;
+	}
+	const uint64_t max_file_size =
+		UINT64_C(1) << (KEY_LEN + ORCH_BLOCK_BW);
+	if((uint64_t)length > max_file_size || length > (size_t)INT64_MAX)
+	{
+		errno = EFBIG;
+		return -1;
+	}
+	file_lock_wrlock(fd);
+	if(length > (size_t)ino_pt->i_size)
 	{
 		int64_t now_offset = ino_pt->i_size;
-		int64_t now_write_len = length - now_offset;
-		void* buf = malloc(now_write_len);
-		write_into_file(now_fd, now_offset, now_write_len, buf);
+		int64_t now_write_len = (int64_t)length - now_offset;
+		void* buf = calloc(1, (size_t)now_write_len);
+		if(buf == NULL)
+		{
+			file_lock_unlock(fd);
+			errno = ENOMEM;
+			return -1;
+		}
+		write_into_file(fd, now_offset, now_write_len, buf);
 		free(buf);
+		inode_change_file_size(ino_pt, (int64_t)length);
 	}
 	else
 	{
-		inode_change_file_size(ino_pt, length);
+		inode_change_file_size(ino_pt, (int64_t)length);
 	}
-	file_lock_unlock(now_fd);
+	file_lock_unlock(fd);
 	return 0;
+}
+
+int orchfs_fsync(int fd)
+{
+	if(fd < 0 || fd >= ORCH_MAX_FD || orch_rt.fd_info[fd].used_flag != FD_USED)
+	{
+		errno = EBADF;
+		return -1;
+	}
+	return device_sync();
+}
+
+int64_t orchfs_tell(int fd)
+{
+	if(fd < 0 || fd >= ORCH_MAX_FD || orch_rt.fd_info[fd].used_flag != FD_USED)
+	{
+		errno = EBADF;
+		return -1;
+	}
+	return get_fd_file_offset(fd);
+}
+
+int64_t orchfs_fd_inode_id(int fd)
+{
+	if(fd < 0 || fd >= ORCH_MAX_FD || orch_rt.fd_info[fd].used_flag != FD_USED)
+	{
+		errno = EBADF;
+		return -1;
+	}
+	return fd_to_inodeid(fd);
+}
+
+int orchfs_fd_file_type(int fd)
+{
+	if(fd < 0 || fd >= ORCH_MAX_FD ||
+	   orch_rt.fd_info[fd].used_flag != FD_USED)
+	{
+		errno = EBADF;
+		return ORCHFS_FILE_TYPE_ERROR;
+	}
+
+	orch_inode_pt inode = fd_to_inodept(fd);
+	if(inode->i_type == DIR_FILE)
+		return ORCHFS_FILE_TYPE_DIRECTORY;
+	if(inode->i_type == SIMPLE_FILE)
+		return ORCHFS_FILE_TYPE_REGULAR;
+	return ORCHFS_FILE_TYPE_UNKNOWN;
 }
 
 
@@ -771,61 +997,117 @@ int orchfs_truncate(const char *path, size_t length)
 // 	return 0;
 // }
 
+static int split_rename_path(const char *path, char parent[4096],
+	char basename[ORCH_DIRENT_NAME_MAX + 1])
+{
+	if(path == NULL)
+	{
+		errno = EFAULT;
+		return -1;
+	}
+	if(*path == '\0')
+	{
+		errno = ENOENT;
+		return -1;
+	}
+
+	const char *last_slash = strrchr(path, '/');
+	const char *name = last_slash == NULL ? path : last_slash + 1;
+	const size_t name_len = strlen(name);
+	if(name_len == 0 || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	if(name_len > ORCH_DIRENT_NAME_MAX)
+	{
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+
+	if(last_slash == NULL)
+	{
+		strcpy(parent, ".");
+	}
+	else
+	{
+		const size_t parent_len = (size_t)(last_slash - path);
+		int root_parent = 1;
+		for(size_t i = 0; i < parent_len; i++)
+		{
+			if(path[i] != '/')
+			{
+				root_parent = 0;
+				break;
+			}
+		}
+		if(root_parent)
+		{
+			/* path_to_inode cannot resolve a slash-only spelling, while the
+			 * root directory's "." entry resolves to the same inode. */
+			strcpy(parent, "/.");
+		}
+		else
+		{
+			if(parent_len >= 4096)
+			{
+				errno = ENAMETOOLONG;
+				return -1;
+			}
+			memcpy(parent, path, parent_len);
+			parent[parent_len] = '\0';
+		}
+	}
+
+	memcpy(basename, name, name_len + 1);
+	return 0;
+}
+
 int orchfs_rename(const char *oldpath, const char *newpath)
 {
-	// 剥离出目录
-	int oldpath_dirend_pos = 0, newpath_dirend_pos = 0;
-	int oldpath_len = strlen(oldpath);
-	int newpath_len = strlen(newpath);
-	// fprintf(stderr,"len: %d %d\n",oldpath_len,newpath_len);
-	for(int i = oldpath_len-1; i >= 0; i--)
+	char old_parent[4096] = {0};
+	char new_parent[4096] = {0};
+	char old_name[ORCH_DIRENT_NAME_MAX + 1] = {0};
+	char new_name[ORCH_DIRENT_NAME_MAX + 1] = {0};
+	if(split_rename_path(oldpath, old_parent, old_name) != 0 ||
+	   split_rename_path(newpath, new_parent, new_name) != 0)
+		return -1;
+
+	errno = 0;
+	const inode_id_t old_parent_inode =
+		path_to_inode(old_parent, NOT_CREATE_PATH);
+	if(old_parent_inode < 0)
 	{
-		if(oldpath[i]=='/')
-		{
-			oldpath_dirend_pos = i-1; break;
-		}
+		if(errno == 0)
+			errno = ENOENT;
+		return -1;
 	}
-	for(int i = newpath_len-1; i >= 0; i--)
+	errno = 0;
+	const inode_id_t new_parent_inode =
+		path_to_inode(new_parent, NOT_CREATE_PATH);
+	if(new_parent_inode < 0)
 	{
-		if(newpath[i]=='/')
-		{
-			newpath_dirend_pos = i-1; break;
-		}
+		if(errno == 0)
+			errno = ENOENT;
+		return -1;
 	}
-	// fprintf(stderr,"pos: %d %d\n",oldpath_dirend_pos,newpath_dirend_pos);
-	if(oldpath_dirend_pos != newpath_dirend_pos)
-		goto path_diff;
-	char target_dir[4096] = {0}, old_fname[256] = {0}, new_fname[256] = {0};
-	int old_fname_cnt = 0, new_fname_cnt = 0;
-	for(int i = 0; i <= oldpath_dirend_pos; i++)
+	if(old_parent_inode != new_parent_inode)
 	{
-		if(oldpath[i] == newpath[i])
-			target_dir[i] = oldpath[i];
-		else
-			goto path_diff;
+		errno = EXDEV;
+		return -1;
 	}
-	for(int i = oldpath_dirend_pos+2; i < oldpath_len; i++)
-		old_fname[old_fname_cnt++] = oldpath[i];
-	for(int i = newpath_dirend_pos+2; i < newpath_len; i++)
-		new_fname[new_fname_cnt++] = newpath[i];
-	if(old_fname_cnt == 0 || new_fname_cnt == 0)
-		goto path_error;
-	file_rename(target_dir, old_fname, new_fname);
-	return 0;
-path_diff:
-	fprintf(stderr,"The path is different! --- orchfs_rename\n");
-	exit(0);
-path_error:
-	fprintf(stderr,"The file path is error! --- orchfs_rename\n");
-	exit(0);
+	return file_rename(old_parent_inode, old_name, new_name);
 }
 
 int orchfs_fcntl(int fd, int cmd, ...)
 {
 	va_list ap;
-	int64_t now_file_inoid = fd_to_inodeid(fd);
-	if(fd >= ORCH_MAX_FD || now_file_inoid == -1)
-		goto fd_error;
+	if(fd < 0 || fd >= ORCH_MAX_FD ||
+	   orch_rt.fd_info[fd].used_flag != FD_USED)
+	{
+		errno = EBADF;
+		return -1;
+	}
 	switch (cmd)
 	{
 	case F_GETFL:
@@ -833,16 +1115,18 @@ int orchfs_fcntl(int fd, int cmd, ...)
 		return orch_rt.fd_info[fd].flags;
 		break;
 	case F_SETFL:
-		
 		va_start(ap, cmd);
-		orch_rt.fd_info[fd].flags = va_arg(ap, int);
+		{
+			int new_flags = va_arg(ap, int);
+			int mutable_flags = O_APPEND | O_NONBLOCK;
+			orch_rt.fd_info[fd].flags =
+				(orch_rt.fd_info[fd].flags & O_ACCMODE) |
+				(new_flags & mutable_flags);
+		}
+		va_end(ap);
 		return 0;
 	default:
-		return 0;
-		break;
+		errno = EOPNOTSUPP;
+		return -1;
 	}
-	return 0;
-fd_error:
-	printf("The fd is error! -- orchfs_fcntl\n");
-	exit(1);
 }

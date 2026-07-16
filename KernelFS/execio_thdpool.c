@@ -82,8 +82,9 @@ cannot_write:
 
 void init_ker_io_thread_pool()
 {
-    ker_io_pth_pool_pt pool = &orch_io_exec;
+	ker_io_pth_pool_pt pool = &orch_io_exec;
 	pool->shutdown = 0;
+	sem_init(&(pool->shutdown_sem), 0, 0);
     
 	for(int i = 0; i < EXEC_THREADS; i++)
 	{
@@ -153,7 +154,7 @@ void destroy_ker_io_thread_pool()
 	}
 	
 
-	for(int i = 0; i < TOTAL_EXEC_THREADS; i++)
+	for(int i = 0; i < EXEC_THREADS; i++)
 	{
 		free(pool->task_list_head[i]);
 		pool->task_list_head[i] = NULL;

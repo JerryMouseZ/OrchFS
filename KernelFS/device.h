@@ -101,6 +101,15 @@ void device_init();
 
 void device_close();
 
+/* Persist all writes issued before this call.  The SPDK build maps this to an
+ * NVMe FLUSH; the legacy block-device build uses fsync after draining CPU
+ * stores. */
+int device_sync();
+
+/* With ORCHFS_ENABLE_SPDK on the KFS target, the SSD half of this interface
+ * is backed by the process-wide SPDK poller service. LibFS must not compile
+ * with ORCHFS_KFS_SERVER and therefore never owns an SPDK controller. */
+
 void read_data_from_devs(void* dst, int64_t len, int64_t offset);
 
 void write_data_to_devs(void* src, int64_t len, int64_t offset);

@@ -31,7 +31,7 @@ adding, deleting, modifying, and querying directory entries*/
 #define CREATE_PATH              1
 #define NOT_CREATE_PATH          0
 
-#define ORCH_MAX_NAME            230
+#define ORCH_DIRENT_NAME_MAX     230
 #define DIRENT_SIZE              256
 
 #define PATH_EXIST               1
@@ -52,7 +52,7 @@ struct orch_dirent
     __off64_t d_off;                    //8B
     unsigned short int d_namelen;       //2B
     unsigned char d_type;               //1B
-    char d_name[ORCH_MAX_NAME + 1];
+    char d_name[ORCH_DIRENT_NAME_MAX + 1];
 };
 typedef struct orch_dirent orch_dirent_t;
 typedef orch_dirent_t* orch_dirent_pt;
@@ -82,12 +82,10 @@ int delete_dirent(char* pathname, int ftype);
  */
 int is_path_exist(char* pathname);
 
-/* File renaming
- * @target_dir                  The path where the file name needs to be changed is located
- * @target_file_name            Target file name
- * @changed_file_name           The changed file name
- */
-void file_rename(char* target_dir, char* target_fname, char* changed_fname);
+/* Rename one entry inside an already-resolved directory inode.  Cross-directory
+ * moves are rejected by orchfs_rename before this helper is called. */
+int file_rename(inode_id_t target_dir_inode, const char* target_fname,
+	const char* changed_fname);
 
 
 

@@ -12,7 +12,7 @@ void init_lib_shm(int reg_id)
     
     // Create shared memory
     int shm_key = KET_MAGIC_OFFSET;
-    int shm_sp_size = sizeof(shm_sp_pt);
+    int shm_sp_size = sizeof(shm_sp_t);
     int permission_code = 0666;
     int shmid = shmget((key_t)shm_key, shm_sp_size, permission_code);
   	if (shmid == -1)

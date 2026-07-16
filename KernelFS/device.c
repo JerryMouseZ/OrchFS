@@ -1,6 +1,11 @@
 #include "../config/config.h"
 #include "device.h"
 
+#if defined(ORCHFS_ENABLE_SPDK) && defined(ORCHFS_KFS_SERVER)
+#include "spdk_device_service.h"
+#define ORCHFS_USE_SPDK_DEVICE 1
+#endif
+
 #ifdef __cplusplus       
 extern "C"{
 #endif
@@ -11,6 +16,18 @@ extern "C"{
 void ssd_init()
 {
 	// alignbuf = valloc(MAX_WRITE_SIZE0);
+	fs_dev_info.ssd_read_fd = -1;
+	fs_dev_info.ssd_write_fd = -1;
+
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	int error_number = orchfs_spdk_device_start();
+	if(error_number != 0)
+	{
+		fprintf(stderr, "start SPDK NVMe service error: %s (%d)\n",
+				strerror(error_number), error_number);
+		exit(1);
+	}
+#else
 
 	fs_dev_info.ssd_read_fd = open(ORCH_DEV_SSD_PATH,  O_RDWR | O_SYNC); //
 	// fs_dev_info.ssd_read_fd = open("/dev/nvme0n1",  O_RDWR | __O_DIRECT); //
@@ -30,14 +47,24 @@ void ssd_init()
         printf("open ssd error!\n");
         exit(1);
 	}
+#endif
 }
 
 void ssd_close() 
 {
-    if(fs_dev_info.ssd_read_fd > 0)
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	int error_number = orchfs_spdk_device_stop();
+	if(error_number != 0)
+		fprintf(stderr, "stop SPDK NVMe service error: %s (%d)\n",
+				strerror(error_number), error_number);
+#else
+    if(fs_dev_info.ssd_read_fd >= 0)
 		close(fs_dev_info.ssd_read_fd);
-	if(fs_dev_info.ssd_write_fd > 0)
+	if(fs_dev_info.ssd_write_fd >= 0)
 		close(fs_dev_info.ssd_write_fd);
+	fs_dev_info.ssd_read_fd = -1;
+	fs_dev_info.ssd_write_fd = -1;
+#endif
 }
 
 void* nvm_init(ioctl_init_t* frame)
@@ -66,12 +93,30 @@ void nvm_close()
 
 void ssd_read(void* dst, int64_t len, int64_t offset)
 {
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	if(len < 0 || offset < 0)
+	{
+		fprintf(stderr, "invalid SPDK read range: %" PRId64 " %" PRId64 "\n",
+				len, offset);
+		exit(1);
+	}
+	int error_number = orchfs_spdk_device_read(
+		(uint64_t)offset, dst, (size_t)len);
+	if(error_number != 0)
+	{
+		fprintf(stderr, "SPDK read error: %s (%d), len=%" PRId64
+				" offset=%" PRId64 "\n", strerror(error_number), error_number,
+				len, offset);
+		exit(1);
+	}
+#else
 	int64_t readnum = pread(fs_dev_info.ssd_read_fd, dst, len, offset);
 	if(readnum != len)
 	{
 		printf("read data error! %" PRId64" %" PRId64" %" PRId64"\n", readnum, len, offset);
 		exit(1);
 	}
+#endif
 }
 
 // void ssd_read_pre(void* dst, int64_t len, int64_t offset)
@@ -97,17 +142,52 @@ void ssd_read(void* dst, int64_t len, int64_t offset)
 void shm_ssd_write(void* src, int64_t src_off, int64_t len, int64_t offset)
 {
 	assert(len % SIZE_4KiB == 0);
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	if(src_off < 0 || len < 0 || offset < 0)
+	{
+		fprintf(stderr, "invalid SPDK shared write range\n");
+		exit(1);
+	}
+	const void *write_source = (const char *)src + src_off;
+	int error_number = orchfs_spdk_device_write(
+		(uint64_t)offset, write_source, (size_t)len);
+	if(error_number != 0)
+	{
+		fprintf(stderr, "SPDK shared write error: %s (%d), len=%" PRId64
+				" offset=%" PRId64 "\n", strerror(error_number), error_number,
+				len, offset);
+		exit(1);
+	}
+#else
 	int64_t writenum = pwrite(fs_dev_info.ssd_write_fd, src + src_off, len, offset);
 	if(writenum != len)
 	{
 		printf("write data error! %" PRId64" %" PRId64" %" PRId64"\n", writenum, len, offset);
 		exit(1);
 	}
+#endif
 }
 
 
 void ssd_write(void* src, int64_t len, int64_t offset)
 {
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	if(len < 0 || offset < 0)
+	{
+		fprintf(stderr, "invalid SPDK write range: %" PRId64 " %" PRId64 "\n",
+				len, offset);
+		exit(1);
+	}
+	int error_number = orchfs_spdk_device_write(
+		(uint64_t)offset, src, (size_t)len);
+	if(error_number != 0)
+	{
+		fprintf(stderr, "SPDK write error: %s (%d), len=%" PRId64
+				" offset=%" PRId64 "\n", strerror(error_number), error_number,
+				len, offset);
+		exit(1);
+	}
+#else
 	// printf("ssdw: %lld %lld\n",offset,len);
 	uint64_t end_byte = offset+len-1;
 	uint64_t start_offset_4k = (offset>>BW_4KiB);
@@ -153,6 +233,7 @@ void ssd_write(void* src, int64_t len, int64_t offset)
 		assert(writenum == block_sum*SIZE_4KiB);
 	}
 	free(alignbuf);
+#endif
 }
 
 void avx_cpy(void *dest, const void *src, uint64_t size)
@@ -259,6 +340,24 @@ void device_close()
 	nvm_close();
 }
 
+int device_sync()
+{
+	/* nvm_write() uses non-temporal stores. */
+	_mm_sfence();
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	int error_number = orchfs_spdk_device_flush();
+	if(error_number != 0)
+	{
+		errno = error_number;
+		return -1;
+	}
+#else
+	if(fs_dev_info.ssd_write_fd >= 0 && fsync(fs_dev_info.ssd_write_fd) != 0)
+		return -1;
+#endif
+	return 0;
+}
+
 void read_data_from_devs(void* dst, int64_t len, int64_t offset)
 {
 	if(offset + len <= PMEM_LEN)
@@ -312,9 +411,10 @@ void shm_write_data_to_devs(void* src, int64_t src_off, int64_t len, int64_t off
 		int64_t nvm_write_len = PMEM_LEN - offset;
 		int64_t ssd_write_len = offset + len - PMEM_LEN;
 		nvm_write(src + src_off, nvm_write_len, offset);
-		uint64_t ssd_write_buf_addr = (uint64_t)src + nvm_write_len;
-		void* ssd_write_buf_pt = (void*)ssd_write_buf_addr;
-		shm_ssd_write(ssd_write_buf_pt, src_off, ssd_write_len, 0);
+		/* src_off is relative to the original shared-memory base.  Preserve that
+		 * base when advancing past the NVM portion; advancing the pointer and
+		 * passing src_off again would apply the offset twice. */
+		shm_ssd_write(src, src_off + nvm_write_len, ssd_write_len, 0);
 	}
 	else if(offset >= PMEM_LEN)
 	{
@@ -324,15 +424,33 @@ void shm_write_data_to_devs(void* src, int64_t src_off, int64_t len, int64_t off
 
 void write_data_to_ssds_newbaseline(void* src, int64_t len, int64_t offset)
 {
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	if(len < 0 || offset < 0 || orchfs_spdk_device_write(
+			(uint64_t)offset, src, (size_t)len) != 0)
+	{
+		fprintf(stderr, "SPDK new-baseline write failed\n");
+		exit(1);
+	}
+#else
 	int64_t writenum = pwrite(fs_dev_info.ssd_write_fd, src, len, offset);
 	assert(writenum == len);
+#endif
 	return;
 }
 
 void read_data_from_ssds_newbaseline(void* dst, int64_t len, int64_t offset)
 {
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	if(len < 0 || offset < 0 || orchfs_spdk_device_read(
+			(uint64_t)offset, dst, (size_t)len) != 0)
+	{
+		fprintf(stderr, "SPDK new-baseline read failed\n");
+		exit(1);
+	}
+#else
 	int64_t readnum = pread(fs_dev_info.ssd_read_fd, dst, len, offset);
 	assert(readnum == len);
+#endif
 	return;
 }
 

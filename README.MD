@@ -64,10 +64,26 @@ Replace `[dax]` and `[SSD]` with the device files on the server you are using no
 
 Compiling requires the use of the cmake tool.
 ```
-mkdir build
-cd build
-cmake ..
-make
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j
+```
+
+The build now requires CMake 3.16 or newer and a C++20 compiler. By default it
+builds the C++20 coroutine runtime, asynchronous LibFS/KFS IPC libraries, the
+SPDK-independent NVMe backend tests, and all original OrchFS targets without
+requiring SPDK.
+
+For the SPDK v26.01 build, runtime configuration, cooperative scheduling
+contract, and destructive device-binding checklist, see
+[docs/async-spdk.md](docs/async-spdk.md). The short form is:
+
+```bash
+cmake -S . -B build-spdk \
+  -DORCHFS_ENABLE_SPDK=ON \
+  -DSPDK_ROOT=/opt/orchfs/spdk \
+  -DBUILD_TESTING=ON
+cmake --build build-spdk -j
+ctest --test-dir build-spdk --output-on-failure
 ```
 
 ## Using OrchFS:
