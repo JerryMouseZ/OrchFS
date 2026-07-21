@@ -8,12 +8,10 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#include <list>
-#include <mutex>
 #include <new>
 #include <sstream>
-#include <thread>
 #include <utility>
+#include <vector>
 
 #ifdef ORCHFS_HAS_SPDK
 #include <spdk/env.h>
@@ -77,6 +75,22 @@ const std::error_category &nvme_status_category() noexcept {
 std::error_code invalid_argument() noexcept {
     return std::make_error_code(std::errc::invalid_argument);
 }
+
+class AtomicFlagGuard final {
+public:
+    explicit AtomicFlagGuard(std::atomic_flag &flag) noexcept : flag_(flag) {
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+
+    ~AtomicFlagGuard() { flag_.clear(std::memory_order_release); }
+
+    AtomicFlagGuard(const AtomicFlagGuard &) = delete;
+    AtomicFlagGuard &operator=(const AtomicFlagGuard &) = delete;
+
+private:
+    std::atomic_flag &flag_;
+};
 
 } // namespace
 
@@ -187,6 +201,7 @@ std::error_code plan_io(Operation operation,
 }
 
 detail::WriteCoordinator::Ticket detail::WriteCoordinator::accept(
+    WriteTicket &storage,
     std::uint64_t physical_begin,
     std::uint64_t physical_end,
     std::error_code &error) {
@@ -196,36 +211,46 @@ detail::WriteCoordinator::Ticket detail::WriteCoordinator::accept(
         return {};
     }
 
-    Ticket ticket;
-    try {
-        ticket = std::make_shared<WriteTicket>();
-        std::lock_guard lock(mutex_);
-        if (last_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
-            error = std::make_error_code(std::errc::value_too_large);
-            return {};
-        }
-        ticket->sequence = last_sequence_ + 1;
-        ticket->physical_begin = physical_begin;
-        ticket->physical_end = physical_end;
-        outstanding_.push_back(ticket);
-        last_sequence_ = ticket->sequence;
-    } catch (const std::bad_alloc &) {
-        error = std::make_error_code(std::errc::not_enough_memory);
+    AtomicFlagGuard guard(lock_);
+    if (storage.linked) {
+        error = invalid_argument();
         return {};
     }
-    return ticket;
+    if (last_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
+        error = std::make_error_code(std::errc::value_too_large);
+        return {};
+    }
+
+    storage.sequence = ++last_sequence_;
+    storage.physical_begin = physical_begin;
+    storage.physical_end = physical_end;
+    storage.previous = tail_;
+    storage.next = nullptr;
+    storage.granted = false;
+    storage.linked = true;
+    if (tail_ != nullptr) {
+        tail_->next = &storage;
+    } else {
+        head_ = &storage;
+    }
+    tail_ = &storage;
+    return &storage;
 }
 
-bool detail::WriteCoordinator::try_grant(const Ticket &ticket) noexcept {
-    if (!ticket) {
+bool detail::WriteCoordinator::try_grant(Ticket ticket) noexcept {
+    if (ticket == nullptr) {
         return false;
     }
-    std::lock_guard lock(mutex_);
-    for (const Ticket &earlier : outstanding_) {
-        if (earlier == ticket) {
-            ticket->granted = true;
-            return true;
-        }
+    AtomicFlagGuard guard(lock_);
+    if (!ticket->linked) {
+        return false;
+    }
+    if (ticket->granted) {
+        return true;
+    }
+
+    for (WriteTicket *earlier = head_; earlier != ticket;
+         earlier = earlier->next) {
         const bool overlaps =
             earlier->physical_begin < ticket->physical_end &&
             ticket->physical_begin < earlier->physical_end;
@@ -233,32 +258,42 @@ bool detail::WriteCoordinator::try_grant(const Ticket &ticket) noexcept {
             return false;
         }
     }
-    return false;
+    ticket->granted = true;
+    return true;
 }
 
-void detail::WriteCoordinator::complete(const Ticket &ticket) noexcept {
-    if (!ticket) {
+void detail::WriteCoordinator::complete(Ticket ticket) noexcept {
+    if (ticket == nullptr) {
         return;
     }
-    std::lock_guard lock(mutex_);
-    for (auto iterator = outstanding_.begin(); iterator != outstanding_.end();
-         ++iterator) {
-        if (*iterator == ticket) {
-            ticket->granted = false;
-            outstanding_.erase(iterator);
-            return;
-        }
+    AtomicFlagGuard guard(lock_);
+    if (!ticket->linked) {
+        return;
     }
+    if (ticket->previous != nullptr) {
+        ticket->previous->next = ticket->next;
+    } else {
+        head_ = ticket->next;
+    }
+    if (ticket->next != nullptr) {
+        ticket->next->previous = ticket->previous;
+    } else {
+        tail_ = ticket->previous;
+    }
+    ticket->previous = nullptr;
+    ticket->next = nullptr;
+    ticket->granted = false;
+    ticket->linked = false;
 }
 
 std::uint64_t detail::WriteCoordinator::capture_fence() const noexcept {
-    std::lock_guard lock(mutex_);
+    AtomicFlagGuard guard(lock_);
     return last_sequence_;
 }
 
 bool detail::WriteCoordinator::fence_ready(std::uint64_t fence) const noexcept {
-    std::lock_guard lock(mutex_);
-    for (const Ticket &ticket : outstanding_) {
+    AtomicFlagGuard guard(lock_);
+    for (WriteTicket *ticket = head_; ticket != nullptr; ticket = ticket->next) {
         if (ticket->sequence <= fence) {
             return false;
         }
@@ -269,9 +304,16 @@ bool detail::WriteCoordinator::fence_ready(std::uint64_t fence) const noexcept {
 #ifdef ORCHFS_HAS_SPDK
 namespace {
 
-std::mutex global_backend_mutex;
-bool global_backend_active = false;
-bool global_env_initialized_once = false;
+std::atomic_flag global_backend_active = ATOMIC_FLAG_INIT;
+std::atomic<bool> global_env_initialized_once{false};
+
+// An address in thread-local storage is a stable, allocation-free owner token.
+// Unlike std::thread::id it can be compared atomically without a pthread lock.
+thread_local const std::byte poller_owner_token{};
+
+std::uintptr_t current_owner_token() noexcept {
+    return reinterpret_cast<std::uintptr_t>(&poller_owner_token);
+}
 
 enum class RequestKind {
     read,
@@ -282,9 +324,11 @@ enum class RequestKind {
 enum class RequestStage {
     ready,
     read_inflight,
+    direct_read_inflight,
     rmw_read_inflight,
     rmw_write_ready,
     write_inflight,
+    direct_write_inflight,
     flush_inflight,
     done,
 };
@@ -304,8 +348,11 @@ struct Request {
     std::error_code error;
     void *bounce{};
     PollerState *poller{};
+    detail::WriteTicket write_ticket_storage;
     detail::WriteCoordinator::Ticket write_ticket;
     std::uint64_t write_fence{};
+    Request *next{};
+    bool pooled{};
 };
 
 class DmaBouncePool {
@@ -367,20 +414,95 @@ private:
 };
 
 struct PollerState {
-    mutable std::mutex incoming_mutex;
-    std::list<std::unique_ptr<Request>> incoming;
-    std::list<std::unique_ptr<Request>> active;
+    // Producers publish complete Request objects to this Treiber MPSC inbox.
+    // Only the owning Runtime worker exchanges and drains it.
+    std::atomic<Request *> incoming{nullptr};
+    Request *active_head{};
+    Request *active_tail{};
 
-    mutable std::mutex owner_mutex;
-    bool owner_bound{};
+    std::atomic<std::uintptr_t> owner_token{0};
     bool polling{};
-    std::thread::id owner;
+    std::uint32_t admin_poll_ticks{1023};
+
+    std::vector<std::unique_ptr<Request>> request_storage;
+    std::vector<Request *> free_requests;
 
     struct spdk_nvme_qpair *qpair{};
     DmaBouncePool bounce_pool;
     bool initialized{};
     std::atomic<bool> stopped{false};
     std::atomic<bool> failed{false};
+
+    std::error_code initialize_request_pool(std::size_t count) {
+        try {
+            request_storage.reserve(count);
+            free_requests.reserve(count);
+            for (std::size_t index = 0; index < count; ++index) {
+                auto request = std::make_unique<Request>();
+                request->pooled = true;
+                free_requests.push_back(request.get());
+                request_storage.push_back(std::move(request));
+            }
+        } catch (const std::bad_alloc &) {
+            request_storage.clear();
+            free_requests.clear();
+            return std::make_error_code(std::errc::not_enough_memory);
+        }
+        return {};
+    }
+
+    Request *acquire_request() noexcept {
+        if (owner_token.load(std::memory_order_acquire) ==
+                current_owner_token() &&
+            !free_requests.empty()) {
+            Request *request = free_requests.back();
+            free_requests.pop_back();
+            return request;
+        }
+        return new (std::nothrow) Request();
+    }
+
+    void release_request(Request *request) noexcept {
+        if (request == nullptr) {
+            return;
+        }
+        request->stage = RequestStage::ready;
+        request->plan.segments.clear();
+        request->plan.physical_begin = 0;
+        request->plan.physical_end = 0;
+        request->segment_index = 0;
+        request->read_buffer = nullptr;
+        request->write_buffer = nullptr;
+        request->requested_bytes = 0;
+        request->callback = nullptr;
+        request->callback_context = nullptr;
+        request->error.clear();
+        request->bounce = nullptr;
+        request->poller = nullptr;
+        request->write_ticket = nullptr;
+        request->write_fence = 0;
+        request->next = nullptr;
+        if (request->pooled) {
+            free_requests.push_back(request);
+        } else {
+            delete request;
+        }
+    }
+
+    ~PollerState() {
+        Request *request = incoming.exchange(nullptr, std::memory_order_acquire);
+        while (request != nullptr) {
+            Request *next = request->next;
+            release_request(request);
+            request = next;
+        }
+        request = active_head;
+        while (request != nullptr) {
+            Request *next = request->next;
+            release_request(request);
+            request = next;
+        }
+    }
 };
 
 void release_bounce(Request &request) noexcept {
@@ -396,6 +518,26 @@ void finish_segment(Request &request) noexcept {
     request.stage = request.segment_index == request.plan.segments.size()
                         ? RequestStage::done
                         : RequestStage::ready;
+}
+
+void finish_direct_segment(Request &request) noexcept {
+    ++request.segment_index;
+    request.stage = request.segment_index == request.plan.segments.size()
+                        ? RequestStage::done
+                        : RequestStage::ready;
+}
+
+bool dma_addressable(const void *buffer, std::size_t length) noexcept {
+    if (buffer == nullptr || length == 0) {
+        return false;
+    }
+    std::uint64_t contiguous = length;
+    if (spdk_vtophys(buffer, &contiguous) == SPDK_VTOPHYS_ERROR) {
+        return false;
+    }
+    const auto *last = static_cast<const std::byte *>(buffer) + length - 1U;
+    contiguous = 1;
+    return spdk_vtophys(last, &contiguous) != SPDK_VTOPHYS_ERROR;
 }
 
 void fail_request(Request &request, std::error_code error) noexcept {
@@ -422,6 +564,10 @@ void command_complete(void *argument, const struct spdk_nvme_cpl *completion) {
         finish_segment(request);
         break;
     }
+    case RequestStage::direct_read_inflight:
+    case RequestStage::direct_write_inflight:
+        finish_direct_segment(request);
+        break;
     case RequestStage::rmw_read_inflight: {
         const IoSegment &segment = request.plan.segments[request.segment_index];
         std::memcpy(static_cast<std::byte *>(request.bounce) + segment.bounce_offset,
@@ -464,6 +610,7 @@ struct SpdkNvmeBackend::Impl {
     std::atomic<bool> accepting{true};
     std::atomic<bool> stopping{false};
     std::atomic<bool> closed{false};
+    std::atomic<std::size_t> submitting{0};
     bool environment_started{};
     detail::WriteCoordinator writes;
 
@@ -485,20 +632,32 @@ struct SpdkNvmeBackend::Impl {
             poller.qpair = nullptr;
             return error;
         }
+        error = poller.initialize_request_pool(
+            static_cast<std::size_t>(config.queue_depth) * 2U + 16U);
+        if (error) {
+            poller.bounce_pool.release_all();
+            spdk_nvme_ctrlr_free_io_qpair(poller.qpair);
+            poller.qpair = nullptr;
+            return error;
+        }
         poller.initialized = true;
         return {};
     }
 
     bool enter_poller(PollerState &poller, std::error_code &error) {
-        const std::thread::id current = std::this_thread::get_id();
-        std::lock_guard lock(poller.owner_mutex);
-        if (!poller.owner_bound) {
-            poller.owner = current;
-            poller.owner_bound = true;
-        } else if (poller.owner != current) {
-            error = make_error_code(BackendErrc::wrong_poller_thread);
-            return false;
+        const std::uintptr_t current = current_owner_token();
+        std::uintptr_t owner =
+            poller.owner_token.load(std::memory_order_acquire);
+        if (owner != current) {
+            if (owner != 0 || !poller.owner_token.compare_exchange_strong(
+                                  owner, current, std::memory_order_acq_rel,
+                                  std::memory_order_acquire)) {
+                error = make_error_code(BackendErrc::wrong_poller_thread);
+                return false;
+            }
         }
+        // Once bound, only this thread can enter the poller. A plain flag is
+        // therefore sufficient to reject callback-driven recursive polling.
         if (poller.polling) {
             error = make_error_code(BackendErrc::reentrant_poll);
             return false;
@@ -508,8 +667,51 @@ struct SpdkNvmeBackend::Impl {
     }
 
     void leave_poller(PollerState &poller) noexcept {
-        std::lock_guard lock(poller.owner_mutex);
         poller.polling = false;
+    }
+
+    std::error_code enqueue(PollerState &poller, Request *request) noexcept {
+        submitting.fetch_add(1, std::memory_order_acq_rel);
+        if (!accepting.load(std::memory_order_acquire)) {
+            submitting.fetch_sub(1, std::memory_order_acq_rel);
+            return make_error_code(BackendErrc::stopping);
+        }
+
+        Request *published = request;
+        Request *head = poller.incoming.load(std::memory_order_relaxed);
+        do {
+            published->next = head;
+        } while (!poller.incoming.compare_exchange_weak(
+            head, published, std::memory_order_release,
+            std::memory_order_relaxed));
+        submitting.fetch_sub(1, std::memory_order_release);
+        return {};
+    }
+
+    void drain_incoming(PollerState &poller) noexcept {
+        Request *stack =
+            poller.incoming.exchange(nullptr, std::memory_order_acquire);
+        Request *fifo = nullptr;
+        while (stack != nullptr) {
+            Request *next = stack->next;
+            stack->next = fifo;
+            fifo = stack;
+            stack = next;
+        }
+        if (fifo == nullptr) {
+            return;
+        }
+
+        Request *tail = fifo;
+        while (tail->next != nullptr) {
+            tail = tail->next;
+        }
+        if (poller.active_tail != nullptr) {
+            poller.active_tail->next = fifo;
+        } else {
+            poller.active_head = fifo;
+        }
+        poller.active_tail = tail;
     }
 
     int process_completions(PollerState &poller,
@@ -549,8 +751,10 @@ struct SpdkNvmeBackend::Impl {
                        std::error_code &poll_error) {
         if (request.stage == RequestStage::done ||
             request.stage == RequestStage::read_inflight ||
+            request.stage == RequestStage::direct_read_inflight ||
             request.stage == RequestStage::rmw_read_inflight ||
             request.stage == RequestStage::write_inflight ||
+            request.stage == RequestStage::direct_write_inflight ||
             request.stage == RequestStage::flush_inflight) {
             return;
         }
@@ -587,16 +791,53 @@ struct SpdkNvmeBackend::Impl {
         }
 
         const IoSegment &segment = request.plan.segments[request.segment_index];
-        if (request.bounce == nullptr) {
-            request.bounce = poller.bounce_pool.acquire();
-            if (request.bounce == nullptr) {
-                return;
+        const bool full_segment = !segment.read_before_write &&
+            segment.bounce_offset == 0 &&
+            segment.user_length == segment.device_length;
+        void *direct_buffer = nullptr;
+        if (full_segment) {
+            direct_buffer = request.kind == RequestKind::read
+                ? static_cast<void *>(request.read_buffer + segment.user_offset)
+                : const_cast<std::byte *>(
+                      request.write_buffer + segment.user_offset);
+            if (!dma_addressable(direct_buffer, segment.device_length)) {
+                direct_buffer = nullptr;
             }
         }
 
         const std::uint64_t lba_offset = segment.device_offset / lba;
         const std::uint32_t lba_count =
             static_cast<std::uint32_t>(segment.device_length / lba);
+        if (direct_buffer != nullptr) {
+            const int result = submit_with_retry(
+                poller,
+                [&] {
+                    return request.kind == RequestKind::read
+                        ? spdk_nvme_ns_cmd_read(namespace_handle,
+                                                poller.qpair, direct_buffer,
+                                                lba_offset, lba_count,
+                                                command_complete, &request, 0)
+                        : spdk_nvme_ns_cmd_write(namespace_handle,
+                                                 poller.qpair, direct_buffer,
+                                                 lba_offset, lba_count,
+                                                 command_complete, &request, 0);
+                },
+                poll_error);
+            if (result == 0) {
+                request.stage = request.kind == RequestKind::read
+                    ? RequestStage::direct_read_inflight
+                    : RequestStage::direct_write_inflight;
+            } else if (result != -ENOMEM) {
+                fail_request(request, error_from_negative_rc(result));
+            }
+            return;
+        }
+        if (request.bounce == nullptr) {
+            request.bounce = poller.bounce_pool.acquire();
+            if (request.bounce == nullptr) {
+                return;
+            }
+        }
 
         if (request.kind == RequestKind::read) {
             const int result = submit_with_retry(
@@ -669,7 +910,8 @@ struct SpdkNvmeBackend::Impl {
     }
 
     void fail_all(PollerState &poller, const std::error_code &error) {
-        for (auto &request : poller.active) {
+        for (Request *request = poller.active_head; request != nullptr;
+             request = request->next) {
             fail_request(*request, error);
         }
     }
@@ -688,31 +930,42 @@ struct SpdkNvmeBackend::Impl {
 
     std::size_t finish_requests(PollerState &poller) {
         std::size_t completed = 0;
-        for (auto iterator = poller.active.begin(); iterator != poller.active.end();) {
-            Request &request = **iterator;
-            if (request.stage != RequestStage::done) {
-                ++iterator;
+        Request *previous = nullptr;
+        Request *current = poller.active_head;
+        while (current != nullptr) {
+            if (current->stage != RequestStage::done) {
+                previous = current;
+                current = current->next;
                 continue;
             }
 
-            CompletionCallback callback = request.callback;
-            void *context = request.callback_context;
-            const std::error_code error = request.error;
-            const std::size_t bytes = error ? 0 : request.requested_bytes;
-            writes.complete(request.write_ticket);
-            iterator = poller.active.erase(iterator);
+            Request *finished = current;
+            current = current->next;
+            if (previous != nullptr) {
+                previous->next = current;
+            } else {
+                poller.active_head = current;
+            }
+            if (poller.active_tail == finished) {
+                poller.active_tail = previous;
+            }
+
+            CompletionCallback callback = finished->callback;
+            void *context = finished->callback_context;
+            const std::error_code error = finished->error;
+            const std::size_t bytes = error ? 0 : finished->requested_bytes;
+            writes.complete(finished->write_ticket);
+            poller.release_request(finished);
             ++completed;
             callback(context, error, bytes);
         }
         return completed;
     }
 
-    bool no_pending_work(PollerState &poller) {
-        if (!poller.active.empty()) {
-            return false;
-        }
-        std::lock_guard lock(poller.incoming_mutex);
-        return poller.incoming.empty();
+    bool no_pending_work(PollerState &poller) const noexcept {
+        return poller.active_head == nullptr &&
+               poller.incoming.load(std::memory_order_acquire) == nullptr &&
+               submitting.load(std::memory_order_acquire) == 0;
     }
 
     void stop_poller(PollerState &poller) noexcept {
@@ -764,20 +1017,15 @@ SpdkNvmeBackend::open(const Config &config, std::error_code &error) {
         return nullptr;
     }
 
-    bool reinitialize_environment = false;
-    {
-        std::lock_guard lock(global_backend_mutex);
-        if (global_backend_active) {
-            error = make_error_code(BackendErrc::controller_busy);
-            return nullptr;
-        }
-        global_backend_active = true;
-        reinitialize_environment = global_env_initialized_once;
+    if (global_backend_active.test_and_set(std::memory_order_acq_rel)) {
+        error = make_error_code(BackendErrc::controller_busy);
+        return nullptr;
     }
+    const bool reinitialize_environment =
+        global_env_initialized_once.load(std::memory_order_acquire);
 
     auto release_global_claim = [] {
-        std::lock_guard lock(global_backend_mutex);
-        global_backend_active = false;
+        global_backend_active.clear(std::memory_order_release);
     };
 
     std::error_code affinity_error;
@@ -823,10 +1071,7 @@ SpdkNvmeBackend::open(const Config &config, std::error_code &error) {
         error = error_from_negative_rc(result);
         return nullptr;
     }
-    {
-        std::lock_guard lock(global_backend_mutex);
-        global_env_initialized_once = true;
-    }
+    global_env_initialized_once.store(true, std::memory_order_release);
 
     struct spdk_nvme_transport_id transport {};
     transport.trtype = SPDK_NVME_TRANSPORT_PCIE;
@@ -927,8 +1172,8 @@ std::error_code SpdkNvmeBackend::submit_read(
         return make_error_code(BackendErrc::poller_failed);
     }
 
-    auto request = std::unique_ptr<Request>(new (std::nothrow) Request());
-    if (!request) {
+    Request *request = poller.acquire_request();
+    if (request == nullptr) {
         return std::make_error_code(std::errc::not_enough_memory);
     }
     request->kind = RequestKind::read;
@@ -944,22 +1189,19 @@ std::error_code SpdkNvmeBackend::submit_read(
                                     impl_->max_transfer,
                                     request->plan);
     if (error) {
+        poller.release_request(request);
         return error;
     }
     if (!destination.empty() && request->plan.physical_end > impl_->capacity) {
+        poller.release_request(request);
         return std::make_error_code(std::errc::no_space_on_device);
     }
 
-    try {
-        std::lock_guard lock(poller.incoming_mutex);
-        if (!impl_->accepting.load(std::memory_order_acquire)) {
-            return make_error_code(BackendErrc::stopping);
-        }
-        poller.incoming.push_back(std::move(request));
-    } catch (const std::bad_alloc &) {
-        return std::make_error_code(std::errc::not_enough_memory);
+    error = impl_->enqueue(poller, request);
+    if (error) {
+        poller.release_request(request);
     }
-    return {};
+    return error;
 #endif
 }
 
@@ -990,8 +1232,8 @@ std::error_code SpdkNvmeBackend::submit_write(
         return make_error_code(BackendErrc::poller_failed);
     }
 
-    auto request = std::unique_ptr<Request>(new (std::nothrow) Request());
-    if (!request) {
+    Request *request = poller.acquire_request();
+    if (request == nullptr) {
         return std::make_error_code(std::errc::not_enough_memory);
     }
     request->kind = RequestKind::write;
@@ -1007,36 +1249,31 @@ std::error_code SpdkNvmeBackend::submit_write(
                                     impl_->max_transfer,
                                     request->plan);
     if (error) {
+        poller.release_request(request);
         return error;
     }
     if (!source.empty() && request->plan.physical_end > impl_->capacity) {
+        poller.release_request(request);
         return std::make_error_code(std::errc::no_space_on_device);
     }
 
     detail::WriteCoordinator::Ticket write_ticket;
     if (!source.empty()) {
-        write_ticket = impl_->writes.accept(request->plan.physical_begin,
+        write_ticket = impl_->writes.accept(request->write_ticket_storage,
+                                            request->plan.physical_begin,
                                             request->plan.physical_end,
                                             error);
         if (error) {
+            poller.release_request(request);
             return error;
         }
         request->write_ticket = write_ticket;
     }
 
-    std::error_code enqueue_error;
-    try {
-        std::lock_guard lock(poller.incoming_mutex);
-        if (!impl_->accepting.load(std::memory_order_acquire)) {
-            enqueue_error = make_error_code(BackendErrc::stopping);
-        } else {
-            poller.incoming.push_back(std::move(request));
-        }
-    } catch (const std::bad_alloc &) {
-        enqueue_error = std::make_error_code(std::errc::not_enough_memory);
-    }
+    const std::error_code enqueue_error = impl_->enqueue(poller, request);
     if (enqueue_error) {
         impl_->writes.complete(write_ticket);
+        poller.release_request(request);
         return enqueue_error;
     }
     return {};
@@ -1064,22 +1301,50 @@ std::error_code SpdkNvmeBackend::submit_flush(
         return make_error_code(BackendErrc::poller_failed);
     }
 
-    try {
-        auto request = std::make_unique<Request>();
-        request->kind = RequestKind::flush;
-        request->callback = callback;
-        request->callback_context = callback_context;
-        request->poller = &poller;
-        request->write_fence = impl_->writes.capture_fence();
-        std::lock_guard lock(poller.incoming_mutex);
-        if (!impl_->accepting.load(std::memory_order_acquire)) {
-            return make_error_code(BackendErrc::stopping);
-        }
-        poller.incoming.push_back(std::move(request));
-    } catch (const std::bad_alloc &) {
+    Request *request = poller.acquire_request();
+    if (request == nullptr) {
         return std::make_error_code(std::errc::not_enough_memory);
     }
-    return {};
+    request->kind = RequestKind::flush;
+    request->callback = callback;
+    request->callback_context = callback_context;
+    request->poller = &poller;
+    request->write_fence = impl_->writes.capture_fence();
+    const std::error_code error = impl_->enqueue(poller, request);
+    if (error) {
+        poller.release_request(request);
+    }
+    return error;
+#endif
+}
+
+std::error_code SpdkNvmeBackend::register_memory(
+    void *address, std::size_t length) noexcept {
+#ifndef ORCHFS_HAS_SPDK
+    (void)address;
+    (void)length;
+    return std::make_error_code(std::errc::not_supported);
+#else
+    if (impl_ == nullptr || address == nullptr || length == 0 ||
+        impl_->closed.load(std::memory_order_acquire)) {
+        return invalid_argument();
+    }
+    return error_from_negative_rc(spdk_mem_register(address, length));
+#endif
+}
+
+std::error_code SpdkNvmeBackend::unregister_memory(
+    void *address, std::size_t length) noexcept {
+#ifndef ORCHFS_HAS_SPDK
+    (void)address;
+    (void)length;
+    return std::make_error_code(std::errc::not_supported);
+#else
+    if (impl_ == nullptr || address == nullptr || length == 0 ||
+        impl_->closed.load(std::memory_order_acquire)) {
+        return invalid_argument();
+    }
+    return error_from_negative_rc(spdk_mem_unregister(address, length));
 #endif
 }
 
@@ -1110,10 +1375,7 @@ PollResult SpdkNvmeBackend::poll(std::size_t poller_id,
         ~PollExit() { impl->leave_poller(*poller); }
     } poll_exit{impl_.get(), &poller};
 
-    {
-        std::lock_guard lock(poller.incoming_mutex);
-        poller.active.splice(poller.active.end(), poller.incoming);
-    }
+    impl_->drain_incoming(poller);
 
     if (poller.failed.load(std::memory_order_acquire)) {
         result.error = make_error_code(BackendErrc::poller_failed);
@@ -1127,7 +1389,8 @@ PollResult SpdkNvmeBackend::poll(std::size_t poller_id,
     }
 
     if (!poller.initialized) {
-        if (impl_->stopping.load(std::memory_order_acquire) && poller.active.empty()) {
+        if (impl_->stopping.load(std::memory_order_acquire) &&
+            impl_->no_pending_work(poller)) {
             impl_->stop_poller(poller);
             result.stopped = true;
             return result;
@@ -1144,7 +1407,10 @@ PollResult SpdkNvmeBackend::poll(std::size_t poller_id,
         }
     }
 
-    if (poller_id == 0) {
+    constexpr std::uint32_t kAdminPollMask = 1023;
+    if (poller_id == 0 &&
+        ((++poller.admin_poll_ticks & kAdminPollMask) == 0 ||
+         impl_->stopping.load(std::memory_order_acquire))) {
         const int admin_result =
             spdk_nvme_ctrlr_process_admin_completions(impl_->controller);
         if (admin_result < 0) {
@@ -1161,7 +1427,8 @@ PollResult SpdkNvmeBackend::poll(std::size_t poller_id,
     }
 
     if (!result.error) {
-        for (auto &request : poller.active) {
+        for (Request *request = poller.active_head; request != nullptr;
+             request = request->next) {
             impl_->drive_request(poller, *request, result.error);
             if (result.error) {
                 impl_->fail_poller(poller, result.error);
@@ -1237,10 +1504,7 @@ std::error_code SpdkNvmeBackend::close() noexcept {
         impl_->environment_started = false;
     }
     impl_->closed.store(true, std::memory_order_release);
-    {
-        std::lock_guard lock(global_backend_mutex);
-        global_backend_active = false;
-    }
+    global_backend_active.clear(std::memory_order_release);
     return {};
 #endif
 }

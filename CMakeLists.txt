@@ -15,14 +15,19 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(ORCHFS_ENABLE_SPDK
        "Build the KFS NVMe backend with SPDK support" OFF)
-option(ORCHFS_ENABLE_ASYNC_SERVER
-       "Start the authoritative coroutine RPC server inside kfs_main" ON)
+option(ORCHFS_BUILD_KFS
+       "Build the production Runtime-owned KFS server" OFF)
+if(ORCHFS_BUILD_KFS AND NOT ORCHFS_ENABLE_SPDK)
+  set(ORCHFS_ENABLE_SPDK ON CACHE BOOL
+      "Production KFS requires the SPDK backend" FORCE)
+  message(STATUS "ORCHFS_BUILD_KFS=ON: enabling ORCHFS_ENABLE_SPDK")
+endif()
 set(SPDK_ROOT "/opt/orchfs/spdk" CACHE PATH
     "Fixed SPDK source/build prefix (the supported baseline is SPDK v26.01)")
 
 set(ORCHFS_PUBLIC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
-function(orchfs_enable_legacy_options target)
+function(orchfs_enable_project_options target)
   target_compile_options(
     ${target}
     PRIVATE
@@ -64,8 +69,8 @@ target_include_directories(orchfs_async_client PUBLIC
 target_link_libraries(orchfs_async_client
   PUBLIC orchfs_async_runtime orchfs_async_ipc Threads::Threads)
 
-# KFS-side authoritative dispatcher. Legacy OrchFS core symbols are resolved by
-# the final KFS executable, not by this static library.
+# KFS-side authoritative dispatcher. The injected AsyncFilesystem implementation
+# is resolved by the final KFS executable, not by this transport-only library.
 add_library(orchfs_async_server STATIC Async/server.cpp)
 add_library(orchfs::async_server ALIAS orchfs_async_server)
 target_compile_features(orchfs_async_server PUBLIC cxx_std_20)
@@ -75,6 +80,26 @@ target_include_directories(orchfs_async_server PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS")
 target_link_libraries(orchfs_async_server
   PUBLIC orchfs_async_runtime orchfs_async_ipc Threads::Threads)
+
+add_library(orchfs_async_device STATIC Async/block_device.cpp)
+target_compile_features(orchfs_async_device PUBLIC cxx_std_20)
+target_include_directories(orchfs_async_device PUBLIC
+  "${ORCHFS_PUBLIC_INCLUDE_DIR}")
+target_include_directories(orchfs_async_device PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS")
+target_link_libraries(orchfs_async_device PUBLIC orchfs_async_runtime)
+target_link_libraries(orchfs_async_server PUBLIC orchfs_async_device)
+
+add_library(orchfs_kfs_coroutine_core STATIC
+  Async/kfs_coroutine_core.cpp)
+target_compile_features(orchfs_kfs_coroutine_core PUBLIC cxx_std_20)
+target_include_directories(orchfs_kfs_coroutine_core PUBLIC
+  "${ORCHFS_PUBLIC_INCLUDE_DIR}")
+target_include_directories(orchfs_kfs_coroutine_core PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/LibFS"
+  "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS")
+target_link_libraries(orchfs_kfs_coroutine_core PUBLIC
+  orchfs_async_runtime orchfs_async_device)
 
 # SPDK-backed NVMe data path. The same target remains usable with SPDK disabled;
 # open then reports ENOTSUP and the hardware-independent planning tests still run.
@@ -219,39 +244,7 @@ if(ORCHFS_ENABLE_SPDK)
   message(STATUS "OrchFS SPDK prefix: ${SPDK_ROOT} (${_orchfs_spdk_version})")
 endif()
 
-# ---------------------------------------------------------------------------
-# Original LibFS / KFS targets. Their names and command targets are preserved.
-
-set(OrchFS_LIBFS_COREsrc
-  LibFS/index.c
-  LibFS/io_thdpool.c
-  LibFS/lib_dir.c
-  LibFS/lib_func.c
-  LibFS/lib_inode.c
-  LibFS/lib_log.c
-  LibFS/lib_rwfunc.c
-  LibFS/lib_socket.c
-  LibFS/libspace.c
-  LibFS/meta_cache.c
-  LibFS/req_kernel.c
-  LibFS/runtime.c
-  LibFS/ffile.c
-  LibFS/dir_cache.c
-  LibFS/lib_shm.c
-  LibFS/migrate.c
-  util/hashtable.c
-  util/radixtree.c
-  util/orch_list.c
-  util/orch_array.c
-  util/LRU.c)
-set(OrchFS_LIBFSsrc ${OrchFS_LIBFS_COREsrc} KernelFS/device.c)
-
-add_library(OrchFS_LIBFS STATIC ${OrchFS_LIBFSsrc})
-orchfs_enable_legacy_options(OrchFS_LIBFS)
-target_include_directories(OrchFS_LIBFS PUBLIC LibFS)
-target_link_libraries(OrchFS_LIBFS PUBLIC pmem Threads::Threads dl)
-
-# Keep the preload boundary independent of the legacy in-process core. This is
+# Keep the preload boundary independent of the KFS on-media layout core. This is
 # both the ownership boundary (LibFS never opens an NVMe controller) and a
 # loader-safety requirement: pulling libpmem/device constructors into an
 # LD_PRELOAD DSO can recurse through interposed libc calls before real_ops is
@@ -265,90 +258,95 @@ target_link_libraries(orchfs_async_posix_adapter PUBLIC
   orchfs_async_client Threads::Threads)
 
 add_library(OrchFS SHARED LibFS/orchfs_wrapper.c)
-orchfs_enable_legacy_options(OrchFS)
+orchfs_enable_project_options(OrchFS)
 target_include_directories(OrchFS PUBLIC LibFS)
 target_link_libraries(OrchFS PRIVATE
   orchfs_async_posix_adapter Threads::Threads dl)
 
-# The KFS coroutine server embeds the existing filesystem core but uses the
-# KFS-owned device instance. Keeping device.c out of this archive guarantees
-# that LibFS never opens a second NVMe/SPDK handle in the server process.
-if(ORCHFS_ENABLE_ASYNC_SERVER)
-  add_library(OrchFS_SERVER_CORE STATIC ${OrchFS_LIBFS_COREsrc})
-  orchfs_enable_legacy_options(OrchFS_SERVER_CORE)
-  # LibFS and KFS historically used the same two private helper names in
-  # separate processes. They now coexist in kfs_main, so namespace the LibFS
-  # copies without changing either public interface.
-  target_compile_definitions(OrchFS_SERVER_CORE PRIVATE
-    init_send_port_basic_info=libfs_init_send_port_basic_info
-    init_recv_port_basic_info=libfs_init_recv_port_basic_info)
-  target_include_directories(OrchFS_SERVER_CORE PUBLIC LibFS KernelFS)
-  target_link_libraries(OrchFS_SERVER_CORE PUBLIC pmem Threads::Threads dl)
+if(ORCHFS_BUILD_KFS)
+  # On-media layout implementation encapsulated by KfsCoroutineCore.
+  # It contains no transport, fd table, I/O pool, or service thread.
+  set(ORCHFS_KFS_LAYOUT_SOURCES
+    LibFS/index.c
+    LibFS/kfs_core_api.c
+    LibFS/kfs_data_plan.c
+    LibFS/lib_inode.c
+    LibFS/lib_log.c
+    LibFS/libspace.c
+    LibFS/meta_cache.c
+    LibFS/req_kernel.c
+    LibFS/migrate.c
+    util/radixtree.c
+    util/orch_list.c
+    util/orch_array.c)
+  add_library(orchfs_kfs_layout_core STATIC ${ORCHFS_KFS_LAYOUT_SOURCES})
+  orchfs_enable_project_options(orchfs_kfs_layout_core)
+  target_compile_definitions(orchfs_kfs_layout_core PRIVATE
+    ORCHFS_IN_PROCESS_DEVICE_IO=1)
+  target_include_directories(orchfs_kfs_layout_core PUBLIC LibFS KernelFS)
+  target_link_libraries(orchfs_kfs_layout_core PUBLIC pmem dl)
+
+  add_library(orchfs_kfs_service STATIC
+    KernelFS/balloc.c
+    KernelFS/device.c
+    KernelFS/kernel_func.c
+    KernelFS/log.c
+    KernelFS/async_server_bridge.cpp
+    KernelFS/spdk_device_service.cpp
+    util/hashtable.c
+    util/orch_list.c
+    util/orch_array.c)
+  orchfs_enable_project_options(orchfs_kfs_service)
+  target_include_directories(orchfs_kfs_service PUBLIC
+    KernelFS LibFS "${ORCHFS_PUBLIC_INCLUDE_DIR}")
+  target_compile_definitions(orchfs_kfs_service PRIVATE
+    ORCHFS_KFS_SERVER=1 ORCHFS_ENABLE_SPDK=1)
+  target_link_libraries(orchfs_kfs_service PUBLIC
+    pmem orchfs_spdk_backend orchfs_async_server
+    orchfs_kfs_coroutine_core orchfs_kfs_layout_core)
+
+  add_executable(kfs_main KernelFS/kernel_main.c)
+  orchfs_enable_project_options(kfs_main)
+  target_link_libraries(kfs_main PRIVATE orchfs_kfs_service)
+  add_custom_target(run_kfs_main DEPENDS kfs_main COMMAND kfs_main)
+
+  add_executable(orchfs_layered_benchmark
+    KernelFS/layered_benchmark.cpp)
+  orchfs_enable_project_options(orchfs_layered_benchmark)
+  target_include_directories(orchfs_layered_benchmark PRIVATE
+    KernelFS "${ORCHFS_PUBLIC_INCLUDE_DIR}")
+  target_link_libraries(orchfs_layered_benchmark PRIVATE
+    orchfs_kfs_service)
+
+  # The formatter owns SPDK on its calling thread and polls each qpair itself.
+  add_executable(mkfs
+    KernelFS/mkfs.c
+    KernelFS/balloc.c
+    KernelFS/device.c
+    KernelFS/kindex.c
+    KernelFS/log.c
+    KernelFS/spdk_device_service.cpp
+    util/hashtable.c
+    util/orch_list.c
+    util/orch_array.c)
+  orchfs_enable_project_options(mkfs)
+  target_include_directories(mkfs PRIVATE
+    KernelFS "${ORCHFS_PUBLIC_INCLUDE_DIR}")
+  target_compile_definitions(mkfs PRIVATE
+    ORCHFS_KFS_SERVER=1 ORCHFS_ENABLE_SPDK=1 ORCHFS_FORMATTER=1)
+  target_link_libraries(mkfs PRIVATE
+    pmem orchfs_spdk_backend orchfs_async_runtime)
+  add_custom_target(run_mkfs DEPENDS mkfs COMMAND mkfs)
 endif()
-
-set(OrchFS_KERFSsrc
-  KernelFS/balloc.c
-  KernelFS/device.c
-  KernelFS/kernel_func.c
-  KernelFS/kernel_recv.c
-  KernelFS/kernel_send.c
-  KernelFS/log.c
-  KernelFS/thdpool.c
-  KernelFS/kindex.c
-  KernelFS/close_kfs.c
-  KernelFS/execio_thdpool.c
-  KernelFS/ker_shm.c
-  util/hashtable.c
-  util/orch_list.c
-  util/orch_array.c)
-
-add_library(OrchFS_KERFS STATIC ${OrchFS_KERFSsrc})
-orchfs_enable_legacy_options(OrchFS_KERFS)
-target_include_directories(OrchFS_KERFS PUBLIC KernelFS)
-target_compile_definitions(OrchFS_KERFS PRIVATE ORCHFS_KFS_SERVER=1)
-target_link_libraries(OrchFS_KERFS
-  PUBLIC pmem Threads::Threads orchfs_spdk_backend)
-
-# These files are integration seams added by the coroutine/SPDK conversion.
-if(ORCHFS_ENABLE_SPDK)
-  target_compile_definitions(OrchFS_KERFS PRIVATE ORCHFS_ENABLE_SPDK=1)
-endif()
-if(ORCHFS_ENABLE_SPDK AND
-   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS/spdk_device_service.cpp")
-  target_sources(OrchFS_KERFS PRIVATE KernelFS/spdk_device_service.cpp)
-endif()
-if(ORCHFS_ENABLE_ASYNC_SERVER AND
-   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS/async_server_bridge.cpp")
-  target_compile_definitions(OrchFS_KERFS PRIVATE
-    ORCHFS_ENABLE_ASYNC_SERVER=1)
-  target_sources(OrchFS_KERFS PRIVATE KernelFS/async_server_bridge.cpp)
-  target_link_libraries(OrchFS_KERFS
-    PUBLIC orchfs_async_server OrchFS_SERVER_CORE)
-endif()
-
-add_executable(mkfs KernelFS/mkfs.c)
-orchfs_enable_legacy_options(mkfs)
-target_link_libraries(mkfs PRIVATE OrchFS_KERFS)
-add_custom_target(run_mkfs DEPENDS mkfs COMMAND mkfs)
-
-add_executable(kfs_main KernelFS/kernel_main.c)
-orchfs_enable_legacy_options(kfs_main)
-target_link_libraries(kfs_main PRIVATE OrchFS_KERFS)
-add_custom_target(run_kfs_main DEPENDS kfs_main COMMAND kfs_main)
-
-add_executable(close_kfs KernelFS/close_kfs.c)
-orchfs_enable_legacy_options(close_kfs)
-target_link_libraries(close_kfs PRIVATE OrchFS_KERFS)
-add_custom_target(run_close_kfs DEPENDS close_kfs COMMAND close_kfs)
 
 add_executable(paralleltest2-ComFS test/paralleltest2-ComFS.c)
-orchfs_enable_legacy_options(paralleltest2-ComFS)
+orchfs_enable_project_options(paralleltest2-ComFS)
 target_link_libraries(paralleltest2-ComFS PRIVATE Threads::Threads)
 add_custom_target(run_paralleltest2-ComFS
   DEPENDS paralleltest2-ComFS COMMAND paralleltest2-ComFS)
 
 add_executable(paralleltest3-ComFS test/paralleltest3-ComFS.c)
-orchfs_enable_legacy_options(paralleltest3-ComFS)
+orchfs_enable_project_options(paralleltest3-ComFS)
 target_link_libraries(paralleltest3-ComFS PRIVATE Threads::Threads)
 add_custom_target(run_paralleltest3-ComFS
   DEPENDS paralleltest3-ComFS COMMAND paralleltest3-ComFS)
@@ -365,32 +363,13 @@ if(ORCHFS_ENABLE_SPDK)
 endif()
 
 if(BUILD_TESTING)
-  # Exercise the legacy functions that form the blocking boundary of the
-  # coroutine server without opening a real DAX/NVMe device. Function sections
-  # let the small mock harness link only the lib_func.c entry points it tests.
-  add_executable(legacy_lib_func_test
-    test/legacy_lib_func_test.c
-    LibFS/lib_func.c)
-  target_include_directories(legacy_lib_func_test PRIVATE LibFS KernelFS)
-  target_compile_options(legacy_lib_func_test PRIVATE
-    -fcommon -ffunction-sections)
-  target_link_options(legacy_lib_func_test PRIVATE -Wl,--gc-sections)
-  target_link_libraries(legacy_lib_func_test PRIVATE Threads::Threads)
-  add_test(NAME legacy_lib_func COMMAND legacy_lib_func_test)
-  set_tests_properties(legacy_lib_func PROPERTIES
-    TIMEOUT 30 LABELS "legacy;unit")
-
-  add_executable(legacy_rename_core_test
-    test/legacy_rename_core_test.c
-    LibFS/lib_dir.c)
-  target_include_directories(legacy_rename_core_test PRIVATE LibFS KernelFS)
-  target_compile_options(legacy_rename_core_test PRIVATE
-    -fcommon -ffunction-sections)
-  target_link_options(legacy_rename_core_test PRIVATE -Wl,--gc-sections)
-  target_link_libraries(legacy_rename_core_test PRIVATE Threads::Threads)
-  add_test(NAME legacy_rename_core COMMAND legacy_rename_core_test)
-  set_tests_properties(legacy_rename_core PROPERTIES
-    TIMEOUT 30 LABELS "legacy;unit")
+  set(ORCHFS_SANITIZER_FLAGS
+      "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_SHARED_LINKER_FLAGS}")
+  if(ORCHFS_SANITIZER_FLAGS MATCHES "(^| )-fsanitize=thread( |$)")
+    set(ORCHFS_THREAD_SANITIZER_BUILD ON)
+  else()
+    set(ORCHFS_THREAD_SANITIZER_BUILD OFF)
+  endif()
 
   add_executable(legacy_wrapper_host_test test/legacy_wrapper_host_test.c)
   add_dependencies(legacy_wrapper_host_test OrchFS)
@@ -401,11 +380,36 @@ if(BUILD_TESTING)
       $<TARGET_FILE:legacy_wrapper_host_test>)
   set_tests_properties(legacy_wrapper_host PROPERTIES
     TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "legacy;preload;integration")
+  if(ORCHFS_THREAD_SANITIZER_BUILD)
+    # Injecting a TSAN-instrumented DSO with LD_PRELOAD can collide with the
+    # sanitizer's fixed shadow mapping before main(). The ordinary build still
+    # covers this boundary; the runtime-native tests below carry the TSAN run.
+    set_tests_properties(legacy_wrapper_host PROPERTIES DISABLED TRUE)
+  endif()
 
   add_executable(async_runtime_test test/async_runtime_test.cpp)
   target_link_libraries(async_runtime_test PRIVATE orchfs_async_runtime)
   add_test(NAME async_runtime COMMAND async_runtime_test)
   set_tests_properties(async_runtime PROPERTIES TIMEOUT 30 LABELS "async;unit")
+  if(ORCHFS_THREAD_SANITIZER_BUILD)
+    # This test intentionally recreates a Runtime in a child after fork.
+    set_tests_properties(async_runtime PROPERTIES
+      ENVIRONMENT "TSAN_OPTIONS=die_after_fork=0:halt_on_error=1")
+  endif()
+
+  add_executable(async_block_device_test test/async_block_device_test.cpp)
+  target_link_libraries(async_block_device_test PRIVATE
+    orchfs_async_device orchfs_async_runtime)
+  add_test(NAME async_block_device COMMAND async_block_device_test)
+  set_tests_properties(async_block_device PROPERTIES
+    TIMEOUT 30 LABELS "async;device;unit")
+
+  add_executable(kfs_coroutine_core_test test/kfs_coroutine_core_test.cpp)
+  target_link_libraries(kfs_coroutine_core_test PRIVATE
+    orchfs_kfs_coroutine_core orchfs_async_device orchfs_async_runtime)
+  add_test(NAME kfs_coroutine_core COMMAND kfs_coroutine_core_test)
+  set_tests_properties(kfs_coroutine_core PROPERTIES
+    TIMEOUT 30 LABELS "async;kfs;unit")
 
   add_executable(async_ipc_test test/async_ipc_test.cpp)
   target_link_libraries(async_ipc_test PRIVATE orchfs_async_ipc)
@@ -422,6 +426,11 @@ if(BUILD_TESTING)
     add_test(NAME async_client_server COMMAND async_client_server_test)
     set_tests_properties(async_client_server PROPERTIES
       TIMEOUT 30 LABELS "async;ipc;integration")
+    if(ORCHFS_THREAD_SANITIZER_BUILD)
+      # The LD_PRELOAD boundary has its own ordinary-build test above.
+      set_tests_properties(async_client_server PROPERTIES
+        ENVIRONMENT "ORCHFS_SKIP_WRAPPER_TEST=1;TSAN_OPTIONS=die_after_fork=0:halt_on_error=1")
+    endif()
   endif()
 
   add_executable(spdk_nvme_logic_test test/spdk_nvme_logic_test.cpp)
@@ -432,4 +441,19 @@ if(BUILD_TESTING)
   endif()
   add_test(NAME spdk_nvme_logic COMMAND spdk_nvme_logic_test)
   set_tests_properties(spdk_nvme_logic PROPERTIES TIMEOUT 30 LABELS "spdk;unit")
+
+  if(TARGET kfs_main)
+    add_test(NAME runtime_native_static_gate
+      COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DKFS_BINARY=$<TARGET_FILE:kfs_main>"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/runtime_native_gate.cmake")
+  else()
+    add_test(NAME runtime_native_static_gate
+      COMMAND "${CMAKE_COMMAND}"
+        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/runtime_native_gate.cmake")
+  endif()
+  set_tests_properties(runtime_native_static_gate PROPERTIES
+    TIMEOUT 30 LABELS "async;static")
 endif()

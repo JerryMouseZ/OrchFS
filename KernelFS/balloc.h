@@ -2,7 +2,7 @@
 #define ALLOC_H
 
 #include <stdint.h>
-#include <pthread.h>
+#include <stddef.h>
 #include <unistd.h>
 #include <stdio.h>
 
@@ -38,7 +38,12 @@ struct memory_bitmap_info_t
     // read from config
     uint64_t bmp_capacity;                  // Capacity of Bitmap
     uint64_t blk_area_start;                    
-    uint64_t blk_size;                     
+    uint64_t blk_size;
+    /* One allocation cursor per Runtime worker.  Workers first scan their
+     * disjoint shard; atomic bit claims make fallback and cross-worker frees
+     * safe without an allocator lock. */
+    uint64_t* shard_cursor;
+    size_t shard_count;
 };
 typedef struct memory_bitmap_info_t mem_bmp_t;
 typedef mem_bmp_t* mem_bmp_pt;
@@ -72,14 +77,14 @@ uint64_t alloc_single_inode(int return_type);
  * @return_type:        Type of return value, block ID or device address
  * @return              
  */
-void alloc_inodes(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
+int alloc_inodes(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
 
 /* dealloc an inode
  * @dealloc_blk_info:   The address or block ID of the block that needs to be released
  * @par_type:           Type of parameter, block ID or device address
  * @return               
  */
-void dealloc_inode(uint64_t dealloc_blk_info, int par_type);
+int dealloc_inode(uint64_t dealloc_blk_info, int par_type);
 
 /*---------------------------------index----------------------------------*/
 /* alloc an index node
@@ -94,14 +99,14 @@ uint64_t alloc_single_idx_node(int return_type);
  * @return_type:        Type of return value, block ID or device address
  * @return               
  */
-void alloc_idx_nodes(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
+int alloc_idx_nodes(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
 
 /* dealloc a index node
  * @dealloc_blk_info:   The address or block ID of the block that needs to be released
  * @par_type:           Type of parameter, block ID or device address
  * @return              
  */
-void dealloc_idx_node(uint64_t dealloc_blk_info, int par_type);
+int dealloc_idx_node(uint64_t dealloc_blk_info, int par_type);
 
 /*------------------------------vir index--------------------------------*/
 /* alloc a virtural index node
@@ -116,14 +121,14 @@ uint64_t alloc_single_viridx_node(int return_type);
  * @return_type:        Type of return value, block ID or device address
  * @return              
  */
-void alloc_viridx_nodes(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
+int alloc_viridx_nodes(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
 
 /* dealloc a virtural index node
  * @dealloc_blk_info:   The address or block ID of the block that needs to be released
  * @par_type:           Type of parameter, block ID or device address
  * @return              
  */
-void dealloc_viridx_node(uint64_t dealloc_blk_info, int par_type);
+int dealloc_viridx_node(uint64_t dealloc_blk_info, int par_type);
 
 /*-------------------------------buf meta--------------------------------*/
 /* alloc a buffer metadata node
@@ -138,14 +143,14 @@ uint64_t alloc_single_bufmeta_node(int return_type);
  * @return_type:        Type of return value, block ID or device address
  * @return              
  */
-void alloc_bufmeta_nodes(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
+int alloc_bufmeta_nodes(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
 
 /* dealloc a buffer metadata node
  * @dealloc_blk_info:   The address or block ID of the block that needs to be released
  * @par_type:           Type of parameter, block ID or device address
  * @return               
  */
-void dealloc_bufmeta_node(uint64_t dealloc_blk_info, int par_type);
+int dealloc_bufmeta_node(uint64_t dealloc_blk_info, int par_type);
 
 /*----------------------------------nvm-----------------------------------*/
 /* alloc nvm page
@@ -160,14 +165,14 @@ uint64_t alloc_single_nvm_page(int return_type);
  * @return_type:        Type of return value, block ID or device address
  * @return               
  */
-void alloc_nvm_pages(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
+int alloc_nvm_pages(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
 
 /* dealloc a nvm page
  * @dealloc_blk_info:   The address or block ID of the block that needs to be released
  * @par_type:           Type of return value, block ID or device address
  * @return              
  */
-void dealloc_nvm_page(uint64_t dealloc_blk_info, int par_type);
+int dealloc_nvm_page(uint64_t dealloc_blk_info, int par_type);
 
 /*----------------------------------ssd-----------------------------------*/
 /* alloc ssd block
@@ -182,14 +187,14 @@ uint64_t alloc_single_ssd_block(int return_type);
  * @return_type:        Type of return value, block ID or device address
  * @return              
  */
-void alloc_ssd_blocks(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
+int alloc_ssd_blocks(int64_t alloc_blk_num, uint64_t addr_list[], int return_type);
 
 /* dealloc a ssd block
  * @dealloc_blk_info:   The address or block ID of the block that needs to be released
  * @par_type:           Type of parameter, block ID or device address
  * @return               
  */
-void dealloc_ssd_block(uint64_t dealloc_blk_info, int par_type);
+int dealloc_ssd_block(uint64_t dealloc_blk_info, int par_type);
 
 
 #endif

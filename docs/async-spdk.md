@@ -21,8 +21,8 @@ for release sources.
 ## Build without SPDK
 
 The default build needs no SPDK installation. It builds the coroutine runtime,
-IPC, client/server libraries, a non-SPDK NVMe bridge, the original targets, and
-hardware-independent tests:
+IPC, client/server libraries, the POSIX/LD_PRELOAD adapter, a non-SPDK NVMe
+bridge, and hardware-independent tests. It intentionally does not build KFS:
 
 ```bash
 cmake -S . -B build-async \
@@ -44,10 +44,14 @@ The main CMake targets are:
 | `orchfs_async_ipc` | Unix control socket and shared-memory SQ/CQ transport |
 | `orchfs_async_client` | LibFS-side asynchronous proxy API |
 | `orchfs_async_server` | KFS-side authoritative request dispatcher |
+| `orchfs_async_device` | Runtime-resuming asynchronous block-device phases |
+| `orchfs_kfs_coroutine_core` | Runtime-native filesystem implementation behind `AsyncFilesystem` |
 | `orchfs_spdk_backend` | SPDK NVMe backend, or an `ENOTSUP` stub when disabled |
+| `OrchFS` | POSIX/LD_PRELOAD compatibility adapter backed by the async client |
 
-The legacy targets (`OrchFS`, `OrchFS_LIBFS`, `OrchFS_KERFS`, `mkfs`,
-`kfs_main`, and `close_kfs`) remain available.
+The old LibFS/KFS service targets, NOASYNC mode, and `close_kfs` helper have
+been removed. `kfs_main` and the standalone `mkfs` formatter are created only
+when `ORCHFS_BUILD_KFS=ON`; that option force-enables SPDK.
 
 ## Build with SPDK v26.01
 
@@ -60,7 +64,7 @@ SPDK-generated metadata below that prefix, normally under
 cmake -S . -B build-spdk \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_TESTING=ON \
-  -DORCHFS_ENABLE_SPDK=ON \
+  -DORCHFS_BUILD_KFS=ON \
   -DSPDK_ROOT=/opt/orchfs/spdk
 cmake --build build-spdk -j"$(nproc)"
 ctest --test-dir build-spdk --output-on-failure
@@ -73,6 +77,48 @@ compile against one tree and link against another.
 
 The CTest suite still performs no media I/O in an SPDK-enabled build. Device
 tests must be launched explicitly after the checks in the next section.
+
+## Comparable four-layer performance benchmark
+
+Performance work uses one fixed ladder so an optimization can be attributed to
+the layer it actually changes:
+
+1. the official `spdk_nvme_perf` raw path;
+2. `AsyncBlockDevice` called directly on KFS Runtime workers;
+3. `KfsCoroutineCore` called directly, with no shared-memory RPC;
+4. `Client` / shared-memory RPC / KFS end to end.
+
+All four use 64 KiB requests, total QD 64, the same four KFS CPUs, 64
+coroutines where the layer has coroutines, 16,384 timed operations, and five
+runs. The direct and E2E write samples overwrite fully allocated extents and
+include the final sync. The runner records every sample plus the five-run
+median for throughput, IOPS, and p99:
+
+```bash
+sudo -E env \
+  ORCHFS_LAYERED_BENCHMARK_DESTRUCTIVE=ERASE_AND_REFORMAT \
+  ORCHFS_SPDK_PCI_BDF='0000:BB:DD.F' \
+  ORCHFS_SPDK_NSID='1' \
+  ORCHFS_ASYNC_BENCHMARK_SERVER_CPUS='1,3,5,7' \
+  ORCHFS_ASYNC_BENCHMARK_CLIENT_CPUS='9,11,13,15' \
+  scripts/async/run_layered_benchmark.sh
+```
+
+This runner is intentionally destructive. It refuses to run unless the exact
+opt-in token is present, the controller is already bound to `vfio-pci` or
+`uio_pci_generic`, hugepages exist, and all benchmark binaries are available.
+Raw SPDK writes invalidate the selected namespace; the runner then executes
+`mkfs` before measuring either KFS layer. It does not bind or reset a PCI
+device. The direct block-device range defaults to 2 TiB and is rejected unless
+it is 64 KiB aligned, lies entirely above OrchFS's 1 TiB on-media format, and
+fits in the selected namespace. Override it only with an explicitly reserved
+range through `ORCHFS_LAYERED_BENCHMARK_DEVICE_OFFSET`.
+
+The official raw tool reports completed writes but does not issue the
+filesystem-level sync used by the three OrchFS write samples. Its raw write
+phase is therefore labeled `write`, while the other layers are labeled
+`write+sync`; this keeps the peak-device denominator explicit rather than
+silently presenting unlike durability semantics as identical.
 
 `spdk_nvme_device_test` is deliberately not a CTest. It refuses to read the
 namespace unless all of the following are supplied: the destructive opt-in,
@@ -142,10 +188,14 @@ grep -E 'HugePages_(Total|Free)|Hugepagesize' /proc/meminfo
 readlink "/sys/bus/pci/devices/${ORCHFS_SPDK_PCI_BDF}/driver"
 ```
 
-Start KFS with the edited environment preserved:
+Start KFS with the edited environment preserved. Stop it with `SIGINT` or
+`SIGTERM`; shutdown stops admission, drains client/core/journal/migration work,
+stops SPDK while the Runtime is alive, and stops the Runtime last:
 
 ```bash
 sudo -E ./build-spdk/kfs_main
+# In another terminal:
+sudo kill -TERM "$(pidof kfs_main)"
 ```
 
 Stop KFS and let it drain before resetting the device. Do not reset a
@@ -205,29 +255,31 @@ The shared-memory footprint grows approximately with
 worker counts and IPC sizing explicit. The protocol currently supports at most
 120 lanes per client.
 
-Each SPDK poller owns one qpair. Submission, completion polling, and qpair
-destruction stay on that poller's thread. The backend uses DMA bounce buffers
+Each KFS Runtime worker owns one SPDK qpair. Submission, completion polling,
+and qpair destruction stay on that worker; SPDK creates no OrchFS service
+thread. The backend uses DMA bounce buffers
 for unaligned reads and read-modify-write, splits transfers at the configured
 maximum, retries transient queue pressure, and maps filesystem sync to a real
 NVMe flush. A physical LBA-range reservation spans the complete logical write,
 so overlapping RMW operations serialize while non-overlapping writes remain
 concurrent. Flush captures a global write fence and waits for every logical
-write accepted through that fence on every poller before issuing the namespace
+write accepted through that fence on every worker before issuing the namespace
 flush.
 
-SPDK completion callbacks execute on their qpair's poller thread. They may
+SPDK completion callbacks execute on their qpair's owning Runtime worker. They may
 submit more asynchronous work, but must not invoke blocking device entry points,
 stop the device service, or recursively poll the same qpair; these cases return
 `EDEADLK`.
 
-The v1 authoritative metadata implementation is still the existing synchronous
-core, isolated on the fixed blocking executor; the public API, IPC path, and
-device path are asynchronous, but the legacy metadata algorithms themselves
-have not been rewritten as nonblocking coroutines. Per-inode range arbiters are
-retained for the server lifetime so every later open of the same inode observes
-the same serialization domain. Individual write callbacks report their own
-NVMe completion errors; a later flush waits for the write fence but does not
-replay an error that its caller already received.
+The authoritative KFS path is `KfsCoroutineCore`: namespace operations are
+owned by Runtime worker 0, inode data operations are owned by a stable worker,
+and every SSD phase suspends through `AsyncBlockDevice`. Metadata and directory
+lookups use the same coroutine data plans, so no executor, fd bridge, socket
+service, or LibFS I/O pool exists in the production call graph. Per-inode range
+arbiters are retained for the server lifetime so every later open of the same
+inode observes the same serialization domain. Individual write callbacks
+report their own NVMe completion errors; a later flush waits for the write
+fence but does not replay an error that its caller already received.
 
 ## Configuration reference
 
@@ -236,23 +288,22 @@ replay an error that its caller already received.
 | `ORCHFS_ASYNC_ENDPOINT` | Unix-domain control socket shared by LibFS and KFS |
 | `ORCHFS_CLIENT_WORKERS` | workers in each LibFS runtime (also bounds its IPC lanes) |
 | `ORCHFS_KFS_WORKERS` | authoritative KFS coroutine workers |
-| `ORCHFS_KFS_BLOCKING_WORKERS` | fixed threads that execute the synchronous legacy core; unset uses the KFS worker count |
 | `ORCHFS_IPC_RING_CAPACITY` | descriptors per SQ/CQ lane |
 | `ORCHFS_IPC_DATA_SLOT_SIZE` | maximum payload bytes per descriptor; larger I/O is chunked |
 | `ORCHFS_SPDK_PCI_BDF` | required exact domain-qualified controller BDF; there is no device default |
 | `ORCHFS_SPDK_NSID` | required namespace ID on that controller; there is no namespace default |
-| `ORCHFS_SPDK_POLLER_COUNT` | qpair/poller count |
-| `ORCHFS_SPDK_QUEUE_DEPTH` | NVMe qpair depth |
-| `ORCHFS_SPDK_BOUNCE_BUFFERS` | DMA bounce buffers per poller |
-| `ORCHFS_SPDK_MAX_TRANSFER_SIZE` | maximum bytes in one NVMe command |
-| `ORCHFS_SPDK_CPU_LIST` | comma-separated CPUs used by qpair pollers; empty derives from process affinity |
+| `ORCHFS_SPDK_POLLER_COUNT` | standalone caller-polled formatter qpair count; production KFS uses `ORCHFS_KFS_WORKERS` |
+| `ORCHFS_SPDK_QUEUE_DEPTH` | NVMe qpair depth; default 32, leaving headroom above the measured 16 requests per worker |
+| `ORCHFS_SPDK_BOUNCE_BUFFERS` | DMA bounce buffers per poller; default 32 (registered shared slots bypass them) |
+| `ORCHFS_SPDK_MAX_TRANSFER_SIZE` | maximum bytes in one NVMe command; default 1 MiB |
+| `ORCHFS_SPDK_CPU_LIST` | standalone formatter qpair CPUs; production KFS uses its Runtime worker CPUs |
 | `ORCHFS_SPDK_HUGEPAGE_DIR` | hugetlbfs mount used by SPDK/DPDK |
 | `ORCHFS_SPDK_SHM_ID` | SPDK shared-memory ID; `-1` selects private mode |
-| `ORCHFS_SPDK_REACTOR_MASK` | SPDK environment core mask used during initialization |
+| `ORCHFS_SPDK_REACTOR_MASK` | standalone formatter EAL mask; production KFS derives a one-control-lcore mask |
 | `ORCHFS_SPDK_TEST_OFFSET` | explicit unaligned byte offset in a reserved scratch range; no default |
 | `ORCHFS_SPDK_TEST_BACKUP_FILE` | new `O_EXCL` backup file on independent storage |
 | `ORCHFS_SPDK_TEST_CONFIRM_RANGE` | exact BDF/NSID/write/save token printed by the first manual test run |
 
-CPU affinity should be explicit in production. Keep KFS coroutine workers and
-SPDK pollers on CPUs local to the NVMe controller where possible, without
-oversubscribing the machine.
+CPU affinity should be explicit in production. Pin the KFS process to CPUs local
+to the NVMe controller; Runtime maps workers across that affinity set and each
+worker directly polls its own qpair, without a second SPDK service-thread set.

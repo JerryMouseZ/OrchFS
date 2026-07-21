@@ -18,7 +18,6 @@
 #include <string.h>
 #include <error.h>
 #include <errno.h>
-#include <pthread.h>
 #include <inttypes.h>
 #include <time.h>
 #include <x86intrin.h>
@@ -26,6 +25,8 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <malloc.h>
+
+#include "async_device.h"
 
 #ifdef __GNUC__
 #define likely(x)       __builtin_expect((x), 1)
@@ -97,18 +98,31 @@ int16_t pre_flag_list[3*1024*1024];
 
 dev_info_t fs_dev_info;
 
+/* Select Runtime-integrated SPDK ownership for the next device_init(). A NULL
+ * handle keeps the standalone/mkfs compatibility mode. */
+void device_set_async_runtime(void* runtime_handle);
+
 void device_init();
 
 void device_close();
 
-/* Persist all writes issued before this call.  The SPDK build maps this to an
- * NVMe FLUSH; the legacy block-device build uses fsync after draining CPU
- * stores. */
-int device_sync();
+/* PMEM-only primitives. Callers must validate that the complete range is
+ * below PMEM_LEN; these never enter the SSD/SPDK path. */
+void nvm_read(void* dst, int64_t len, int64_t offset);
+void nvm_write(void* src, int64_t len, int64_t offset);
+
+/* Non-blocking device seam used by the coroutine core. Completion may run
+ * inline for PMEM and offline file-backed devices, or from the owning Runtime
+ * worker for SPDK. Buffers remain borrowed until completion. */
 
 /* With ORCHFS_ENABLE_SPDK on the KFS target, the SSD half of this interface
  * is backed by the process-wide SPDK poller service. LibFS must not compile
  * with ORCHFS_KFS_SERVER and therefore never owns an SPDK controller. */
+
+#ifdef ORCHFS_FORMATTER
+/* Synchronous device access exists only in the offline, caller-polled layout
+ * formatter. It is deliberately absent from the production KFS link graph. */
+int device_sync(void);
 
 void read_data_from_devs(void* dst, int64_t len, int64_t offset);
 
@@ -123,5 +137,6 @@ void read_data_from_nvms_newbaseline(void* dst, int64_t len, int64_t offset);
 void write_data_to_ssds_newbaseline(void* src, int64_t len, int64_t offset);
 
 void read_data_from_ssds_newbaseline(void* dst, int64_t len, int64_t offset);
+#endif
 
 #endif

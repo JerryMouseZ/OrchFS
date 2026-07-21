@@ -1,399 +1,191 @@
 #include "libspace.h"
-#include "lib_socket.h"
+
+#include "lib_log.h"
 #include "req_kernel.h"
-#include "runtime.h"
 
-#include "../config/config.h"
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
 
-#ifdef __cplusplus       
-extern "C"{
+#ifdef __cplusplus
+extern "C" {
 #endif
 
-
-int apply_lib_alloc_ext(int ext_type)
+/* Allocation is performed directly against the Runtime-worker-sharded KFS
+ * bitmap.  The former process-wide extent caches needed spin ownership and
+ * could reserve thousands of objects that never became part of a transaction.
+ * A single-object reservation is cheap in-process and is immediately attached
+ * to the current journal transaction for rollback. */
+static int request_one(int type, int64_t* block)
 {
-    if(ext_type < MIN_EXT_ID || ext_type > MAX_EXT_ID)
-        goto type_error;
-    
-    if(lib_alloc_info[ext_type].blk_id_arr == NULL)
-        lib_alloc_info[ext_type].blk_id_arr = malloc(ext_size_arr[ext_type] * sizeof(int64_t));
-    if(lib_alloc_info[ext_type].blk_used_flag_arr == NULL)
-        lib_alloc_info[ext_type].blk_used_flag_arr = malloc(ext_size_arr[ext_type] * sizeof(int32_t));
-    if(lib_alloc_info[ext_type].blk_id_arr == NULL || lib_alloc_info[ext_type].blk_used_flag_arr == NULL)
-        goto alloc_error;
-    
-   
-    lib_alloc_info[ext_type].ext_blk_capacity = ext_size_arr[ext_type];
-    lib_alloc_info[ext_type].used_blk_num = 0;
-    lib_alloc_info[ext_type].blk_type = ext_type;
-    lib_alloc_info[ext_type].last_cur = -1;
-    
-    
-    memset(lib_alloc_info[ext_type].blk_used_flag_arr, 0x00, ext_size_arr[ext_type] * sizeof(int32_t));
-
-    
-    void* ret_info_buf = malloc(1024*1024);
-    // printf("ext_type: %d\n",ext_type);
-
-    if(ext_type == INODE_EXT)
-        request_inode_id_arr(ret_info_buf, MAX_INODE_EXT_SIZE, RET_BLK_ID);
-    else if(ext_type == IDXND_EXT)
-        request_idxnd_id_arr(ret_info_buf, MAX_IDXND_EXT_SIZE, RET_BLK_ID);
-    else if(ext_type == VIRND_EXT)
-        request_virnd_id_arr(ret_info_buf, MAX_VIRND_EXT_SIZE, RET_BLK_ID);
-    else if(ext_type == BUFMETA_EXT)
-        request_bufmeta_id_arr(ret_info_buf, MAX_BUFMETA_EXT_SIZE, RET_BLK_ID);
-    else if(ext_type == PAGE_EXT)
-        request_page_id_arr(ret_info_buf, MAX_PAGE_EXT_SIZE, RET_BLK_ID);
-    else if(ext_type == BLOCK_EXT)
-        request_block_id_arr(ret_info_buf, MAX_BLOCK_EXT_SIZE, RET_BLK_ID);
-    
-    int64_t* ret_info_int64_pt = (int64_t*)ret_info_buf;
-    int alloced_blknum = ret_info_int64_pt[1];
-
-    // printf("\n");
-    // printf("%d %d\n",ext_type,ret_info_int64_pt[2]);
-    for(int i = 0; i < alloced_blknum; i++)
+    int64_t response[3] = {0};
+    int error;
+    switch(type)
     {
-        assert(i < ext_size_arr[ext_type]);
-        lib_alloc_info[ext_type].blk_id_arr[i] = ret_info_int64_pt[i+2];
-        // printf("%d ",ret_info_int64_pt[i+2]);
-        if(i >= 1)
-        {
-            if(ret_info_int64_pt[i+2] != ret_info_int64_pt[i+1] + 1)
-            {
-                fprintf(stderr,"lib alloc blk id error! --- %d %d\n",alloced_blknum,ext_type);
-                for(int j = 0; j < alloced_blknum; j++)
-                {
-                    fprintf(stderr,"%"PRId64" ",ret_info_int64_pt[j+2]);
-                }
-                fprintf(stderr,"\n");
-                exit(1);
-            }
-        }
+        case INODE_EXT:
+            error = request_inode_id_arr(response, 1, RET_BLK_ID);
+            break;
+        case IDXND_EXT:
+            error = request_idxnd_id_arr(response, 1, RET_BLK_ID);
+            break;
+        case VIRND_EXT:
+            error = request_virnd_id_arr(response, 1, RET_BLK_ID);
+            break;
+        case BUFMETA_EXT:
+            error = request_bufmeta_id_arr(response, 1, RET_BLK_ID);
+            break;
+        case PAGE_EXT:
+            error = request_page_id_arr(response, 1, RET_BLK_ID);
+            break;
+        case BLOCK_EXT:
+            error = request_block_id_arr(response, 1, RET_BLK_ID);
+            break;
+        default:
+            return EINVAL;
     }
-    // printf("\n");
-    free(ret_info_buf);
+    if(error != 0)
+        return error;
+    if(response[1] != 1 || response[2] < 0)
+        return EIO;
+    *block = response[2];
     return 0;
-type_error:
-    printf("extent type error!\n");
-    return -1;
-alloc_error:
-    printf("alloc memory error!\n");
-    return -1;
 }
 
-
-int dealloc_block_to_dev(int ext_type)
+static int release_one(int type, int64_t block)
 {
-    if(ext_type < MIN_EXT_ID || ext_type > MAX_EXT_ID)
-        goto type_error;
-    void* send_data = (void*)lib_dealloc_info[ext_type].blk_id_arr;
-    
-    int blk_num = lib_dealloc_info[ext_type].dealloc_blk_num;
-    if(lib_dealloc_info[ext_type].dealloc_blk_num == 0)
+    switch(type)
+    {
+        case INODE_EXT:
+            return send_dealloc_inode_req(&block, 1, PAR_BLK_ID);
+        case IDXND_EXT:
+            return send_dealloc_idxnd_req(&block, 1, PAR_BLK_ID);
+        case VIRND_EXT:
+            return send_dealloc_virnd_req(&block, 1, PAR_BLK_ID);
+        case BUFMETA_EXT:
+            return send_dealloc_bufmeta_req(&block, 1, PAR_BLK_ID);
+        case PAGE_EXT:
+            return send_dealloc_page_req(&block, 1, PAR_BLK_ID);
+        case BLOCK_EXT:
+            return send_dealloc_block_req(&block, 1, PAR_BLK_ID);
+        default:
+            return EINVAL;
+    }
+}
+
+static int64_t reserve(int type)
+{
+    int64_t block = -1;
+    int error = request_one(type, &block);
+    if(error != 0)
+    {
+        errno = error;
+        return -1;
+    }
+    error = orchfs_log_record_current_allocation(type, block);
+    if(error != 0)
+    {
+        (void)release_one(type, block);
+        errno = error;
+        return -1;
+    }
+    return block;
+}
+
+static void release(int type, int64_t block)
+{
+    if(block < 0)
+    {
+        errno = EINVAL;
+        return;
+    }
+    const int deferred = orchfs_log_defer_current_release(type, block);
+    if(deferred > 0)
+        return;
+    if(deferred < 0)
+    {
+        errno = -deferred;
+        return;
+    }
+    const int error = release_one(type, block);
+    if(error != 0)
+        errno = error;
+}
+
+int init_all_ext(void)
+{
+    return 0;
+}
+
+int return_all_ext(void)
+{
+    return 0;
+}
+
+int64_t require_inode_id(void) { return reserve(INODE_EXT); }
+int64_t require_index_node_id(void) { return reserve(IDXND_EXT); }
+int64_t require_virindex_node_id(void) { return reserve(VIRND_EXT); }
+int64_t require_buffer_metadata_id(void) { return reserve(BUFMETA_EXT); }
+int64_t require_nvm_page_id(void) { return reserve(PAGE_EXT); }
+int64_t require_ssd_block_id(void) { return reserve(BLOCK_EXT); }
+
+int require_ssd_block_ids(int64_t count, int64_t* blocks)
+{
+    if(count < 0 || (count != 0 && blocks == NULL))
+        return EINVAL;
+    if(count == 0)
         return 0;
-    // printf("ext_type1: %d %lld\n",ext_type,lib_dealloc_info[ext_type].dealloc_blk_num);
-    \
-    if(ext_type == INODE_EXT)
-        send_dealloc_inode_req(send_data, blk_num, PAR_BLK_ID);
-    else if(ext_type == IDXND_EXT)
-        send_dealloc_idxnd_req(send_data, blk_num, PAR_BLK_ID);
-    else if(ext_type == VIRND_EXT)
-        send_dealloc_virnd_req(send_data, blk_num, PAR_BLK_ID);
-    else if(ext_type == BUFMETA_EXT)
-        send_dealloc_bufmeta_req(send_data, blk_num, PAR_BLK_ID);
-    else if(ext_type == PAGE_EXT)
-        send_dealloc_page_req(send_data, blk_num, PAR_BLK_ID);
-    else if(ext_type == BLOCK_EXT)
-        send_dealloc_block_req(send_data, blk_num, PAR_BLK_ID);
-    lib_dealloc_info[ext_type].dealloc_blk_num = 0;
-    return 0;
-type_error:
-    printf("extent type error!\n");
-    return -1;
-}
+    if(count > INT_MAX ||
+       (uint64_t)count > SIZE_MAX / sizeof(int64_t) - 2)
+        return EOVERFLOW;
 
-
-int apply_lib_dealloc_ext(int ext_type)
-{
-    if(ext_type < MIN_EXT_ID || ext_type > MAX_EXT_ID)
-        goto type_error;
-    if(lib_dealloc_info[ext_type].blk_id_arr != NULL)
-        free(lib_dealloc_info[ext_type].blk_id_arr);
-    
-    lib_dealloc_info[ext_type].ext_blk_capacity = ext_size_arr[ext_type];
-    lib_dealloc_info[ext_type].dealloc_blk_num = 0;
-    lib_dealloc_info[ext_type].blk_type = ext_type;
-    lib_dealloc_info[ext_type].blk_id_arr = malloc(ext_size_arr[ext_type] * sizeof(int64_t));
-    if(lib_dealloc_info[ext_type].blk_id_arr == NULL)
-        goto alloc_error;
-    return 0;
-type_error:
-    printf("extent type error!\n");
-    return -1;
-alloc_error:
-    printf("alloc memory error!\n");
-    return -1;
-}
-
-int64_t find_block_from_ext(int ext_type)
-{
-    alloc_ext_info_pt alloc_info_pt = &(lib_alloc_info[ext_type]);
-    // printf("aa: %lld %lld\n",alloc_info_pt->used_blk_num,alloc_info_pt->ext_blk_capacity);
-    if(alloc_info_pt->used_blk_num < alloc_info_pt->ext_blk_capacity)
+    int64_t* response = malloc(((size_t)count + 2) * sizeof(*response));
+    if(response == NULL)
+        return ENOMEM;
+    int error = request_block_id_arr(response, count, RET_BLK_ID);
+    if(error != 0)
     {
-        alloc_info_pt->last_cur += 1;
-        alloc_info_pt->used_blk_num += 1;
-        alloc_info_pt->blk_used_flag_arr[alloc_info_pt->last_cur] = 1;
-        // if(alloc_info_pt->blk_id_arr[alloc_info_pt->last_cur] == 0)
-        // {
-        //     printf("cur: %" PRId64 "\n",alloc_info_pt->last_cur);
-        //     for(int i = 0; i < ext_size_arr[ext_type]; i++)
-        //         printf("%" PRId64 "  ",alloc_info_pt->blk_id_arr[i]);
-        //     printf("\n");
-        // }
-        // printf("%lld %lld\n",ext_type,alloc_info_pt->blk_id_arr[alloc_info_pt->last_cur]);
-        return alloc_info_pt->blk_id_arr[alloc_info_pt->last_cur];
+        free(response);
+        return error;
     }
-    // not found, need to apply for a new space
-    return -1;
-}
-
-
-int64_t add_block_to_dealloc_ext(int ext_type, int64_t dealloc_blk_id)
-{
-    dealloc_ext_info_pt dealloc_info_pt = &(lib_dealloc_info[ext_type]);
-    // printf("%lld %lld, ",dealloc_info_pt->dealloc_blk_num,dealloc_info_pt->ext_blk_capacity);
-    if(dealloc_info_pt->dealloc_blk_num < MAX_DEALLOC_BLK)
+    if(response[1] != count)
     {
-        dealloc_info_pt->blk_id_arr[dealloc_info_pt->dealloc_blk_num] = dealloc_blk_id;
-        dealloc_info_pt->dealloc_blk_num += 1;
-        return 0;
+        (void)send_dealloc_block_req(response + 2, (int)count, PAR_BLK_ID);
+        free(response);
+        return EIO;
     }
-    return -1;
-}
 
-/* Request a specific type of block and perform space retrieval processing
- */
-int64_t require_block(int ext_type)
-{
-    int64_t ret_blk_info = find_block_from_ext(ext_type);
-    // printf("ret_blk_info: %lld\n",ret_blk_info);
-    if(ret_blk_info == -1)
+    int64_t recorded = 0;
+    for(; recorded < count; ++recorded)
     {
-        int ret = apply_lib_alloc_ext(ext_type);
-        if(ret == -1)
-            goto error;
-        ret_blk_info = find_block_from_ext(ext_type);
-        if(ret_blk_info == -1)
-            goto error;
-        return ret_blk_info;
-    }
-    else
-        return ret_blk_info;
-error:
-    printf("require error! type: %d\n",ext_type);
-    exit(0);
-}
-
-/* Declare a block number to be reclaimed in user space
- */
-void add_dealloc_block(int ext_type, int64_t dealloc_blk_id)
-{
-    int64_t ret_blk_info = add_block_to_dealloc_ext(ext_type, dealloc_blk_id);
-
-    if(ret_blk_info == -1)
-    {
-        // printf("pre extid1: %d\n",ext_type);
-        int ret = dealloc_block_to_dev(ext_type);
-        if(ret == -1)
-            goto error;
-        ret_blk_info = add_block_to_dealloc_ext(ext_type, dealloc_blk_id);
-        if(ret_blk_info == -1)
-            goto error;
-    }
-    return;
-error:
-    printf("dealloc error! type: %d\n",ext_type);
-    exit(0);
-}
-
-int init_all_ext()
-{
-    ext_size_arr[INODE_EXT] = MAX_INODE_EXT_SIZE;
-    ext_size_arr[IDXND_EXT] = MAX_IDXND_EXT_SIZE;
-    ext_size_arr[VIRND_EXT] = MAX_VIRND_EXT_SIZE;
-    ext_size_arr[BUFMETA_EXT] = MAX_BUFMETA_EXT_SIZE;
-    ext_size_arr[PAGE_EXT] = MAX_PAGE_EXT_SIZE;
-    ext_size_arr[BLOCK_EXT] = MAX_BLOCK_EXT_SIZE;
-
-    for(int i = MIN_EXT_ID; i <= MAX_EXT_ID; i++)
-    {
-        pthread_spin_init(&(lib_alloc_info[i].alloc_lock), PTHREAD_PROCESS_SHARED);
-        int error_info = apply_lib_alloc_ext(i);
-        if(error_info != 0)
+        const int64_t block = response[recorded + 2];
+        if(block < 0)
         {
-            printf("alloc extent add error! type: %d\n",i);
-            exit(0);
+            error = EIO;
+            break;
         }
+        error = orchfs_log_record_current_allocation(BLOCK_EXT, block);
+        if(error != 0)
+            break;
+        blocks[recorded] = block;
     }
-    for(int i = MIN_EXT_ID; i <= MAX_EXT_ID; i++)
+    if(error != 0)
     {
-        pthread_spin_init(&(lib_dealloc_info[i].dealloc_lock), PTHREAD_PROCESS_SHARED);
-        int error_info = apply_lib_dealloc_ext(i);
-        if(error_info != 0)
-        {
-            printf("dealloc extent add error! type: %d\n",i);
-            exit(0);
-        }
+        /* Successfully journaled entries belong to the transaction and are
+         * released by abort.  Entries not recorded must be returned here. */
+        (void)send_dealloc_block_req(response + 2 + recorded,
+                                     (int)(count - recorded), PAR_BLK_ID);
     }
-    return 0;
+    free(response);
+    return error;
 }
 
-int return_all_ext()
-{
-    fprintf(stderr,"ret ext!\n");
-    for(int i = MIN_EXT_ID; i <= MAX_EXT_ID; i++)
-        pthread_spin_lock(&(lib_dealloc_info[i].dealloc_lock));
-    for(int i = MIN_EXT_ID; i <= MAX_EXT_ID; i++)
-    {
-        int64_t start_cur = lib_alloc_info[i].last_cur+1;
-        for(int64_t j = start_cur; j < lib_alloc_info[i].ext_blk_capacity; j++)
-        {
-            add_dealloc_block(i, lib_alloc_info[i].blk_id_arr[j]);
-        }
-    }
-    for(int i = MIN_EXT_ID; i <= MAX_EXT_ID; i++)
-    {
-        // printf("pre extid: %d\n",i);
-        if(lib_dealloc_info->dealloc_blk_num == 0)
-            continue;
-        int error_info = dealloc_block_to_dev(i);
-        if(error_info != 0)
-        {
-            printf("extent delete error! type: %d\n",i);
-            return -1;
-        }
-    }
-    for(int i = MIN_EXT_ID; i <= MAX_EXT_ID; i++)
-        pthread_spin_unlock(&(lib_dealloc_info[i].dealloc_lock));
-    
-    for(int i = MIN_EXT_ID; i <= MAX_EXT_ID; i++)
-    {
-        pthread_spin_destroy(&(lib_alloc_info[i].alloc_lock));
-        pthread_spin_destroy(&(lib_dealloc_info[i].dealloc_lock));
-    }
-    fprintf(stderr,"ret ext end!\n");
-    return 0;
-}
-
-int64_t require_inode_id()
-{
-    pthread_spin_lock(&(lib_alloc_info[INODE_EXT].alloc_lock));
-    int64_t ret_blkid = require_block(INODE_EXT);
-    pthread_spin_unlock(&(lib_alloc_info[INODE_EXT].alloc_lock));
-    return ret_blkid;
-}
-
-int64_t require_index_node_id()
-{
-// #ifdef COUNT_ON
-//     orch_rt.used_tree_nodes += 1;
-// #endif
-    pthread_spin_lock(&(lib_alloc_info[IDXND_EXT].alloc_lock));
-    int64_t ret_blkid = require_block(IDXND_EXT);
-    pthread_spin_unlock(&(lib_alloc_info[IDXND_EXT].alloc_lock));
-    return ret_blkid;
-}
-
-int64_t require_virindex_node_id()
-{
-// #ifdef COUNT_ON
-//     orch_rt.used_vir_nodes += 1;
-// #endif
-    pthread_spin_lock(&(lib_alloc_info[VIRND_EXT].alloc_lock));
-    int64_t ret_blkid = require_block(VIRND_EXT);
-    pthread_spin_unlock(&(lib_alloc_info[VIRND_EXT].alloc_lock));
-    return ret_blkid;
-}
-
-int64_t require_buffer_metadata_id()
-{
-// #ifdef COUNT_ON
-//     orch_rt.used_pm_units += 1;
-// #endif
-    pthread_spin_lock(&(lib_alloc_info[BUFMETA_EXT].alloc_lock));
-    int64_t ret_blkid = require_block(BUFMETA_EXT);
-    pthread_spin_unlock(&(lib_alloc_info[BUFMETA_EXT].alloc_lock));
-    return ret_blkid;
-}
-
-int64_t require_nvm_page_id()
-{
-// #ifdef COUNT_ON
-//     orch_rt.used_pm_pages += 1;
-// #endif
-    pthread_spin_lock(&(lib_alloc_info[PAGE_EXT].alloc_lock));
-    int64_t ret_blkid = require_block(PAGE_EXT);
-    // if(ret_blkid < 10)
-    //     fprintf(stderr, "pageid: %" PRId64 " \n",ret_blkid);
-    pthread_spin_unlock(&(lib_alloc_info[PAGE_EXT].alloc_lock));
-    return ret_blkid;
-}
-
-int64_t require_ssd_block_id()
-{
-// #ifdef COUNT_ON
-//     orch_rt.used_ssd_blks += 1;
-// #endif
-    pthread_spin_lock(&(lib_alloc_info[BLOCK_EXT].alloc_lock));
-    int64_t ret_blkid = require_block(BLOCK_EXT);
-    pthread_spin_unlock(&(lib_alloc_info[BLOCK_EXT].alloc_lock));
-    return ret_blkid;
-}
-
-void release_inode(int64_t inode_id)
-{
-    pthread_spin_lock(&(lib_dealloc_info[INODE_EXT].dealloc_lock));
-    add_dealloc_block(INODE_EXT, inode_id);
-    pthread_spin_unlock(&(lib_dealloc_info[INODE_EXT].dealloc_lock));
-}
-
-void release_index_node(int64_t idx_id)
-{
-    pthread_spin_lock(&(lib_dealloc_info[IDXND_EXT].dealloc_lock));
-    add_dealloc_block(IDXND_EXT, idx_id);
-    pthread_spin_unlock(&(lib_dealloc_info[IDXND_EXT].dealloc_lock));
-}
-
-void release_virindex_node(int64_t virnd_id)
-{
-    pthread_spin_lock(&(lib_dealloc_info[VIRND_EXT].dealloc_lock));
-    add_dealloc_block(VIRND_EXT, virnd_id);
-    pthread_spin_unlock(&(lib_dealloc_info[VIRND_EXT].dealloc_lock));
-}
-
-void release_buffer_metadata(int64_t buf_id)
-{
-    pthread_spin_lock(&(lib_dealloc_info[BUFMETA_EXT].dealloc_lock));
-    add_dealloc_block(BUFMETA_EXT, buf_id);
-    pthread_spin_unlock(&(lib_dealloc_info[BUFMETA_EXT].dealloc_lock));
-}
-
-void release_nvm_page(int64_t page_id)
-{
-    pthread_spin_lock(&(lib_dealloc_info[PAGE_EXT].dealloc_lock));
-    add_dealloc_block(PAGE_EXT, page_id);
-    pthread_spin_unlock(&(lib_dealloc_info[PAGE_EXT].dealloc_lock));
-}
-
-void release_ssd_block(int64_t block_id)
-{
-    pthread_spin_lock(&(lib_dealloc_info[BLOCK_EXT].dealloc_lock));
-    add_dealloc_block(BLOCK_EXT, block_id);
-    pthread_spin_unlock(&(lib_dealloc_info[BLOCK_EXT].dealloc_lock));
-}
+void release_inode(int64_t block) { release(INODE_EXT, block); }
+void release_index_node(int64_t block) { release(IDXND_EXT, block); }
+void release_virindex_node(int64_t block) { release(VIRND_EXT, block); }
+void release_buffer_metadata(int64_t block) { release(BUFMETA_EXT, block); }
+void release_nvm_page(int64_t block) { release(PAGE_EXT, block); }
+void release_ssd_block(int64_t block) { release(BLOCK_EXT, block); }
 
 #ifdef __cplusplus
 }

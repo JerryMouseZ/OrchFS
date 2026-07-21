@@ -3,14 +3,13 @@
 #include "orchfs/async/result.hpp"
 
 #include <atomic>
-#include <condition_variable>
 #include <coroutine>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -41,6 +40,8 @@ void register_pin(std::coroutine_handle<> coroutine,
 void transfer_pin_to_continuation(std::coroutine_handle<> coroutine,
                                   std::coroutine_handle<> continuation) noexcept;
 void unpin_current(std::coroutine_handle<> coroutine) noexcept;
+[[nodiscard]] void* allocate_coroutine_frame(std::size_t size);
+void deallocate_coroutine_frame(void* frame) noexcept;
 
 class CompletionStateBase;
 void root_completed(Runtime* runtime, CompletionStateBase* state) noexcept;
@@ -62,7 +63,8 @@ public:
     }
 
     [[nodiscard]] bool ready() const noexcept {
-        return ready_.load(std::memory_order_acquire);
+        return waiter_state_.load(std::memory_order_acquire) ==
+               completed_sentinel();
     }
 
     [[nodiscard]] bool begin_consume() noexcept {
@@ -77,20 +79,30 @@ public:
 
     [[nodiscard]] bool register_waiter(std::coroutine_handle<> waiter,
                                        ResumeTarget target) noexcept {
-        std::lock_guard lock(mutex_);
-        if (ready_.load(std::memory_order_relaxed)) {
+        if (!waiter) {
             return false;
         }
         waiter_ = waiter;
         waiter_target_ = target;
-        return true;
+        void* expected = nullptr;
+        if (waiter_state_.compare_exchange_strong(
+                expected, waiter.address(), std::memory_order_release,
+                std::memory_order_acquire)) {
+            return true;
+        }
+        if (expected != completed_sentinel()) {
+            // begin_consume() guarantees that only one waiter can register.
+            std::terminate();
+        }
+        return false;
     }
 
     void wait() noexcept {
-        std::unique_lock lock(mutex_);
-        ready_cv_.wait(lock, [this] {
-            return ready_.load(std::memory_order_relaxed);
-        });
+        void* state = waiter_state_.load(std::memory_order_acquire);
+        while (state != completed_sentinel()) {
+            waiter_state_.wait(state, std::memory_order_acquire);
+            state = waiter_state_.load(std::memory_order_acquire);
+        }
     }
 
     void set_root(std::coroutine_handle<> root) noexcept {
@@ -103,19 +115,16 @@ public:
 
 protected:
     void publish_ready() noexcept {
-        std::coroutine_handle<> waiter;
-        ResumeTarget target;
-        {
-            std::lock_guard lock(mutex_);
-            ready_.store(true, std::memory_order_release);
-            waiter = waiter_;
-            target = waiter_target_;
-            waiter_ = {};
-        }
-
-        ready_cv_.notify_all();
-        if (waiter) {
-            schedule_resume(target, waiter, target.pin_depth != 0);
+        void* waiter = waiter_state_.exchange(
+            completed_sentinel(), std::memory_order_acq_rel);
+        waiter_state_.notify_all();
+        if (waiter != nullptr) {
+            if (waiter == completed_sentinel() ||
+                waiter_.address() != waiter) {
+                std::terminate();
+            }
+            schedule_resume(waiter_target_, waiter_,
+                            waiter_target_.pin_depth != 0);
         }
         root_completed(runtime_, this);
     }
@@ -135,16 +144,17 @@ protected:
         }
     }
 
-    mutable std::mutex mutex_;
-
 private:
+    static void* completed_sentinel() noexcept {
+        return reinterpret_cast<void*>(static_cast<std::uintptr_t>(1));
+    }
+
     Runtime* runtime_;
     UnobservedErrorHandler unobserved_error_;
     std::coroutine_handle<> root_{};
-    std::atomic<bool> ready_{false};
     std::atomic<bool> consumed_{false};
     std::atomic<bool> observed_{false};
-    std::condition_variable ready_cv_;
+    std::atomic<void*> waiter_state_{nullptr};
     std::coroutine_handle<> waiter_{};
     ResumeTarget waiter_target_{};
 };
@@ -156,7 +166,6 @@ public:
 
     ~CompletionState() override {
         if constexpr (is_result_v<T>) {
-            std::lock_guard lock(mutex_);
             if (value_ && !*value_) {
                 report_unobserved(value_->error());
             }
@@ -164,15 +173,11 @@ public:
     }
 
     void complete(T value) noexcept(std::is_nothrow_move_constructible_v<T>) {
-        {
-            std::lock_guard lock(mutex_);
-            value_.emplace(std::move(value));
-        }
+        value_.emplace(std::move(value));
         publish_ready();
     }
 
     [[nodiscard]] Result<T> take() noexcept(std::is_nothrow_move_constructible_v<T>) {
-        std::lock_guard lock(mutex_);
         if (!value_) {
             return Result<T>::failure(Errc::invalid_handle);
         }
@@ -400,6 +405,18 @@ template <typename T>
 class [[nodiscard]] Task {
 public:
     struct promise_type {
+        static void* operator new(std::size_t size) {
+            return detail::allocate_coroutine_frame(size);
+        }
+
+        static void operator delete(void* frame) noexcept {
+            detail::deallocate_coroutine_frame(frame);
+        }
+
+        static void operator delete(void* frame, std::size_t) noexcept {
+            detail::deallocate_coroutine_frame(frame);
+        }
+
         [[nodiscard]] Task get_return_object() noexcept {
             return Task(std::coroutine_handle<promise_type>::from_promise(*this));
         }
@@ -540,6 +557,18 @@ template <>
 class [[nodiscard]] Task<void> {
 public:
     struct promise_type {
+        static void* operator new(std::size_t size) {
+            return detail::allocate_coroutine_frame(size);
+        }
+
+        static void operator delete(void* frame) noexcept {
+            detail::deallocate_coroutine_frame(frame);
+        }
+
+        static void operator delete(void* frame, std::size_t) noexcept {
+            detail::deallocate_coroutine_frame(frame);
+        }
+
         [[nodiscard]] Task get_return_object() noexcept {
             return Task(std::coroutine_handle<promise_type>::from_promise(*this));
         }

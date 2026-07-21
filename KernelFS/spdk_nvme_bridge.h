@@ -52,6 +52,10 @@ int orchfs_spdk_submit_flush(orchfs_spdk_backend *backend,
                              size_t poller_id,
                              orchfs_spdk_completion_fn callback,
                              void *callback_context);
+int orchfs_spdk_register_memory(orchfs_spdk_backend *backend, void *address,
+                                size_t length);
+int orchfs_spdk_unregister_memory(orchfs_spdk_backend *backend, void *address,
+                                  size_t length);
 
 // completed_requests and stopped may be NULL.  Callbacks run synchronously from
 // this function on the poller thread. Recursive poll of the same poller is

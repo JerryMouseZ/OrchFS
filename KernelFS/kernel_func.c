@@ -3,51 +3,29 @@
 #include "device.h"
 #include "log.h"
 #include "type.h"
-#include "thdpool.h"
-#include "addr_util.h"
-#include "kernel_socket.h"
-#include "ker_shm.h"
-#include "execio_thdpool.h"
 #include "../config/protocol.h"
-#include "../config/socket_config.h"
 #include "../config/config.h"
 
-#ifdef ORCHFS_ENABLE_ASYNC_SERVER
 #include "async_server_bridge.h"
-#include "../LibFS/orchfs.h"
-#endif
+#include "../LibFS/kfs_core_api.h"
 
 #ifdef __cplusplus       
 extern "C"{
 #endif
 
-// #define KERNEL_FUNC_DEBUG
-
-int now_registered_pid;
-
-
-void init_kernelFS()
+static void init_kernelFS_impl(int start_server)
 {
-
+	int runtime_error = orchfs_async_runtime_start();
+	if(runtime_error != 0)
+	{
+		fprintf(stderr, "start async KFS runtime error: %s (%d)\n",
+				strerror(runtime_error), runtime_error);
+		exit(1);
+	}
+	device_set_async_runtime(orchfs_async_runtime_handle());
 	device_init();
 	// printf("dev init!\n");
 	// fflush(stdout);
-
-	init_kernel_recv_info();
-	init_kernel_send_info();
-	// printf("socket init!\n");
-	// fflush(stdout);
-
-	init_kernel_thd_pool();
-	// printf("thread pool init!\n");
-	// fflush(stdout);
-
-
-	init_kernel_shm(KET_MAGIC_OFFSET);
-
-
-	init_ker_io_thread_pool();
-
 
 	init_mem_bmp();
 	// printf("bitmap init!\n");
@@ -57,19 +35,38 @@ void init_kernelFS()
 	// printf("log init!\n");
 	// fflush(stdout);
 
-#ifdef ORCHFS_ENABLE_ASYNC_SERVER
-	/* The authoritative LibFS core uses the KFS-owned devices and must be
-	 * initialized only after the legacy allocation/socket services are live. */
-	init_libfs_server_core();
-	int async_error = orchfs_async_server_start();
-	if(async_error != 0)
+	/* The authoritative coroutine core uses the KFS-owned device, bitmap
+	 * allocator, and journal directly. No socket, SHM, or worker-pool service
+	 * is started. */
+	int core_error = orchfs_core_initialize();
+	if(core_error != 0)
 	{
-		fprintf(stderr, "start async KFS server error: %s (%d)\n",
-				strerror(async_error), async_error);
+		fprintf(stderr, "initialize KFS coroutine core error: %s (%d)\n",
+				strerror(core_error), core_error);
 		close_kernelFS();
 		exit(1);
 	}
-#endif
+	if(start_server)
+	{
+		int async_error = orchfs_async_server_start();
+		if(async_error != 0)
+		{
+			fprintf(stderr, "start async KFS server error: %s (%d)\n",
+					strerror(async_error), async_error);
+			close_kernelFS();
+			exit(1);
+		}
+	}
+}
+
+void init_kernelFS()
+{
+	init_kernelFS_impl(1);
+}
+
+void init_kernelFS_direct()
+{
+	init_kernelFS_impl(0);
 }
 
 
@@ -77,27 +74,13 @@ void close_kernelFS()
 {
 
 	fprintf(stderr,"close begin!\n");
-#ifdef ORCHFS_ENABLE_ASYNC_SERVER
-	/* Stop accepting RPCs and drain every coroutine before releasing the
-	 * filesystem state they reference. The core may still issue allocation
-	 * messages while closing, so the legacy KFS services remain live here. */
+	/* Stop accepting RPCs and drain every client/core coroutine first. */
 	int async_error = orchfs_async_server_stop();
 	if(async_error != 0)
 		fprintf(stderr, "stop async KFS server error: %s (%d)\n",
 				strerror(async_error), async_error);
-	close_libfs_server_core();
+	orchfs_core_shutdown();
 	fprintf(stderr,"async server close!\n");
-#endif
-	free_kernel_recv_info();
-	free_kernel_send_info();
-	fprintf(stderr,"socket close!\n");
-
-	destroy_kernel_thd_pool();
-	fprintf(stderr,"thdpool close!\n");
-
-
-	destroy_ker_io_thread_pool();
-	close_kernel_shm();
 	
 
 	close_kernel_log();
@@ -109,176 +92,80 @@ void close_kernelFS()
 
 	device_close();
 	fprintf(stderr,"dev close!\n");
+	device_set_async_runtime(NULL);
+	int runtime_error = orchfs_async_runtime_stop();
+	if(runtime_error != 0)
+		fprintf(stderr, "stop async KFS runtime error: %s (%d)\n",
+				strerror(runtime_error), runtime_error);
 }
 
-int call_alloc_func(int64_t func_type, void* para_space)
+int orchfs_kfs_alloc_direct(int64_t func_type, int64_t alloc_blk_num,
+		int64_t return_type, void* ret_info_buf)
 {
-	int64_t* para_int64_pt = (int64_t*)para_space;
-    int64_t alloc_blk_num = para_int64_pt[0];
-    int64_t return_type = para_int64_pt[1];
-	int64_t reg_pid = para_int64_pt[2];
-	// printf("func_type: %lld %lld %lld\n",func_type,alloc_blk_num,return_type);
+	if(ret_info_buf == NULL || alloc_blk_num < 0)
+		return EINVAL;
+	if(return_type != RET_BLK_ID && return_type != RET_BLK_ADDR)
+		return EINVAL;
 
-	int64_t mesg_headsize = sizeof(int64_t) * 2;
-    void* ret_info_pt = malloc(sizeof(int64_t) * alloc_blk_num + mesg_headsize);
-	void* blk_start_pt = (void*)((int64_t)ret_info_pt + mesg_headsize);
+	int64_t* response = (int64_t*)ret_info_buf;
+	uint64_t* blocks = (uint64_t*)(response + 2);
+	int error = 0;
 	if(func_type == ALLOC_INODE_FUNC)
-	{
-		alloc_inodes(alloc_blk_num, blk_start_pt, return_type);
-	}
+		error = alloc_inodes(alloc_blk_num, blocks, return_type);
 	else if(func_type == ALLOC_INXND_FUNC)
-	{
-		alloc_idx_nodes(alloc_blk_num, blk_start_pt, return_type);
-	}
+		error = alloc_idx_nodes(alloc_blk_num, blocks, return_type);
 	else if(func_type == ALLOC_VIRND_FUNC)
-	{
-		alloc_viridx_nodes(alloc_blk_num, blk_start_pt, return_type);
-	}
+		error = alloc_viridx_nodes(alloc_blk_num, blocks, return_type);
 	else if(func_type == ALLOC_BUFMETA_FUNC)
-	{
-		alloc_bufmeta_nodes(alloc_blk_num, blk_start_pt, return_type);
-	}
+		error = alloc_bufmeta_nodes(alloc_blk_num, blocks, return_type);
 	else if(func_type == ALLOC_PAGE_FUNC)
-	{
-		alloc_nvm_pages(alloc_blk_num, blk_start_pt, return_type);
-	}
+		error = alloc_nvm_pages(alloc_blk_num, blocks, return_type);
 	else if(func_type == ALLOC_BLOCK_FUNC)
-	{
-		alloc_ssd_blocks(alloc_blk_num, blk_start_pt, return_type);
-	}
+		error = alloc_ssd_blocks(alloc_blk_num, blocks, return_type);
 	else
-		goto func_type_error;
+		return EINVAL;
+	if(error != 0)
+		return error;
 
-	int64_t* ret_info_int64_pt = (void*)ret_info_pt;
-	ret_info_int64_pt[0] = func_type;
-	ret_info_int64_pt[1] = alloc_blk_num;
-
-
-	// for(int i = 1; i < alloc_blk_num; i++)
-	// {
-	// 	if(ret_info_int64_pt[i+2] != ret_info_int64_pt[i+1] + 1)
-	// 	{
-	// 		printf("alloc blk id error!\n");
-	// 		exit(1);
-	// 	}
-	// }
-
-
-	int64_t send_len = sizeof(int64_t) * alloc_blk_num + mesg_headsize;
-	if(send_len > 192*1024)
-	{
-		printf("send len is too long!\n");
-		exit(1);
-	}
-	// for(int i = 0; i < alloc_blk_num; i++)
-	// 	printf("%" PRId64 " ",ret_info_int64_pt[2+i]);
-	// printf("\n");
-
-
-    kernel_send_message(ret_info_pt, send_len, RECV_BLK_PORT+reg_pid);
-    free(ret_info_pt);
+	response[0] = func_type;
+	response[1] = alloc_blk_num;
 	return 0;
-func_type_error:
-	printf("The func type is error!\n");
-	return -1;
 }
 
-int call_dealloc_func(int64_t func_type, void* para_space)
+int orchfs_kfs_dealloc_direct(int64_t func_type, int64_t dealloc_blk_num,
+		int64_t parameter_type, const int64_t* block_ids)
 {
-    int64_t* para_int64_pt = (int64_t*)para_space;
-    int64_t dealloc_blk_num = para_int64_pt[0];
-    int64_t opblk_type = para_int64_pt[1];
-	// int64_t reg_pid = para_int64_pt[2];
-	int64_t* blk_start_pt = (int64_t*)((int64_t)para_space + sizeof(int64_t)*3);
-	// printf("blk_type: %" PRId64" %" PRId64"  %" PRId64"\n",func_type, dealloc_blk_num, reg_pid);
-	// for(int i = 0; i < dealloc_blk_num; i++)
-	// 	printf("%" PRId64" ",blk_start_pt[i]);
-	// printf("\n");
+	if(dealloc_blk_num < 0 || (dealloc_blk_num != 0 && block_ids == NULL))
+		return EINVAL;
+	if(parameter_type != PAR_BLK_ID && parameter_type != PAR_BLK_ADDR)
+		return EINVAL;
 
-	if(func_type == DEALLOC_INODE_FUNC)
+	for(int64_t i = 0; i < dealloc_blk_num; ++i)
 	{
-		for(int64_t i = 0; i < dealloc_blk_num; i++)
-			dealloc_inode(blk_start_pt[i], opblk_type);
+		int error;
+		if(func_type == DEALLOC_INODE_FUNC)
+			error = dealloc_inode(block_ids[i], parameter_type);
+		else if(func_type == DEALLOC_INXND_FUNC)
+			error = dealloc_idx_node(block_ids[i], parameter_type);
+		else if(func_type == DEALLOC_VIRND_FUNC)
+			error = dealloc_viridx_node(block_ids[i], parameter_type);
+		else if(func_type == DEALLOC_BUFMETA_FUNC)
+			error = dealloc_bufmeta_node(block_ids[i], parameter_type);
+		else if(func_type == DEALLOC_PAGE_FUNC)
+			error = dealloc_nvm_page(block_ids[i], parameter_type);
+		else if(func_type == DEALLOC_BLOCK_FUNC)
+			error = dealloc_ssd_block(block_ids[i], parameter_type);
+		else
+			return EINVAL;
+		if(error != 0)
+			return error;
 	}
-	else if(func_type == DEALLOC_INXND_FUNC)
-	{
-		for(int64_t i = 0; i < dealloc_blk_num; i++)
-			dealloc_idx_node(blk_start_pt[i], opblk_type);
-	}
-	else if(func_type == DEALLOC_VIRND_FUNC)
-	{
-		for(int64_t i = 0; i < dealloc_blk_num; i++)
-			dealloc_viridx_node(blk_start_pt[i], opblk_type);
-	}
-	else if(func_type == DEALLOC_BUFMETA_FUNC)
-	{
-		for(int64_t i = 0; i < dealloc_blk_num; i++)
-			dealloc_bufmeta_node(blk_start_pt[i], opblk_type);
-	}
-	else if(func_type == DEALLOC_PAGE_FUNC)
-	{
-		for(int64_t i = 0; i < dealloc_blk_num; i++)
-			dealloc_nvm_page(blk_start_pt[i], opblk_type);
-	}
-	else if(func_type == DEALLOC_BLOCK_FUNC)
-	{
-		for(int64_t i = 0; i < dealloc_blk_num; i++)
-			dealloc_ssd_block(blk_start_pt[i], opblk_type);
-	}
-	else
-		goto func_type_error;
 	return 0;
-func_type_error:
-	printf("The func type is error!\n");
-	return -1;
 }
 
-int call_log_func(int64_t func_type, void* para_space)
+int64_t orchfs_kfs_alloc_log_direct(void)
 {
-	if(func_type == ALLOC_LOG_SEG_CODE)
-	{
-		int64_t* para_int64_pt = (int64_t*)para_space;
-		int64_t reg_pid = para_int64_pt[0];
-
-		int64_t ret_seg_id = alloc_log_segment_from_dev();
-		int64_t ret_info_arr[2] = {0};
-		ret_info_arr[0] = func_type;
-		ret_info_arr[1] = ret_seg_id;
-
-		kernel_send_message(ret_info_arr, 16, RECV_LOG_SP_PORT+reg_pid);
-	}
-	else
-		goto func_type_error;
-	return 0;
-func_type_error:
-	printf("The func type is error!\n");
-	return -1;
-}
-
-int call_register_func(int64_t func_type, void* para_space)
-{
-	if(func_type == REGISTER_CODE)
-	{
-		if(para_space != NULL)
-			goto message_error;
-		
-		int64_t ret_pid = now_registered_pid++;      
-
-		int64_t ret_info_arr[2] = {0};
-		ret_info_arr[0] = func_type;
-		ret_info_arr[1] = ret_pid;
-
-		kernel_send_message(ret_info_arr, 16, RECV_PID_PORT);
-	}
-	else
-		goto func_type_error;
-	return 0;
-func_type_error:
-	printf("The func type is error!\n");
-	return -1;
-message_error:
-	printf("The message structure is error!\n");
-	return -1;
+	return alloc_log_segment_from_dev();
 }
 
 #ifdef __cplusplus

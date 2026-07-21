@@ -1,15 +1,14 @@
 #ifndef ORCHFS_KERNELFS_SPDK_NVME_BACKEND_HPP
 #define ORCHFS_KERNELFS_SPDK_NVME_BACKEND_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <list>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string>
 #include <system_error>
-#include <vector>
+#include <boost/container/small_vector.hpp>
 
 namespace orchfs::nvme {
 
@@ -33,7 +32,7 @@ struct IoSegment {
 };
 
 struct IoPlan {
-    std::vector<IoSegment> segments;
+    boost::container::small_vector<IoSegment, 4> segments;
     std::uint64_t physical_begin{};
     std::uint64_t physical_end{};
 };
@@ -77,28 +76,36 @@ struct WriteTicket final {
     std::uint64_t sequence{};
     std::uint64_t physical_begin{};
     std::uint64_t physical_end{};
+    WriteTicket *previous{};
+    WriteTicket *next{};
     bool granted{};
+    bool linked{};
 };
 
 class WriteCoordinator final {
 public:
-    using Ticket = std::shared_ptr<WriteTicket>;
+    using Ticket = WriteTicket *;
 
-    Ticket accept(std::uint64_t physical_begin,
+    Ticket accept(WriteTicket &storage,
+                  std::uint64_t physical_begin,
                   std::uint64_t physical_end,
                   std::error_code &error);
 
     // Acceptance order is enforced only for overlapping ranges, so disjoint
     // physical writes can still run concurrently on different pollers.
-    bool try_grant(const Ticket &ticket) noexcept;
-    void complete(const Ticket &ticket) noexcept;
+    bool try_grant(Ticket ticket) noexcept;
+    void complete(Ticket ticket) noexcept;
 
     std::uint64_t capture_fence() const noexcept;
     bool fence_ready(std::uint64_t fence) const noexcept;
 
 private:
-    mutable std::mutex mutex_;
-    std::list<Ticket> outstanding_;
+    // Tickets live in the backend's preallocated Request objects. The short
+    // intrusive-list critical sections replace per-write shared_ptr and
+    // copy-on-write snapshot allocations.
+    mutable std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+    WriteTicket *head_{};
+    WriteTicket *tail_{};
     std::uint64_t last_sequence_{};
 };
 
@@ -108,12 +115,12 @@ struct Config {
     std::string pci_bdf;
     std::uint32_t namespace_id{1};
     std::size_t poller_count{1};
-    std::uint32_t queue_depth{128};
-    std::size_t bounce_buffers_per_poller{64};
+    std::uint32_t queue_depth{32};
+    std::size_t bounce_buffers_per_poller{32};
 
     // Zero uses the namespace maximum.  A non-zero value is capped by the
     // namespace maximum and rounded down to an LBA multiple.
-    std::uint32_t max_transfer_size{};
+    std::uint32_t max_transfer_size{1024U * 1024U};
 
     std::string application_name{"orchfs_kfs"};
     std::string reactor_mask{"0x1"};
@@ -131,9 +138,10 @@ struct PollResult {
     bool stopped{};
 };
 
-// The KFS process owns one Backend.  submit_* may be called by any thread; all
-// SPDK qpair operations happen from poll().  The first poll call binds that
-// poller permanently to the calling thread.  Caller buffers must remain valid
+// The KFS process owns one Backend. submit_* publishes to a lock-free MPSC
+// inbox; all SPDK qpair operations happen from poll(). The first poll call
+// binds that qpair permanently to the calling Runtime worker. Caller buffers
+// must remain valid
 // until their completion callback.  Failed split writes may already have
 // changed earlier media ranges; bytes is reported as zero with the error.  The
 // owner must complete the documented stop/poll/close sequence before destroy.
@@ -165,6 +173,13 @@ public:
     std::error_code submit_flush(std::size_t poller_id,
                                  CompletionCallback callback,
                                  void *callback_context);
+
+    // Register externally shared hugepage memory for direct NVMe DMA. The
+    // caller must keep the region mapped and unregister it only after all I/O
+    // referencing it has completed.
+    std::error_code register_memory(void *address, std::size_t length) noexcept;
+    std::error_code unregister_memory(void *address,
+                                      std::size_t length) noexcept;
 
     // max_completions == 0 asks SPDK to consume all currently available
     // completions.  Completion callbacks execute on this poller thread.

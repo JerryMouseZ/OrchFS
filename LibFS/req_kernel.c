@@ -1,276 +1,96 @@
-#include "../config/socket_config.h"
-#include "../config/protocol.h"
-#include "lib_socket.h"
 #include "req_kernel.h"
-#include "runtime.h"
 
-#ifdef __cplusplus       
-extern "C"{
-#endif
+#include "../KernelFS/kernel_func.h"
+#include "../config/protocol.h"
 
-void reqlock_unlock()
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+static int request_alloc(int64_t function, void* response, int64_t count,
+                         int64_t return_type)
 {
-    pthread_spin_unlock(&(orch_rt.req_kernel_lock));
-    // printf("unlock\n");
-}
-void reqlock_lock()
-{
-    pthread_spin_lock(&(orch_rt.req_kernel_lock));
-    // printf("lock\n");
+    if(function < 0 || function > DEALLOC_BLOCK_FUNC)
+        return EINVAL;
+    return orchfs_kfs_alloc_direct(function, count, return_type, response);
 }
 
-void orch_time_stamp(struct timespec * time)
+static int request_dealloc(int64_t function, const void* blocks,
+                           int64_t count, int64_t parameter_type)
+{
+    if(function < 0 || function > DEALLOC_BLOCK_FUNC)
+        return EINVAL;
+    return orchfs_kfs_dealloc_direct(
+        function, count, parameter_type, (const int64_t*)blocks);
+}
+
+void orch_time_stamp(struct timespec* time)
 {
     clock_gettime(CLOCK_REALTIME, time);
 }
 
-
-void debug(void* out)
+int request_inode_id_arr(void* output, int64_t count, int64_t type)
 {
-    int64_t* out_pt = (int64_t*)out;
-    for(int i = 0; i <= 60; i++)
-        printf("%" PRId64" ",out_pt[i]);
-    printf("\n");
+    return request_alloc(ALLOC_INODE_FUNC, output, count, type);
 }
 
-/*-------------------------alloc----------------------------*/
-
-void request_inode_id_arr(void* ret_info_buf, int64_t req_blk_num, int64_t ret_type)
+int request_idxnd_id_arr(void* output, int64_t count, int64_t type)
 {
-    int64_t send_buf[5];
-    send_buf[0] = ALLOC_INODE_FUNC;
-    send_buf[1] = req_blk_num; send_buf[2] = ret_type;
-    send_buf[3] = lib_register_pid;
-    void* send_data = (void*)send_buf;
-    
-    reqlock_lock();
-    lib_send_message(send_data, sizeof(int64_t)*4, ALLOC_OP_PORT);
-    int recv_len = lib_recv_message(RECV_BLK_PORT + lib_register_pid, ret_info_buf, sizeof(int64_t)*(req_blk_num+2));
-    // fprintf(stderr, "recv len: %d 0 \n",recv_len);
-    reqlock_unlock();
+    return request_alloc(ALLOC_INXND_FUNC, output, count, type);
 }
 
-void request_idxnd_id_arr(void* ret_info_buf, int64_t req_blk_num, int64_t ret_type)
+int request_virnd_id_arr(void* output, int64_t count, int64_t type)
 {
-    int64_t send_buf[5];
-    send_buf[0] = ALLOC_INXND_FUNC;
-    send_buf[1] = req_blk_num; send_buf[2] = ret_type;
-    send_buf[3] = lib_register_pid;
-    void* send_data = (void*)send_buf;
-
-    reqlock_lock();
-    lib_send_message(send_data, sizeof(int64_t)*4, ALLOC_OP_PORT);
-    int recv_len = lib_recv_message(RECV_BLK_PORT + lib_register_pid, ret_info_buf, sizeof(int64_t)*(req_blk_num+2));
-    // fprintf(stderr, "recv len: %d 1 \n",recv_len);
-    reqlock_unlock();
+    return request_alloc(ALLOC_VIRND_FUNC, output, count, type);
 }
 
-void request_virnd_id_arr(void* ret_info_buf, int64_t req_blk_num, int64_t ret_type)
+int request_bufmeta_id_arr(void* output, int64_t count, int64_t type)
 {
-    int64_t send_buf[5];
-    send_buf[0] = ALLOC_VIRND_FUNC;
-    send_buf[1] = req_blk_num; send_buf[2] = ret_type;
-    send_buf[3] = lib_register_pid;
-    void* send_data = (void*)send_buf;
-    
-    reqlock_lock();
-    lib_send_message(send_data, sizeof(int64_t)*4, ALLOC_OP_PORT);
-    int recv_len = lib_recv_message(RECV_BLK_PORT + lib_register_pid, ret_info_buf, sizeof(int64_t)*(req_blk_num+2));
-    // fprintf(stderr, "recv len: %d 2 \n",recv_len);
-    reqlock_unlock();
+    return request_alloc(ALLOC_BUFMETA_FUNC, output, count, type);
 }
 
-void request_bufmeta_id_arr(void* ret_info_buf, int64_t req_blk_num, int64_t ret_type)
+int request_page_id_arr(void* output, int64_t count, int64_t type)
 {
-    int64_t send_buf[5];
-    send_buf[0] = ALLOC_BUFMETA_FUNC;
-    send_buf[1] = req_blk_num; send_buf[2] = ret_type;
-    send_buf[3] = lib_register_pid;
-    void* send_data = (void*)send_buf;
-    
-    reqlock_lock();
-    // fprintf(stderr, "send len: 3 \n");
-    lib_send_message(send_data, sizeof(int64_t)*4, ALLOC_OP_PORT);
-    int recv_len = lib_recv_message(RECV_BLK_PORT + lib_register_pid, ret_info_buf, sizeof(int64_t)*(req_blk_num+2));
-    // fprintf(stderr, "recv len: %d 3 \n",recv_len);
-    reqlock_unlock();
+    return request_alloc(ALLOC_PAGE_FUNC, output, count, type);
 }
 
-void request_page_id_arr(void* ret_info_buf, int64_t req_blk_num, int64_t ret_type)
+int request_block_id_arr(void* output, int64_t count, int64_t type)
 {
-    int64_t send_buf[5];
-    send_buf[0] = ALLOC_PAGE_FUNC;
-    send_buf[1] = req_blk_num; send_buf[2] = ret_type;
-    send_buf[3] = lib_register_pid;
-    void* send_data = (void*)send_buf;
-    
-    reqlock_lock();
-    // fprintf(stderr, "send len: 4\n");
-    lib_send_message(send_data, sizeof(int64_t)*4, ALLOC_OP_PORT);
-    int recv_len = lib_recv_message(RECV_BLK_PORT + lib_register_pid, ret_info_buf, sizeof(int64_t)*(req_blk_num+2));
-    // fprintf(stderr, "recv len: %d 4 \n",recv_len);
-    reqlock_unlock();
+    return request_alloc(ALLOC_BLOCK_FUNC, output, count, type);
 }
 
-void request_block_id_arr(void* ret_info_buf, int64_t req_blk_num, int64_t ret_type)
+int send_dealloc_inode_req(void* blocks, int count, int64_t type)
 {
-    int64_t send_buf[5];
-    send_buf[0] = ALLOC_BLOCK_FUNC;
-    send_buf[1] = req_blk_num; 
-    send_buf[2] = ret_type;
-    send_buf[3] = lib_register_pid;
-    void* send_data = (void*)send_buf;
-    
-    reqlock_lock();
-    lib_send_message(send_data, sizeof(int64_t)*4, ALLOC_OP_PORT);
-    int recv_len = lib_recv_message(RECV_BLK_PORT + lib_register_pid, ret_info_buf, sizeof(int64_t)*(req_blk_num+2));
-    // fprintf(stderr, "recv len: %d 5 \n",recv_len);
-    reqlock_unlock();
+    return request_dealloc(DEALLOC_INODE_FUNC, blocks, count, type);
 }
 
-
-/*-------------------------dealloc--------------------------*/
-
-void send_dealloc_inode_req(void* send_buf, int dealloc_blk_num, int64_t ret_type)
+int send_dealloc_idxnd_req(void* blocks, int count, int64_t type)
 {
-    int64_t message_len = (dealloc_blk_num+4) * sizeof(int64_t);
-    void* send_data = malloc(message_len);
-
-    int64_t* sd_int64_pt = (int64_t*)send_data;
-    sd_int64_pt[0] = DEALLOC_INODE_FUNC;
-    sd_int64_pt[1] = dealloc_blk_num;
-    sd_int64_pt[2] = ret_type;
-    sd_int64_pt[3] = lib_register_pid;
-
-    void* dealloc_blkid_pt = (void*)(sd_int64_pt + 4);
-    memcpy(dealloc_blkid_pt, send_buf, dealloc_blk_num * sizeof(int64_t));
-    lib_send_message(send_data, message_len, DEALLOC_OP_PORT);
-    free(send_data);
+    return request_dealloc(DEALLOC_INXND_FUNC, blocks, count, type);
 }
 
-void send_dealloc_idxnd_req(void* send_buf, int dealloc_blk_num, int64_t ret_type)
+int send_dealloc_virnd_req(void* blocks, int count, int64_t type)
 {
-    int64_t message_len = (dealloc_blk_num+4) * sizeof(int64_t);
-    void* send_data = malloc(message_len);
-
-    int64_t* sd_int64_pt = (int64_t*)send_data;
-    sd_int64_pt[0] = DEALLOC_INXND_FUNC;
-    sd_int64_pt[1] = dealloc_blk_num;
-    sd_int64_pt[2] = ret_type;
-    sd_int64_pt[3] = lib_register_pid;
-
-    void* dealloc_blkid_pt = (void*)(sd_int64_pt + 4);
-    memcpy(dealloc_blkid_pt, send_buf, dealloc_blk_num * sizeof(int64_t));
-    lib_send_message(send_data, message_len, DEALLOC_OP_PORT);
-    free(send_data);
+    return request_dealloc(DEALLOC_VIRND_FUNC, blocks, count, type);
 }
 
-void send_dealloc_virnd_req(void* send_buf, int dealloc_blk_num, int64_t ret_type)
+int send_dealloc_bufmeta_req(void* blocks, int count, int64_t type)
 {
-    int64_t message_len = (dealloc_blk_num+4) * sizeof(int64_t);
-    void* send_data = malloc(message_len);
-
-    int64_t* sd_int64_pt = (int64_t*)send_data;
-    sd_int64_pt[0] = DEALLOC_VIRND_FUNC;
-    sd_int64_pt[1] = dealloc_blk_num;
-    sd_int64_pt[2] = ret_type;
-    sd_int64_pt[3] = lib_register_pid;
-
-    void* dealloc_blkid_pt = (void*)(sd_int64_pt + 4);
-    memcpy(dealloc_blkid_pt, send_buf, dealloc_blk_num * sizeof(int64_t));
-    lib_send_message(send_data, message_len, DEALLOC_OP_PORT);
-    free(send_data);
+    return request_dealloc(DEALLOC_BUFMETA_FUNC, blocks, count, type);
 }
 
-void send_dealloc_bufmeta_req(void* send_buf, int dealloc_blk_num, int64_t ret_type)
+int send_dealloc_page_req(void* blocks, int count, int64_t type)
 {
-    int64_t message_len = (dealloc_blk_num+4) * sizeof(int64_t);
-    void* send_data = malloc(message_len);
-
-    int64_t* sd_int64_pt = (int64_t*)send_data;
-    sd_int64_pt[0] = DEALLOC_BUFMETA_FUNC;
-    sd_int64_pt[1] = dealloc_blk_num;
-    sd_int64_pt[2] = ret_type;
-    sd_int64_pt[3] = lib_register_pid;
-
-    void* dealloc_blkid_pt = (void*)(sd_int64_pt + 4);
-    memcpy(dealloc_blkid_pt, send_buf, dealloc_blk_num * sizeof(int64_t));
-    lib_send_message(send_data, message_len, DEALLOC_OP_PORT);
-    free(send_data);
+    return request_dealloc(DEALLOC_PAGE_FUNC, blocks, count, type);
 }
 
-void send_dealloc_page_req(void* send_buf, int dealloc_blk_num, int64_t ret_type)
+int send_dealloc_block_req(void* blocks, int count, int64_t type)
 {
-    int64_t message_len = (dealloc_blk_num+4) * sizeof(int64_t);
-    void* send_data = malloc(message_len);
-
-    int64_t* sd_int64_pt = (int64_t*)send_data;
-    sd_int64_pt[0] = DEALLOC_PAGE_FUNC;
-    sd_int64_pt[1] = dealloc_blk_num;
-    sd_int64_pt[2] = ret_type;
-    sd_int64_pt[3] = lib_register_pid;
-
-    void* dealloc_blkid_pt = (void*)(sd_int64_pt + 4);
-    memcpy(dealloc_blkid_pt, send_buf, dealloc_blk_num * sizeof(int64_t));
-    lib_send_message(send_data, message_len, DEALLOC_OP_PORT);
-    free(send_data);
+    return request_dealloc(DEALLOC_BLOCK_FUNC, blocks, count, type);
 }
 
-void send_dealloc_block_req(void* send_buf, int dealloc_blk_num, int64_t ret_type)
+int64_t request_log_seg(void)
 {
-    int64_t message_len = (dealloc_blk_num+4) * sizeof(int64_t);
-    void* send_data = malloc(message_len);
-
-    int64_t* sd_int64_pt = (int64_t*)send_data;
-    sd_int64_pt[0] = DEALLOC_BLOCK_FUNC;
-    sd_int64_pt[1] = dealloc_blk_num;
-    sd_int64_pt[2] = ret_type;
-    sd_int64_pt[3] = lib_register_pid;
-
-    void* dealloc_blkid_pt = (void*)(sd_int64_pt + 4);
-    memcpy(dealloc_blkid_pt, send_buf, dealloc_blk_num * sizeof(int64_t));
-    lib_send_message(send_data, message_len, DEALLOC_OP_PORT);
-    free(send_data);
+    return orchfs_kfs_alloc_log_direct();
 }
-
-/*-------------------------log--------------------------*/
-int64_t request_log_seg()
-{
-    int64_t send_buf[5];
-    send_buf[0] = ALLOC_LOG_SEG_CODE;
-    send_buf[1] = lib_register_pid;
-    void* send_data = (void*)send_buf;
-
-    reqlock_lock();
-    lib_send_message(send_data, sizeof(int64_t)*2, LOG_OP_PORT);
-    void* ret_info_buf = malloc(4096);
-    lib_recv_message(RECV_LOG_SP_PORT + lib_register_pid, ret_info_buf, sizeof(int64_t)*2);
-    reqlock_unlock();
-
-    int64_t* ret_info_int64 = (int64_t*)ret_info_buf;
-    int64_t ret_seg_id = ret_info_int64[1];
-    free(ret_info_buf);
-    return ret_seg_id;
-}
-
-/*-------------------------req process id--------------------------*/
-int64_t request_process_id()
-{
-
-    int64_t send_buf[5];
-    send_buf[0] = REGISTER_CODE;
-    void* send_data = (void*)send_buf;
-
-    lib_send_message(send_data, sizeof(int64_t), REGISTER_PORT);
-    void* ret_info_buf = malloc(4096);
-    lib_recv_message(RECV_PID_PORT, ret_info_buf, sizeof(int64_t)*2);
-
-    int64_t* ret_info_int64 = (int64_t*)ret_info_buf;
-    int64_t ret_pid = ret_info_int64[1];
-    free(ret_info_buf);
-    return ret_pid;
-}
-
-#ifdef __cplusplus
-}
-#endif

@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 
+#include "orchfs/async/filesystem.hpp"
 #include "orchfs/async/result.hpp"
 #include "orchfs/async/range_arbiter.hpp"
 #include "orchfs/async/rpc_protocol.hpp"
@@ -23,45 +24,6 @@ struct ClientOptions {
   std::string endpoint{"/tmp/orchfs-kfs.sock"};
   std::size_t ring_capacity{64};
   std::size_t data_slot_size{1024U * 1024U};
-};
-
-struct FileStat {
-  std::uint64_t device{};
-  std::uint64_t inode{};
-  std::uint64_t mode{};
-  std::uint64_t link_count{};
-  std::uint64_t uid{};
-  std::uint64_t gid{};
-  std::uint64_t rdev{};
-  std::int64_t size{};
-  std::int64_t block_size{};
-  std::int64_t blocks{};
-  std::int64_t atime_seconds{};
-  std::int64_t atime_nanoseconds{};
-  std::int64_t mtime_seconds{};
-  std::int64_t mtime_nanoseconds{};
-  std::int64_t ctime_seconds{};
-  std::int64_t ctime_nanoseconds{};
-};
-
-struct FileSystemStat {
-  std::uint64_t type{};
-  std::uint64_t block_size{};
-  std::uint64_t blocks{};
-  std::uint64_t blocks_free{};
-  std::uint64_t blocks_available{};
-  std::uint64_t files{};
-  std::uint64_t files_free{};
-  std::uint64_t name_length{};
-  std::uint64_t fragment_size{};
-  std::uint64_t flags{};
-};
-
-struct DirEntry {
-  std::uint64_t inode{};
-  std::int64_t offset{};
-  std::uint8_t type{};
-  std::string name;
 };
 
 class Client {

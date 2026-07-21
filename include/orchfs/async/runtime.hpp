@@ -24,6 +24,39 @@ struct RuntimeOptions {
 
 class Runtime final {
 public:
+    enum class PollState : std::uint8_t {
+        idle,
+        busy,
+        progress,
+    };
+
+    using PollFunction = PollState (*)(void* context) noexcept;
+
+    class PollRegistration final {
+    public:
+        struct State;
+
+        PollRegistration() noexcept = default;
+        PollRegistration(const PollRegistration&) = delete;
+        PollRegistration& operator=(const PollRegistration&) = delete;
+        PollRegistration(PollRegistration&& other) noexcept;
+        PollRegistration& operator=(PollRegistration&& other) noexcept;
+        ~PollRegistration();
+
+        void reset() noexcept;
+        [[nodiscard]] explicit operator bool() const noexcept {
+            return static_cast<bool>(state_);
+        }
+
+    private:
+        explicit PollRegistration(std::shared_ptr<State> state) noexcept
+            : state_(std::move(state)) {}
+
+        std::shared_ptr<State> state_;
+
+        friend class Runtime;
+    };
+
     [[nodiscard]] static Result<std::unique_ptr<Runtime>> create(
         RuntimeOptions options = {});
 
@@ -70,7 +103,20 @@ public:
     [[nodiscard]] Result<void> join() noexcept;
 
     [[nodiscard]] std::size_t worker_count() const noexcept;
+    [[nodiscard]] Result<unsigned> worker_cpu(std::size_t worker) const noexcept;
     [[nodiscard]] std::size_t owner_for(std::uint64_t key) const noexcept;
+
+    // Wake a worker so an owner-local poller can drain work published through
+    // an external MPSC queue. No coroutine is created or scheduled.
+    [[nodiscard]] bool notify(std::size_t worker) noexcept;
+
+    // Register a non-blocking driver on one worker. The callback is invoked
+    // only by that worker and must report whether it has outstanding work so
+    // the Runtime does not park while progress still requires active polling.
+    // Destroying the registration prevents future callbacks and waits for an
+    // already-running callback to return.
+    [[nodiscard]] Result<PollRegistration> register_poller(
+        std::size_t worker, PollFunction function, void* context) noexcept;
 
     [[nodiscard]] static Runtime* current() noexcept;
     [[nodiscard]] static std::size_t current_worker() noexcept;

@@ -2,7 +2,6 @@
 #include "libspace.h"
 #include "meta_cache.h"
 #include "lib_log.h"
-#include "runtime.h"
 
 #include "../config/config.h"
 #include "../config/log_config.h"
@@ -11,20 +10,6 @@
 extern "C"{
 #endif
 
-void bitlock_acquire(bit_lock_t* bitlock, int lock_pos)
-{
-    uint64_t * target = bitlock + (lock_pos / 64);
-    uint64_t offset = lock_pos % 64;
-    while((((uint64_t)0b01 << offset) & __sync_fetch_and_or(target, (uint64_t)0b01 << offset)) != 0){
-        // pthread_yield();
-    }
-}
-void bitlock_release(bit_lock_t* bitlock, int unlock_pos)
-{
-    FETCH_AND_unSET_BIT(bitlock, unlock_pos);
-}
-
-
 void node_init(idx_nd_pt idxnd_spt, int64_t init_zipped_layer, int32_t ntype)
 {
     idxnd_spt->ndtype = ntype;
@@ -32,7 +17,7 @@ void node_init(idx_nd_pt idxnd_spt, int64_t init_zipped_layer, int32_t ntype)
     for(int i = 0; i < NODE_SON_CAPACITY/64; i++)
     {
         idxnd_spt->virnd_flag[i] = 0;
-        idxnd_spt->bit_lock[i] = 0;
+        idxnd_spt->reserved_words[i] = 0;
     }
     for(int i = 0; i < NODE_SON_CAPACITY; i++)
         idxnd_spt->son_blk_id[i] = EMPTY_BLKID;
@@ -55,9 +40,16 @@ void vir_node_init(vir_nd_pt virnd_spt, int32_t ntype)
 
 idx_root_pt check_root_id(root_id_t root_id, int64_t inode_id)
 {
+    if(root_id < 0 || inode_id < 0)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
     void* root_blk_memaddr = indexid_to_memaddr(inode_id, root_id, CREATE);
     idx_root_pt root_pt = (idx_root_pt)root_blk_memaddr;
     if(root_pt == NULL)
+        goto cache_error;
+    if(root_pt->ndtype != IDX_ROOT || root_pt->idx_inode_id != inode_id)
         goto cache_error;
     
     // if(inode_id == 0)
@@ -72,6 +64,8 @@ idx_root_pt check_root_id(root_id_t root_id, int64_t inode_id)
         root_pt->idx_entry_blkid = require_index_node_id();
         if(root_pt->idx_entry_blkid != -1)
         {
+            write_change_log(root_id, IDXND_OP, root_pt,
+                offsetof(idx_root_t, idx_entry_blkid), sizeof(int64_t));
 
             write_create_log(root_pt->idx_entry_blkid, IDXND_OP);
             void* idxnd_memaddr = indexid_to_memaddr(inode_id, root_pt->idx_entry_blkid, CREATE);
@@ -91,11 +85,11 @@ idx_root_pt check_root_id(root_id_t root_id, int64_t inode_id)
         return root_pt;
     }
 cache_error:
-    printf("root cache create error!\n");
-    exit(0);
+    errno = EIO;
+    return NULL;
 alloc_error:
-    printf("root create error!\n");
-    exit(0);
+    errno = ENOSPC;
+    return NULL;
 }
 
 
@@ -104,12 +98,29 @@ index_id_t search_leaf_node(index_id_t now_idxnd_id, int64_t inode_id,
 {
     if(now_idxnd_id == EMPTY_BLKID)
         return -1;
+    if(now_idxnd_id < 0 || inode_id < 0 || searched_len < 0 ||
+       searched_len > KEY_LEN || blk_offset < 0 ||
+       (uint64_t)blk_offset >= (1ULL << KEY_LEN))
+    {
+        errno = EINVAL;
+        return -1;
+    }
 
     // printf("sln: %lld %lld\n",inode_id,now_idxnd_id);
     void* idxnd_memaddr = indexid_to_memaddr(inode_id, now_idxnd_id, CREATE);
     idx_nd_pt now_idxnd = (idx_nd_pt)idxnd_memaddr;
     if(now_idxnd == NULL)
         goto cache_error;
+
+    if(now_idxnd->zipped_layer < 0 ||
+       now_idxnd->zipped_layer > MAX_ZIPPED_LAYER ||
+       now_idxnd->zipped_layer * LAYER_BITWIDTH > KEY_LEN - searched_len ||
+       (now_idxnd->ndtype != LEAF_NODE &&
+        now_idxnd->ndtype != NOT_LEAF_NODE) ||
+       (now_idxnd->ndtype == NOT_LEAF_NODE &&
+        now_idxnd->zipped_layer * LAYER_BITWIDTH + LAYER_BITWIDTH >
+            KEY_LEN - searched_len))
+        goto index_error;
 
 
     int32_t zipped_len = now_idxnd->zipped_layer * LAYER_BITWIDTH;
@@ -136,13 +147,16 @@ index_id_t search_leaf_node(index_id_t now_idxnd_id, int64_t inode_id,
 
             // printf("next_info: %" PRId64" %" PRId64" %" PRId64"\n", 
             //                 next_layer_key, new_searched_len,next_layer_idxid);
-            
+
             return search_leaf_node(next_layer_idxid, inode_id, new_searched_len, blk_offset);
         }
     }
 cache_error:
-    printf("root cache create error! -- search_leaf_node\n");
-    exit(0);
+    errno = EIO;
+    return -1;
+index_error:
+    errno = EIO;
+    return -1;
 not_exist:
     return -1;
 }
@@ -151,10 +165,24 @@ not_exist:
 int insert_node_into_index(index_id_t now_idxnd_id, int64_t inode_id, int64_t* father_pt, 
                             int32_t searched_len, uint64_t blk_offset)
 {
+    if(now_idxnd_id < 0 || inode_id < 0 || father_pt == NULL ||
+       searched_len < 0 || searched_len > KEY_LEN ||
+       blk_offset >= (1ULL << KEY_LEN))
+        goto parameter_error;
     // printf("node_id: %" PRId64" \n",now_idxnd_id);
     void* idxnd_memaddr = indexid_to_memaddr(inode_id, now_idxnd_id, CREATE);
     idx_nd_pt now_idxnd = (idx_nd_pt)idxnd_memaddr;
     if(now_idxnd == NULL)
+        goto cache_error;
+
+    if(now_idxnd->zipped_layer < 0 ||
+       now_idxnd->zipped_layer > MAX_ZIPPED_LAYER ||
+       now_idxnd->zipped_layer * LAYER_BITWIDTH > KEY_LEN - searched_len ||
+       (now_idxnd->ndtype != LEAF_NODE &&
+        now_idxnd->ndtype != NOT_LEAF_NODE) ||
+       (now_idxnd->ndtype == NOT_LEAF_NODE &&
+        now_idxnd->zipped_layer * LAYER_BITWIDTH + LAYER_BITWIDTH >
+            KEY_LEN - searched_len))
         goto cache_error;
     
 
@@ -193,22 +221,28 @@ int insert_node_into_index(index_id_t now_idxnd_id, int64_t inode_id, int64_t* f
                 write_change_log(new_idx_id, IDXND_OP, new_idx_pt, 0, ORCH_IDX_SIZE);
 
                 now_idxnd->son_blk_id[son_arridx] = new_idx_id;
-                write_change_log(now_idxnd_id, IDXND_OP, now_idxnd, 32+son_arridx*8, 8);
+                write_change_log(now_idxnd_id, IDXND_OP, now_idxnd,
+                    offsetof(idx_nd_t, son_blk_id) + son_arridx * 8, 8);
             }
+            else
+                goto alloc_error;
         }
         int64_t next_layer_idxid = now_idxnd->son_blk_id[son_arridx];
         int64_t* next_father_pt = &(now_idxnd->son_blk_id[son_arridx]);
         int modify_flag = insert_node_into_index(next_layer_idxid, inode_id, next_father_pt, 
                                                 searched_len + zipped_len + LAYER_BITWIDTH, blk_offset);
+        if(modify_flag < 0)
+            return -1;
         if(modify_flag == 1)
         {
-            write_change_log(now_idxnd_id, IDXND_OP, now_idxnd, 32+son_arridx*8, 8);
+            write_change_log(now_idxnd_id, IDXND_OP, now_idxnd,
+                offsetof(idx_nd_t, son_blk_id) + son_arridx * 8, 8);
         }
         return 0;
     }
     else
     {
-        int64_t level_zipped_part[MAX_ZIPPED_LAYER+1];
+        int64_t level_zipped_part[MAX_ZIPPED_LAYER+1] = {0};
 
         int32_t zipped_layer_num = now_idxnd->zipped_layer;
 
@@ -243,9 +277,13 @@ int insert_node_into_index(index_id_t now_idxnd_id, int64_t inode_id, int64_t* f
                 goto cache_error;
             node_init(new_idx_pt, allow_zipped_layer, NOT_LEAF_NODE);
 
-            
-            int new_idxnd_layer = allow_zipped_layer + 1;
-            int new_layer_key = level_zipped_part[new_idxnd_layer];
+
+            /* The existing compressed subtree represents the all-zero prefix.
+             * Keep it under child zero and let the recursive insertion create
+             * the branch selected by blk_offset.  Placing the old subtree at
+             * new_layer_key aliases block 64 with block 0 (and every later
+             * 64-block boundary with the preceding leaf), so the append path
+             * observes an already occupied slot and returns EIO. */
             new_idx_pt->son_blk_id[0] = now_idxnd_id;
             write_change_log(new_idx_id, IDXND_OP, new_idx_pt, 0, ORCH_IDX_SIZE);
 
@@ -254,13 +292,18 @@ int insert_node_into_index(index_id_t now_idxnd_id, int64_t inode_id, int64_t* f
 
 
             *father_pt = new_idx_id;
-            int64_t* next_father_pt = &(new_idx_pt->son_blk_id[0]);
+            int64_t* next_father_pt =
+                &(new_idx_pt->son_blk_id[0]);
             int modify_flag = insert_node_into_index(new_idx_id, inode_id, next_father_pt, searched_len, blk_offset);
+
+            if(modify_flag < 0)
+                return -1;
 
             // int modify_flag = insert_node_into_index(new_idx_id, inode_id, father, searched_len, blk_offset);
             if(modify_flag == 1)
             {
-                write_change_log(new_idx_id, IDXND_OP, new_idx_pt, 32, 8);
+                write_change_log(new_idx_id, IDXND_OP, new_idx_pt,
+                    offsetof(idx_nd_t, son_blk_id), 8);
             }
             return 1;
         }
@@ -268,11 +311,14 @@ int insert_node_into_index(index_id_t now_idxnd_id, int64_t inode_id, int64_t* f
             goto alloc_error;
     }
 cache_error:
-    printf("root cache create error! -- insert_node_into_index\n");
-    exit(0);
+    errno = EIO;
+    return -1;
 alloc_error:
-    printf("root create error!\n");
-    exit(0);
+    errno = ENOSPC;
+    return -1;
+parameter_error:
+    errno = EINVAL;
+    return -1;
 }
 
 
@@ -297,14 +343,38 @@ void change_idxson_type(idx_nd_pt target_idxpt, uint64_t pos, int type)
 }
 
 
-idx_nd_pt get_and_add_leafnode_pt(idx_root_pt root_pt, int64_t inode_id, int64_t offset)
+idx_nd_pt get_and_add_leafnode_pt(root_id_t root_id, idx_root_pt root_pt,
+                                  int64_t inode_id, int64_t offset)
 {
+    if(root_pt == NULL)
+    {
+        if(errno == 0)
+            errno = EINVAL;
+        return NULL;
+    }
+    errno = 0;
     index_id_t leaf_node_id = search_leaf_node(root_pt->idx_entry_blkid, inode_id, 0, offset);
     // printf("leaf_node_id %ld\n",leaf_node_id);
     if(leaf_node_id == -1)
     {
-        insert_node_into_index(root_pt->idx_entry_blkid, inode_id, &(root_pt->idx_entry_blkid), 0, offset);
+        if(errno != 0)
+            return NULL;
+        const int modified = insert_node_into_index(
+            root_pt->idx_entry_blkid, inode_id,
+            &(root_pt->idx_entry_blkid), 0, offset);
+        if(modified < 0)
+            return NULL;
+        if(modified == 1)
+            write_change_log(root_id, IDXND_OP, root_pt,
+                offsetof(idx_root_t, idx_entry_blkid), sizeof(int64_t));
+        errno = 0;
         leaf_node_id = search_leaf_node(root_pt->idx_entry_blkid, inode_id, 0, offset);
+        if(leaf_node_id < 0)
+        {
+            if(errno == 0)
+                errno = EIO;
+            return NULL;
+        }
         // printf("leaf_node_id1 %ld\n",leaf_node_id);
     }
     void* leaf_memaddr = indexid_to_memaddr(inode_id, leaf_node_id, CREATE);
@@ -314,18 +384,38 @@ idx_nd_pt get_and_add_leafnode_pt(idx_root_pt root_pt, int64_t inode_id, int64_t
         goto cache_error;
     return leaf_pt;
 cache_error:
-    printf("root cache create error! -- insert_node_into_index\n");
-    exit(0);
+    errno = EIO;
+    return NULL;
 }
 
 
-int64_t get_and_add_leafnode_id(idx_root_pt root_pt, int64_t inode_id, int64_t offset)
+int64_t get_and_add_leafnode_id(root_id_t root_id, idx_root_pt root_pt,
+                                int64_t inode_id, int64_t offset)
 {
+    if(root_pt == NULL)
+    {
+        if(errno == 0)
+            errno = EINVAL;
+        return -1;
+    }
+    errno = 0;
     index_id_t leaf_node_id = search_leaf_node(root_pt->idx_entry_blkid, inode_id, 0, offset);
     if(leaf_node_id == -1)
     {
-        insert_node_into_index(root_pt->idx_entry_blkid, inode_id, &(root_pt->idx_entry_blkid), 0, offset);
+        if(errno != 0)
+            return -1;
+        const int modified = insert_node_into_index(
+            root_pt->idx_entry_blkid, inode_id,
+            &(root_pt->idx_entry_blkid), 0, offset);
+        if(modified < 0)
+            return -1;
+        if(modified == 1)
+            write_change_log(root_id, IDXND_OP, root_pt,
+                offsetof(idx_root_t, idx_entry_blkid), sizeof(int64_t));
+        errno = 0;
         leaf_node_id = search_leaf_node(root_pt->idx_entry_blkid, inode_id, 0, offset);
+        if(leaf_node_id < 0 && errno == 0)
+            errno = EIO;
     }
     return leaf_node_id;
 }
@@ -333,6 +423,11 @@ int64_t get_and_add_leafnode_id(idx_root_pt root_pt, int64_t inode_id, int64_t o
 
 idx_nd_pt get_leafnode_pt(idx_root_pt root_pt, int64_t inode_id, int64_t offset)
 {
+    if(root_pt == NULL)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
     index_id_t leaf_node_id = search_leaf_node(root_pt->idx_entry_blkid, inode_id, 0, offset);
     // printf("leaf_node_id %ld\n",leaf_node_id);
     if(leaf_node_id == -1)
@@ -344,8 +439,8 @@ idx_nd_pt get_leafnode_pt(idx_root_pt root_pt, int64_t inode_id, int64_t offset)
         goto cache_error;
     return leaf_pt;
 cache_error:
-    printf("root cache create error! -- insert_node_into_index\n");
-    exit(0);
+    errno = EIO;
+    return NULL;
 }
 
 
@@ -353,13 +448,10 @@ int64_t get_leafnode_id(idx_root_pt root_pt, int64_t inode_id, int64_t offset)
 {
     index_id_t leaf_node_id = search_leaf_node(root_pt->idx_entry_blkid, inode_id, 0, offset);
     return leaf_node_id;
-cache_error:
-    printf("root cache create error! -- insert_node_into_index\n");
-    exit(0);
 }
 
 
-void insert_strata_node(int64_t inode_id, idx_nd_pt leaf_pt, int64_t leaf_pos)
+int insert_strata_node(int64_t inode_id, idx_nd_pt leaf_pt, int64_t leaf_pos)
 {
     if(leaf_pos < 0 || leaf_pos >= NODE_SON_CAPACITY)
         goto pos_error;
@@ -390,24 +482,22 @@ void insert_strata_node(int64_t inode_id, idx_nd_pt leaf_pt, int64_t leaf_pos)
     }
     else
         goto op_error;
-    return;
+    return 0;
 op_error:
-    printf("Can not insert strata node: The offset is error!\n");
-    exit(0);
+    return EINVAL;
 pos_error:
-    printf("The offset/pos is out of range!\n");
-    exit(0);
+    return EINVAL;
 alloc_error:
-    printf("vir node create error!\n");
-    exit(0);
+    return ENOSPC;
 cache_error:
-    printf("vir node cache create error! -- insert_strata_node\n");
-    exit(0);
+    return EIO;
 }
 
 
-void delete_all_index_operation(idx_nd_pt now_idx_pt, int64_t inode_id)
+static int delete_all_index_operation(idx_nd_pt now_idx_pt, int64_t inode_id)
 {
+    if(now_idx_pt == NULL)
+        return EIO;
     if(now_idx_pt->ndtype == LEAF_NODE)
     {
         for(int i = 0; i < NODE_SON_CAPACITY; i++)
@@ -421,7 +511,7 @@ void delete_all_index_operation(idx_nd_pt now_idx_pt, int64_t inode_id)
                 {
                     vir_nd_pt vir_idx_pt = virnodeid_to_memaddr(inode_id, now_idx_pt->son_blk_id[i], CREATE);
                     if(vir_idx_pt == NULL)
-                        goto cache_error;
+                        return EIO;
                     for(int j = 0; j < VLN_SLOT_SUM; j++)
                     {
                         if(vir_idx_pt->nvm_page_id[j] != EMPTY_BLKID)
@@ -449,21 +539,29 @@ void delete_all_index_operation(idx_nd_pt now_idx_pt, int64_t inode_id)
             {
                 int64_t son_idx_id = now_idx_pt->son_blk_id[i];
                 idx_nd_pt next_idx_pt = indexid_to_memaddr(inode_id, son_idx_id, CREATE);
-                delete_all_index_operation(next_idx_pt, inode_id);
+                const int error = delete_all_index_operation(next_idx_pt, inode_id);
+                if(error != 0)
+                    return error;
                 release_index_node(son_idx_id);
             }
         }
     }
-    return;
-cache_error:
-    printf("root cache create error! -- delete_all_index_node\n");
-    exit(0);
+    else
+        return EIO;
+    return 0;
 }
 
 
 void delete_part_index_operation(idx_nd_pt idx_pt, int64_t inode_id, int64_t searched_len, int64_t offset)
 {
+    if(idx_pt == NULL || searched_len < 0 || searched_len > KEY_LEN ||
+       offset < 0 || (uint64_t)offset >= (1ULL << KEY_LEN) ||
+       idx_pt->zipped_layer < 0 ||
+       idx_pt->zipped_layer > MAX_ZIPPED_LAYER)
+        goto index_error;
     int32_t zipped_len = idx_pt->zipped_layer * LAYER_BITWIDTH;       ///当层被压缩的位数
+    if(zipped_len > KEY_LEN - searched_len)
+        goto index_error;
     uint64_t zipped_part_bit = (((1ULL << zipped_len) - 1) << (KEY_LEN - searched_len - zipped_len));
     uint64_t zipped_part = ((zipped_part_bit & offset) >> (KEY_LEN - searched_len - zipped_len));
     if(zipped_part != 0)
@@ -477,6 +575,8 @@ void delete_part_index_operation(idx_nd_pt idx_pt, int64_t inode_id, int64_t sea
             for(int i = next_layer_key; i < NODE_SON_CAPACITY; i++)
             {
                 int64_t next_layer_idxid = idx_pt->son_blk_id[i];
+                if(next_layer_idxid == EMPTY_BLKID)
+                    continue;
                 void* idxnd_memaddr = indexid_to_memaddr(inode_id, next_layer_idxid, CREATE);
                 idx_nd_pt next_idxnd = (idx_nd_pt)idxnd_memaddr;
                 if(next_idxnd == NULL)
@@ -492,6 +592,8 @@ void delete_part_index_operation(idx_nd_pt idx_pt, int64_t inode_id, int64_t sea
             for(int i = next_layer_key; i < NODE_SON_CAPACITY; i++)
             {
                 int64_t next_layer_idxid = idx_pt->son_blk_id[i];
+                if(next_layer_idxid == EMPTY_BLKID)
+                    continue;
                 void* idxnd_memaddr = indexid_to_memaddr(inode_id, next_layer_idxid, CREATE);
                 idx_nd_pt next_idxnd = (idx_nd_pt)idxnd_memaddr;
                 if(next_idxnd == NULL)
@@ -509,11 +611,13 @@ void delete_part_index_operation(idx_nd_pt idx_pt, int64_t inode_id, int64_t sea
             }
         }
     }
+    return;
 cache_error:
-    printf("root cache create error! -- search_leaf_node\n");
-    exit(0);
+    errno = EIO;
+    return;
 index_error:
-    printf("The index is error!\n");
+    errno = EINVAL;
+    return;
 }
 
 
@@ -543,11 +647,11 @@ root_id_t create_index(int64_t inode_id)
     else       
         goto alloc_error;
 alloc_error:
-    printf("root create error!\n");
-    exit(0);
+    errno = ENOSPC;
+    return -1;
 cache_error:
-    printf("root cache create error!\n");
-    exit(0);
+    errno = EIO;
+    return -1;
 }
 
 int append_ssd_blocks(root_id_t root_id, int64_t inode_id, 
@@ -555,10 +659,13 @@ int append_ssd_blocks(root_id_t root_id, int64_t inode_id,
 {
 
     idx_root_pt root_pt = check_root_id(root_id, inode_id);
+    if(root_pt == NULL)
+        return errno != 0 ? errno : EIO;
 
 
     int64_t app_blk_off = root_pt->max_blk_offset + 1;
-    if(app_blk_num + app_blk_off >= (1LL << KEY_LEN))
+    if(app_blk_num <= 0 || app_blk_off < 0 ||
+       app_blk_num > (1LL << KEY_LEN) - app_blk_off)
         goto blknum_error;
 
 
@@ -566,7 +673,10 @@ int append_ssd_blocks(root_id_t root_id, int64_t inode_id,
     while(need_app_blk_num > 0)
     {
 
-        int64_t leaf_node_id = get_and_add_leafnode_id(root_pt, inode_id, app_blk_off);
+        int64_t leaf_node_id = get_and_add_leafnode_id(
+            root_id, root_pt, inode_id, app_blk_off);
+        if(leaf_node_id < 0)
+            return errno != 0 ? errno : EIO;
         idx_nd_pt leaf_pt = (idx_nd_pt)indexid_to_memaddr(inode_id, leaf_node_id, CREATE);
         if(leaf_pt == NULL)
             goto cache_error;
@@ -586,21 +696,21 @@ int append_ssd_blocks(root_id_t root_id, int64_t inode_id,
                 break;
         }
         
-        write_change_log(root_id, IDXND_OP, leaf_pt, (4+leaf_offset)*8, this_app_blk*8);
+        write_change_log(leaf_node_id, IDXND_OP, leaf_pt,
+            offsetof(idx_nd_t, son_blk_id) + leaf_offset * 8,
+            this_app_blk * 8);
     }
     root_pt->max_blk_offset += app_blk_num;
 
-    write_change_log(root_id, IDXND_OP, root_pt, 3*sizeof(int64_t), sizeof(int64_t));
+    write_change_log(root_id, IDXND_OP, root_pt,
+        offsetof(idx_root_t, max_blk_offset), sizeof(int64_t));
     return 0;
 blknum_error:
-    printf("block num error!\n");
-    return -1;
+    return EFBIG;
 cache_error:
-    printf("cache create error! -- append_ssd_blocks\n");
-    exit(0);
+    return EIO;
 index_error:
-    printf("index error!\n");
-    return -1;
+    return EIO;
 }
 
 
@@ -616,6 +726,10 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
                     int32_t app_blk_num, nvm_page_id_t nvm_page_id_arr[])
 {
     idx_root_pt root_pt = check_root_id(root_id, inode_id);
+    if(root_pt == NULL)
+        return errno != 0 ? errno : EIO;
+    if(app_blk_num <= 0)
+        return EINVAL;
 
     int64_t app_blk_offset = 0;
     if(root_pt->max_blk_offset == -1)
@@ -623,7 +737,10 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
     else
     {
         app_blk_offset = root_pt->max_blk_offset;
-        idx_nd_pt leaf_pt = get_and_add_leafnode_pt(root_pt, inode_id, app_blk_offset);
+        idx_nd_pt leaf_pt = get_and_add_leafnode_pt(
+            root_id, root_pt, inode_id, app_blk_offset);
+        if(leaf_pt == NULL)
+            return errno != 0 ? errno : EIO;
         int64_t leaf_pos = (app_blk_offset & ((1LL << LAYER_BITWIDTH) - 1));
         if(leaf_pt->son_blk_id[leaf_pos] != EMPTY_BLKID)
         {
@@ -636,7 +753,10 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
     int64_t now_page_cur = 0;
     while(app_blk_num > 0)
     {
-        int64_t leaf_node_id = get_and_add_leafnode_id(root_pt, inode_id, app_blk_offset);
+        int64_t leaf_node_id = get_and_add_leafnode_id(
+            root_id, root_pt, inode_id, app_blk_offset);
+        if(leaf_node_id < 0)
+            return errno != 0 ? errno : EIO;
         idx_nd_pt leaf_pt = indexid_to_memaddr(inode_id, leaf_node_id, CREATE);
         if(leaf_pt == NULL)
             goto cache_error;
@@ -653,12 +773,13 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
                 vir_nd_pt virnd_mem_pt = virnodeid_to_memaddr(inode_id, vir_node_id, CREATE);
                 if(virnd_mem_pt == NULL)
                     goto cache_error;
-                
-                
+                if(virnd_mem_pt->max_pos < 0 ||
+                   virnd_mem_pt->max_pos > VLN_SLOT_SUM)
+                    goto index_error;
                 if(virnd_mem_pt->ndtype == STRATA_NODE)
                     goto index_error;
-                
-                
+                if(virnd_mem_pt->ndtype != VIR_LEAF_NODE)
+                    goto index_error;
                 for(int i = virnd_mem_pt->max_pos; i < VLN_SLOT_SUM; i++)
                 {
                     virnd_mem_pt->nvm_page_id[i] = nvm_page_id_arr[now_page_cur];
@@ -668,7 +789,8 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
                         break;
                 }
                 
-                write_change_log(vir_node_id, VIRND_OP, virnd_mem_pt, 0, 128);
+                write_change_log(vir_node_id, VIRND_OP, virnd_mem_pt, 0,
+                    ORCH_VIRND_SIZE);
                 if(virnd_mem_pt->max_pos == VLN_SLOT_SUM && app_blk_num > 0)
                     app_blk_offset++;
             }
@@ -680,7 +802,7 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
             vir_nd_pt virnd_mem_pt = NULL;
             if(virnd_id != -1)
             {
-                
+                write_create_log(virnd_id, VIRND_OP);
                 void* virnd_memaddr = virnodeid_to_memaddr(inode_id, virnd_id, CREATE);
                 virnd_mem_pt = (vir_nd_pt)virnd_memaddr;
                 if(virnd_mem_pt == NULL)
@@ -696,8 +818,10 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
             leaf_pt->son_blk_id[leaf_pos] = virnd_id;
             change_idxson_type(leaf_pt, leaf_pos, VIR_LEAF_NODE);
             
-            write_change_log(leaf_node_id, IDXND_OP, leaf_pt, 16, 8);
-            write_change_log(leaf_node_id, IDXND_OP, leaf_pt, 32+leaf_pos*8, 8);
+            write_change_log(leaf_node_id, IDXND_OP, leaf_pt,
+                offsetof(idx_nd_t, virnd_flag), sizeof(leaf_pt->virnd_flag));
+            write_change_log(leaf_node_id, IDXND_OP, leaf_pt,
+                offsetof(idx_nd_t, son_blk_id) + leaf_pos * 8, 8);
 
             
             for(int i = virnd_mem_pt->max_pos; i < VLN_SLOT_SUM; i++)
@@ -708,23 +832,23 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
                 if(app_blk_num <= 0)
                     break;
             }
-            write_change_log(virnd_id, VIRND_OP, virnd_mem_pt, 0, 128);
+            write_change_log(virnd_id, VIRND_OP, virnd_mem_pt, 0,
+                ORCH_VIRND_SIZE);
             if(virnd_mem_pt->max_pos == VLN_SLOT_SUM && app_blk_num > 0)
                 app_blk_offset++;
         }
     }
     root_pt->max_blk_offset = app_blk_offset;
-    // printf("max_blk_offset: %lld\n",root_pt->max_blk_offset);
+    write_change_log(root_id, IDXND_OP, root_pt,
+        offsetof(idx_root_t, max_blk_offset), sizeof(int64_t));
     return 0;
 alloc_error:
-    printf("vir node create error!\n");
-    exit(0);
+    errno = ENOSPC;
+    return ENOSPC;
 cache_error:
-    printf("vir node cache create error! -- insert_node_into_index\n");
-    exit(0);
+    return EIO;
 index_error:
-    printf("index structure error!\n");
-    exit(0);
+    return EIO;
 }
 
 
@@ -745,7 +869,9 @@ off_info_t query_offset_info(root_id_t root_id, int64_t inode_id, int64_t blk_of
         ret_off_info.nvm_page_id[i] = ret_off_info.buf_meta_id[i] = EMPTY_BLKID;
     ret_off_info.offset_ans = blk_offset;
     
-    idx_root_pt root_pt = check_root_id(root_id, inode_id);
+    idx_root_pt root_pt = indexid_to_memaddr(inode_id, root_id, CREATE);
+    if(root_pt == NULL || root_pt->idx_entry_blkid == EMPTY_BLKID)
+        goto query_error;
     idx_nd_pt leaf_pt = get_leafnode_pt(root_pt, inode_id, blk_offset);
     if(leaf_pt == NULL)
         goto query_error;
@@ -805,17 +931,19 @@ query_error:
     ret_off_info.ndtype = EMPTY_BLK_TYPE;
     return ret_off_info;
 cache_error:
-    printf("vir node cache create error! -- query_offset_info\n");
-    exit(0);
+    ret_off_info.ndtype = EMPTY_BLK_TYPE;
+    return ret_off_info;
 }
 
 
-void change_ssd_blk_info(root_id_t root_id, int64_t inode_id, 
+int change_ssd_blk_info(root_id_t root_id, int64_t inode_id,
                         int64_t blk_offset, int64_t changed_blkid)
 {
     if(blk_offset < 0 || blk_offset >= (1LL << KEY_LEN))
         goto offset_error;
     idx_root_pt root_pt = check_root_id(root_id, inode_id);
+    if(root_pt == NULL)
+        return errno != 0 ? errno : EIO;
 
 
     int64_t leaf_node_id = get_leafnode_id(root_pt, inode_id, blk_offset);
@@ -828,27 +956,28 @@ void change_ssd_blk_info(root_id_t root_id, int64_t inode_id,
     int64_t leaf_pos = (blk_offset & ((1LL << LAYER_BITWIDTH) - 1));
     leaf_pt->son_blk_id[leaf_pos] = changed_blkid;
 
-    write_change_log(leaf_node_id, IDXND_OP, leaf_pt, 32+leaf_pos*8, 8);
-    return;
+    write_change_log(leaf_node_id, IDXND_OP, leaf_pt,
+        offsetof(idx_nd_t, son_blk_id) + leaf_pos * 8, 8);
+    return 0;
 offset_error:
-    printf("The offset is out of range!\n");
-    exit(0);
+    return EINVAL;
 index_error:
-    printf("The offset does not exist!\n");
-    exit(0);
+    return ENOENT;
 cache_error:
-    printf("cache create error! -- change_ssd_blk_info\n");
-    exit(0);
+    return EIO;
 }
 
 
-void change_nvm_page_info(root_id_t root_id, int64_t inode_id, 
-                        int64_t blk_offset, int32_t pos, int64_t changed_pageid)
+int change_nvm_page_info(root_id_t root_id, int64_t inode_id,
+                         int64_t blk_offset, int32_t pos,
+                         int64_t changed_pageid)
 {
 
     if(blk_offset < 0 || blk_offset >= (1LL << KEY_LEN))
         goto offset_error;
     idx_root_pt root_pt = check_root_id(root_id, inode_id);
+    if(root_pt == NULL)
+        return errno != 0 ? errno : EIO;
 
 
     idx_nd_pt leaf_pt = get_leafnode_pt(root_pt, inode_id, blk_offset);
@@ -857,7 +986,8 @@ void change_nvm_page_info(root_id_t root_id, int64_t inode_id,
     
 
     int64_t leaf_pos = (blk_offset & ((1LL << LAYER_BITWIDTH) - 1));
-    
+    if(get_idxson_type(leaf_pt->virnd_flag, leaf_pos) != VIR_LEAF_NODE)
+        goto type_error;
 
     viridx_id_t vir_node_id = leaf_pt->son_blk_id[leaf_pos];
     vir_nd_pt virnd_mem_pt = virnodeid_to_memaddr(inode_id, vir_node_id, CREATE);
@@ -868,65 +998,72 @@ void change_nvm_page_info(root_id_t root_id, int64_t inode_id,
         goto offset_error;
     virnd_mem_pt->nvm_page_id[pos] = changed_pageid;
 
-    write_change_log(vir_node_id, VIRND_OP, virnd_mem_pt, 24+pos*8, 8);
-    return;
+    write_change_log(vir_node_id, VIRND_OP, virnd_mem_pt,
+        offsetof(vir_nd_t, nvm_page_id) + pos * 8, 8);
+    return 0;
 offset_error:
-    printf("The offset/pos is out of range!\n");
-    exit(0);
+    return EINVAL;
 index_error:
-    printf("The offset does not exist!\n");
-    exit(0);
+    return ENOENT;
 cache_error:
-    printf("vir node cache create error! -- query_offset_info\n");
-    exit(0);
+    return EIO;
+type_error:
+    return EINVAL;
 }
 
-void change_virnd_to_ssdblk(root_id_t root_id, int64_t inode_id, int64_t blk_offset, 
-                            int64_t changed_blkid)
+int change_virnd_to_ssdblk(root_id_t root_id, int64_t inode_id,
+                           int64_t blk_offset, int64_t changed_blkid)
 {
 
     if(blk_offset < 0 || blk_offset >= (1LL << KEY_LEN))
         goto offset_error;
     idx_root_pt root_pt = check_root_id(root_id, inode_id);
+    if(root_pt == NULL)
+        return errno != 0 ? errno : EIO;
 
 
-    idx_nd_pt leaf_pt = get_leafnode_pt(root_pt, inode_id, blk_offset);
-    if(leaf_pt == NULL)
+    int64_t leaf_node_id = get_leafnode_id(root_pt, inode_id, blk_offset);
+    if(leaf_node_id == -1)
         goto index_error;
+    idx_nd_pt leaf_pt = (idx_nd_pt)indexid_to_memaddr(
+        inode_id, leaf_node_id, CREATE);
+    if(leaf_pt == NULL)
+        goto cache_error;
     
 
     int64_t leaf_pos = (blk_offset & ((1LL << LAYER_BITWIDTH) - 1));
-    
+    if(get_idxson_type(leaf_pt->virnd_flag, leaf_pos) != VIR_LEAF_NODE)
+        goto type_error;
 
     viridx_id_t vir_node_id = leaf_pt->son_blk_id[leaf_pos];
     vir_nd_pt virnd_mem_pt = virnodeid_to_memaddr(inode_id, vir_node_id, CREATE);
     if(virnd_mem_pt == NULL)
         goto cache_error;
     
-    if(virnd_mem_pt->ndtype == STRATA_NODE)
+    if(virnd_mem_pt->ndtype != VIR_LEAF_NODE)
         goto type_error;
     
     leaf_pt->son_blk_id[leaf_pos] = changed_blkid;
     change_idxson_type(leaf_pt, leaf_pos, SSD_BLOCK);
+    write_change_log(leaf_node_id, IDXND_OP, leaf_pt,
+        offsetof(idx_nd_t, virnd_flag), sizeof(leaf_pt->virnd_flag));
+    write_change_log(leaf_node_id, IDXND_OP, leaf_pt,
+        offsetof(idx_nd_t, son_blk_id) + leaf_pos * 8, 8);
     for(int i = 0; i < VLN_SLOT_SUM; i++)
     {
         if(virnd_mem_pt->nvm_page_id[i] != EMPTY_BLK_TYPE)
             release_nvm_page(virnd_mem_pt->nvm_page_id[i]);
     }
     release_virindex_node(vir_node_id);
-    return;
+    return 0;
 offset_error:
-    printf("The offset/pos is out of range!\n");
-    exit(0);
+    return EINVAL;
 index_error:
-    printf("The offset does not exist!\n");
-    exit(0);
+    return ENOENT;
 cache_error:
-    printf("vir node cache create error! -- change_virnd_to_ssdblk\n");
-    exit(0);
+    return EIO;
 type_error:
-    printf("The index type is error!\n");
-    exit(0);
+    return EINVAL;
 }
 
 int insert_strata_page_and_metabuf(root_id_t root_id, int64_t inode_id, int64_t blk_offset, 
@@ -936,6 +1073,8 @@ int insert_strata_page_and_metabuf(root_id_t root_id, int64_t inode_id, int64_t 
     if(blk_offset < 0 || blk_offset >= (1LL << KEY_LEN))
         goto offset_error;
     idx_root_pt root_pt = check_root_id(root_id, inode_id);
+    if(root_pt == NULL)
+        return errno != 0 ? errno : EIO;
 
 
     int64_t leaf_node_id = get_leafnode_id(root_pt, inode_id, blk_offset);
@@ -954,8 +1093,13 @@ int insert_strata_page_and_metabuf(root_id_t root_id, int64_t inode_id, int64_t 
         int son_type = get_idxson_type(leaf_pt->virnd_flag, leaf_pos);
         if(son_type == SSD_BLOCK)
         {
-            insert_strata_node(inode_id, leaf_pt, leaf_pos);
-            write_change_log(leaf_node_id, IDXND_OP, leaf_pt, 16, 8);
+            int insert_error = insert_strata_node(inode_id, leaf_pt, leaf_pos);
+            if(insert_error != 0)
+                return insert_error;
+            write_change_log(leaf_node_id, IDXND_OP, leaf_pt,
+                offsetof(idx_nd_t, virnd_flag), sizeof(leaf_pt->virnd_flag));
+            write_change_log(leaf_node_id, IDXND_OP, leaf_pt,
+                offsetof(idx_nd_t, son_blk_id) + leaf_pos * 8, 8);
         }
 
         viridx_id_t vir_node_id = leaf_pt->son_blk_id[leaf_pos];
@@ -966,7 +1110,7 @@ int insert_strata_page_and_metabuf(root_id_t root_id, int64_t inode_id, int64_t 
 
         if(virnd_mem_pt->ndtype == VIR_LEAF_NODE)
             goto index_error;
-        else
+        else if(virnd_mem_pt->ndtype == STRATA_NODE)
         {
             if(pos < 0 || pos >= VLN_SLOT_SUM)
                 goto offset_error;
@@ -974,123 +1118,66 @@ int insert_strata_page_and_metabuf(root_id_t root_id, int64_t inode_id, int64_t 
                 goto op_error;
             virnd_mem_pt->nvm_page_id[pos] = nvm_page_id;
             virnd_mem_pt->buf_meta_id[pos] = buf_id;
-            write_change_log(vir_node_id, VIRND_OP, virnd_mem_pt, 24+pos*8, 8);
-            write_change_log(vir_node_id, VIRND_OP, virnd_mem_pt, 56+pos*8, 8);
+            write_change_log(vir_node_id, VIRND_OP, virnd_mem_pt,
+                offsetof(vir_nd_t, nvm_page_id) + pos * 8, 8);
+            write_change_log(vir_node_id, VIRND_OP, virnd_mem_pt,
+                offsetof(vir_nd_t, buf_meta_id) + pos * 8, 8);
         }
+        else
+            goto index_error;
     }
     return 0;
 offset_error:
-    printf("The offset/pos is out of range!\n");
-    exit(0);
+    return EINVAL;
 index_error:
-    printf("The offset does not exist!\n");
-    exit(0);
+    return ENOENT;
 op_error:
-    printf("Can not insert strata node: The offset is error!\n");
-    return -1;
-alloc_error:
-    printf("vir node create error!\n");
-    exit(0);
+    return EEXIST;
 cache_error:
-    printf("cache create error! -- query_offset_info\n");
-    exit(0);
+    return EIO;
 }
 
 void delete_part_index(root_id_t root_id, int64_t inode_id, int64_t blk_offset)
 {
-    idx_root_pt root_pt = check_root_id(root_id, inode_id); 
+    idx_root_pt root_pt = check_root_id(root_id, inode_id);
+    if(root_pt == NULL || root_pt->idx_entry_blkid < 0)
+    {
+        if(errno == 0)
+            errno = EIO;
+        return;
+    }
     idx_nd_pt start_idx_pt = indexid_to_memaddr(inode_id, root_pt->idx_entry_blkid, CREATE);
+    if(start_idx_pt == NULL)
+    {
+        errno = EIO;
+        return;
+    }
+    errno = 0;
     delete_part_index_operation(start_idx_pt, inode_id, 0, blk_offset);
+    if(errno != 0)
+        return;
     release_index_node(root_pt->idx_entry_blkid);
 }
 
-void delete_all_index(root_id_t root_id, int64_t inode_id)
+int delete_all_index(root_id_t root_id, int64_t inode_id)
 {
-    idx_root_pt root_pt = check_root_id(root_id, inode_id); 
-    idx_nd_pt start_idx_pt = indexid_to_memaddr(inode_id, root_pt->idx_entry_blkid, CREATE);
-    delete_all_index_operation(start_idx_pt, inode_id);
-    release_index_node(root_pt->idx_entry_blkid);
-}
-
-void lock_range_lock(root_id_t root_id, int64_t inode_id, int64_t blk_start_off, int64_t blk_end_off)
-{
-
-    if(blk_start_off < 0 || blk_start_off >= (1LL << KEY_LEN))
-        goto offset_error;
-    if(blk_end_off < 0 || blk_end_off >= (1LL << KEY_LEN))
-        goto offset_error;
-    idx_root_pt root_pt = check_root_id(root_id, inode_id);
-
-
-    int64_t off_pre36 = -1;
-    idx_nd_pt leaf_pt = NULL;
-    for(int64_t i = blk_start_off; i <= blk_end_off; i++)
+    if(root_id < 0)
+        return EINVAL;
+    idx_root_pt root_pt = indexid_to_memaddr(inode_id, root_id, CREATE);
+    if(root_pt == NULL || root_pt->ndtype != IDX_ROOT)
+        return EIO;
+    if(root_pt->idx_entry_blkid >= 0)
     {
-        int64_t now_off_pre36 = (i >> LAYER_BITWIDTH);
-        if(now_off_pre36 != off_pre36)
-        {
-            leaf_pt = get_and_add_leafnode_pt(root_pt, inode_id, i);
-            if(leaf_pt == NULL)
-                goto index_error;
-            int64_t leaf_pos = (i & ((1LL << LAYER_BITWIDTH) - 1));
-            bitlock_acquire(&(leaf_pt->bit_lock), leaf_pos);
-            now_off_pre36 != off_pre36;
-        }
-        else
-        {
-            int64_t leaf_pos = (i & ((1LL << LAYER_BITWIDTH) - 1));
-            bitlock_acquire(&(leaf_pt->bit_lock), leaf_pos);
-        }
+        idx_nd_pt start_idx_pt = indexid_to_memaddr(
+            inode_id, root_pt->idx_entry_blkid, CREATE);
+        const int error = delete_all_index_operation(start_idx_pt, inode_id);
+        if(error != 0)
+            return error;
+        release_index_node(root_pt->idx_entry_blkid);
     }
-    return;
-offset_error:
-    printf("The offset/pos is out of range!\n");
-    exit(0);
-index_error:
-    printf("The offset does not exist!\n");
-    exit(0); 
+    release_index_node(root_id);
+    return 0;
 }
-
-void unlock_range_lock(root_id_t root_id, int64_t inode_id, int64_t blk_start_off, int64_t blk_end_off)
-{
-
-    if(blk_start_off < 0 || blk_start_off >= (1LL << KEY_LEN))
-        goto offset_error;
-    if(blk_end_off < 0 || blk_end_off >= (1LL << KEY_LEN))
-        goto offset_error;
-    idx_root_pt root_pt = check_root_id(root_id, inode_id);
-
-
-    int64_t off_pre36 = -1;
-    idx_nd_pt leaf_pt = NULL;
-    for(int64_t i = blk_start_off; i <= blk_end_off; i++)
-    {
-        int64_t now_off_pre36 = (i >> LAYER_BITWIDTH);
-        if(now_off_pre36 != off_pre36)
-        {
-            leaf_pt = get_leafnode_pt(root_pt, inode_id, i);
-            if(leaf_pt == NULL)
-                goto index_error;
-            int64_t leaf_pos = (i & ((1LL << LAYER_BITWIDTH) - 1));
-            bitlock_release(&(leaf_pt->bit_lock), leaf_pos);
-            now_off_pre36 != off_pre36;
-        }
-        else
-        {
-            int64_t leaf_pos = (i & ((1LL << LAYER_BITWIDTH) - 1));
-            
-            bitlock_release(&(leaf_pt->bit_lock), leaf_pos);
-        }
-    }
-    return;
-offset_error:
-    printf("The offset/pos is out of range!\n");
-    exit(0);
-index_error:
-    printf("The offset does not exist!\n");
-    exit(0); 
-}
-
 
 void sync_all_index(idx_nd_pt now_idx_pt, int64_t inode_id)
 {
@@ -1122,9 +1209,6 @@ void sync_all_index(idx_nd_pt now_idx_pt, int64_t inode_id)
         }
     }
     return;
-cache_error:
-    printf("root cache create error! -- sync_all_index\n");
-    exit(0);
 }
 
 

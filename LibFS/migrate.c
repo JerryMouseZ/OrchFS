@@ -1,180 +1,239 @@
-#include "index.h"
-#include "io_thdpool.h"
-#include "lib_shm.h"
-#include "lib_inode.h"
 #include "migrate.h"
-#include "meta_cache.h"
-#include "runtime.h"
-#include "libspace.h"
 
-#include "../util/LRU.h"
+#include "index.h"
+#include "lib_inode.h"
+#include "libspace.h"
+#include "meta_cache.h"
+
+#include "../KernelFS/async_server_bridge.h"
 #include "../KernelFS/device.h"
 #include "../config/config.h"
 
-migrate_info_pt init_migrate_info()
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct orchfs_migration_plan
 {
-    migrate_info_pt ret_pt = malloc(sizeof(migrate_info_t));
+    LRU_node_info_t node;
+    root_id_t root_id;
+    int64_t new_ssd_block_id;
+    uint64_t device_offset;
+    void* block_data;
+    int prepared;
+    int requeue_on_error;
+};
 
-    ret_pt->LRU_info = create_LRU_module(DEFAULT_LRU_MAX_ITEM);
+static migrate_info_t migration;
+static int migration_initialized;
 
-
-    ret_pt->migrate_num = DEFAULT_MIGRATE_NUM;
-    ret_pt->all_nvm_page = MAX_PAGE_NUM;
-    ret_pt->nvm_page_used = 0;            
-    ret_pt->can_use_page_num = ret_pt->all_nvm_page / 100 * CAN_USE_PERCENTAGE;
-    ret_pt->mig_threshold = ret_pt->can_use_page_num / 100 * MIGRATE_PERCENTAGE;
-
-    // ret_pt->mig_threshold = 500;
-    ret_pt->mig_state = SLEEP;
-
-    ret_pt->all_mig_blk = 0;
-    ret_pt->max_page_use = 0;
-    // fprintf(stderr,"mig_threshold %"PRId64" %"PRId64"\n",ret_pt->mig_threshold,ret_pt->migrate_num);
-
-    return ret_pt;
+int orchfs_migration_initialize(void)
+{
+    if(migration_initialized)
+        return EALREADY;
+    memset(&migration, 0, sizeof(migration));
+    migration.migrate_num = DEFAULT_MIGRATE_NUM;
+    migration.all_nvm_page = MAX_PAGE_NUM;
+    migration.can_use_page_num =
+        migration.all_nvm_page / 100 * CAN_USE_PERCENTAGE;
+    migration.mig_threshold =
+        migration.can_use_page_num / 100 * MIGRATE_PERCENTAGE;
+    migration.mig_state = SLEEP;
+    const int error = orchfs_async_migration_start();
+    if(error != 0)
+        return error;
+    migration_initialized = 1;
+    return 0;
 }
 
-int do_migrate_operation(migrate_info_pt mig_info)
+void orchfs_migration_shutdown(void)
 {
-    LRU_node_info_pt mig_pos_pt = get_and_eliminate_LRU_node(mig_info->LRU_info);
-    // fprintf(stderr,"mig_pos_pt: %lld\n",mig_pos_pt);
-    if(mig_pos_pt == NULL)
-        return 0;
-    int64_t mig_off = mig_pos_pt->offset;
-    int64_t mig_ino = mig_pos_pt->ino_id;
-
-
-    int now_fd = get_unused_fd(mig_ino, O_RDWR);
-    // fprintf(stderr,"now_fd: %d %lld %lld\n",now_fd, mig_off,mig_ino);
-    orch_inode_pt now_ino_pt = fd_to_inodept(now_fd);
-    // orch_inode_pt now_ino_pt = inodeid_to_memaddr(mig_ino);
-    // fprintf(stderr,"root_id1: %lld %lld\n",now_ino_pt,mig_ino);
-    root_id_t root_id = now_ino_pt->i_idxroot;
-
-
-    void* blk_data_sp = malloc(ORCH_BLOCK_SIZE);
-    void* page_data_sp = malloc(ORCH_PAGE_SIZE);
-    for(int i = 0; i < VLN_SLOT_SUM; i++)
-    {
-        read_data_from_devs(page_data_sp, ORCH_PAGE_SIZE, mig_pos_pt->nvm_page_addr[i]);
-        memcpy(blk_data_sp + ORCH_PAGE_SIZE*i, page_data_sp, ORCH_PAGE_SIZE);
-    }
-    int64_t new_ssd_blk_id = require_ssd_block_id();
-    int64_t new_ssd_addr = ssdblk_to_devaddr(new_ssd_blk_id);
-
-
-    int64_t* para_sp_pt = malloc(3 * sizeof(int64_t));
-	para_sp_pt[0] = SHM_WRITE; 
-	para_sp_pt[1] = new_ssd_addr;
-	para_sp_pt[2] = ORCH_BLOCK_SIZE;
-	sendreq_by_shm(para_sp_pt, 3*sizeof(int64_t), blk_data_sp, ORCH_BLOCK_SIZE);
-	free(para_sp_pt);
-    // fprintf(stderr,"check_flag: %d\n",check_flag);
-
-    // fprintf(stderr,"root_id: %d %lld %lld\n",root_id,mig_off,mig_ino);
-    file_lock_rdlock(now_fd);
-    lock_range_lock(root_id, mig_ino, mig_off, mig_off);
-
-    // off_info_t blk_info = query_offset_info(root_id, mig_ino, mig_off);
-    int check_flag = 1;
-    // if(blk_info.ndtype != VIR_LEAF_NODE)
-    //     check_flag = 0;
-    // else
-    // {
-    //     for(int i = 0; i < VLN_SLOT_SUM; i++)
-    //     {
-    //         if(blk_info.nvm_page_id[i] == EMPTY_BLK_TYPE)
-    //             check_flag = 0;
-    //     }
-    // }
-
-    // fprintf(stderr,"check_flag: %d\n",check_flag);
-
-    if(check_flag == 1)
-    {
-        change_virnd_to_ssdblk(root_id, mig_ino, mig_off, new_ssd_blk_id);
-
-        unlock_range_lock(root_id, mig_ino, mig_off, mig_off);
-        file_lock_unlock(now_fd);
-
-        __sync_fetch_and_sub(&(mig_info->nvm_page_used), 8);
-
-        mig_info->all_mig_blk++;
-        release_fd(now_fd);
-    }
-    else
-    {
-        unlock_range_lock(root_id, mig_ino, mig_off, mig_off);
-        file_lock_unlock(now_fd);
-        release_fd(now_fd);
-    }
-    free(blk_data_sp);
-    free(page_data_sp);
-    return 1;
+    if(!migration_initialized)
+        return;
+    orchfs_async_migration_stop();
+    fprintf(stderr, "all mig num: %lld\n",
+            (long long)migration.all_mig_blk);
+    fprintf(stderr, "max page num: %lld\n",
+            (long long)migration.max_page_use);
+    migration_initialized = 0;
 }
 
-void* wait_and_exec_migrate(void* para_arg)
+migrate_info_pt orchfs_migration_state(void)
 {
-    mig_pth_frame_pt arg = (mig_pth_frame_pt)para_arg;
-	io_pth_pool_pt pool = arg->pool;
-	// int nowtid = arg->tid;
-    migrate_info_pt mig_info = arg->mig_info_pt;
-    // fprintf(stderr,"mig_info->migrate_num: %d %lld\n",nowtid,mig_info->migrate_num);
-	while(1)
-	{
-	    sem_wait(&(pool->migrate_sem));
+    return migration_initialized ? &migration : NULL;
+}
 
-        if(pool->shutdown == 1)
-		{
-			// printf("thd: %d end\n",nowtid);
-			sem_post(&(pool->shutdown_sem));
-			break;
-		}
-        for(int i = 0; i < mig_info->migrate_num; i++)
+static void requeue(const LRU_node_info_t* node)
+{
+    (void)orchfs_async_migration_enqueue_candidate(
+        node->ino_id, node->offset, node->nvm_page_addr,
+        (size_t)(ORCH_BLOCK_SIZE / ORCH_PAGE_SIZE));
+}
+
+int orchfs_prepare_migration(struct orchfs_migration_plan** output)
+{
+    if(output == NULL || !migration_initialized)
+        return EINVAL;
+    *output = NULL;
+    struct orchfs_migration_plan* plan = calloc(1, sizeof(*plan));
+    if(plan == NULL)
+        return ENOMEM;
+    plan->new_ssd_block_id = -1;
+    plan->requeue_on_error = 1;
+    const int error = orchfs_async_migration_take_candidate(
+        &plan->node.ino_id, &plan->node.offset,
+        plan->node.nvm_page_addr,
+        (size_t)(ORCH_BLOCK_SIZE / ORCH_PAGE_SIZE));
+    if(error != 0)
+    {
+        free(plan);
+        return error;
+    }
+    *output = plan;
+    return 0;
+}
+
+int64_t orchfs_migration_inode(const struct orchfs_migration_plan* plan)
+{
+    return plan != NULL ? plan->node.ino_id : -1;
+}
+
+uint64_t orchfs_migration_file_offset(
+    const struct orchfs_migration_plan* plan)
+{
+    return plan != NULL && plan->node.offset >= 0
+        ? (uint64_t)plan->node.offset << ORCH_BLOCK_BW : 0;
+}
+
+int orchfs_prepare_migration_io(struct orchfs_migration_plan* plan)
+{
+    if(plan == NULL || plan->prepared)
+        return EINVAL;
+    orch_inode_pt inode = inodeid_to_memaddr(plan->node.ino_id);
+    if(inode == NULL || inode->i_number != plan->node.ino_id)
+        return ESTALE;
+    plan->root_id = inode->i_idxroot;
+    off_info_t current = query_offset_info(
+        plan->root_id, plan->node.ino_id, plan->node.offset);
+    if(current.ndtype != VIR_LEAF_NODE)
+    {
+        plan->requeue_on_error = 0;
+        return ESTALE;
+    }
+    for(int i = 0; i < VLN_SLOT_SUM; ++i)
+    {
+        if(current.nvm_page_id[i] != plan->node.nvm_page_addr[i])
         {
-            // fprintf(stderr,"---------do migration!-----------\n");
-            int success_flag = do_migrate_operation(arg->mig_info_pt);
-            // fprintf(stderr,"success_flag %d\n",success_flag);
-            if(success_flag == 0)
-                break;
-        }
-        __sync_fetch_and_and(&(mig_info->mig_state), SLEEP);
-    }
-    return NULL;
-}
-
-void add_migrate_node(migrate_info_pt mig_info, struct offset_info_t* off_info, 
-                    int64_t ino_id, int64_t new_page_num)
-{
-    int64_t key = (ino_id << 32) + off_info->offset_ans;
-    LRU_node_info_t new_LRU_node;
-    new_LRU_node.ino_id = ino_id;
-    new_LRU_node.offset = off_info->offset_ans;
-    for(int i = 0; i < VLN_SLOT_SUM; i++)
-        new_LRU_node.nvm_page_addr[i] = off_info->nvm_page_id[i];
-    // fprintf(stderr,"offans: %lld %lld\n",ino_id,off_info->offset_ans);
-    int ret = add_LRU_node(mig_info->LRU_info, key, &new_LRU_node, sizeof(LRU_node_info_t));
-    // fprintf(stderr,"ret: %d\n",ret);
-    assert(ret == LRU_FULL || ret == LRU_NOT_FULL);
-    __sync_fetch_and_add(&(mig_info->nvm_page_used), new_page_num);
-    if(mig_info->nvm_page_used > mig_info->max_page_use)
-        mig_info->max_page_use = mig_info->nvm_page_used;
-
-    if(mig_info->nvm_page_used > mig_info->mig_threshold)
-    {
-        // Exceeding the threshold, do migration
-        if(__sync_fetch_and_or(&(mig_info->mig_state), DO_MIGRATE) == SLEEP)
-        {
-            sem_post(&(orch_io_scheduler.migrate_sem));
-            // clock_gettime(CLOCK_MONOTONIC, &mig_info->last_migrate_time);
+            plan->requeue_on_error = 0;
+            return ESTALE;
         }
     }
+
+    plan->block_data = malloc(ORCH_BLOCK_SIZE);
+    if(plan->block_data == NULL)
+        return ENOMEM;
+    for(int i = 0; i < VLN_SLOT_SUM; ++i)
+        nvm_read((char*)plan->block_data + ORCH_PAGE_SIZE * i,
+                 ORCH_PAGE_SIZE, plan->node.nvm_page_addr[i]);
+    plan->new_ssd_block_id = require_ssd_block_id();
+    if(plan->new_ssd_block_id < 0)
+    {
+        free(plan->block_data);
+        plan->block_data = NULL;
+        return ENOSPC;
+    }
+    plan->device_offset =
+        (uint64_t)ssdblk_to_devaddr(plan->new_ssd_block_id);
+    plan->prepared = 1;
+    return 0;
 }
 
-void free_migrate_info(migrate_info_pt mig_info_pt)
+const void* orchfs_migration_data(const struct orchfs_migration_plan* plan)
 {
-    fprintf(stderr,"all mig num: %"PRId64"\n",mig_info_pt->all_mig_blk);
-    fprintf(stderr,"max page num: %"PRId64"\n",mig_info_pt->max_page_use);
-    free_LRU_module(mig_info_pt->LRU_info);
-    free(mig_info_pt);
+    return plan != NULL ? plan->block_data : NULL;
+}
+
+uint64_t orchfs_migration_length(const struct orchfs_migration_plan* plan)
+{
+    return plan != NULL ? ORCH_BLOCK_SIZE : 0;
+}
+
+uint64_t orchfs_migration_device_offset(
+    const struct orchfs_migration_plan* plan)
+{
+    return plan != NULL ? plan->device_offset : 0;
+}
+
+int64_t orchfs_migration_new_ssd_block(
+    const struct orchfs_migration_plan* plan)
+{
+    return plan != NULL ? plan->new_ssd_block_id : -1;
+}
+
+int orchfs_finish_migration(struct orchfs_migration_plan* plan, int error)
+{
+    if(plan == NULL)
+        return EINVAL;
+    if(error == 0 && plan->prepared)
+    {
+        error = change_virnd_to_ssdblk(
+            plan->root_id, plan->node.ino_id, plan->node.offset,
+            plan->new_ssd_block_id);
+        if(error == 0)
+        {
+            __atomic_fetch_sub(&migration.nvm_page_used, VLN_SLOT_SUM,
+                               __ATOMIC_ACQ_REL);
+            __atomic_fetch_add(&migration.all_mig_blk, 1,
+                               __ATOMIC_ACQ_REL);
+        }
+    }
+    if(error != 0)
+    {
+        if(plan->new_ssd_block_id >= 0)
+            release_ssd_block(plan->new_ssd_block_id);
+        if(plan->requeue_on_error)
+            requeue(&plan->node);
+    }
+    free(plan->block_data);
+    free(plan);
+    return error;
+}
+
+int orchfs_migration_has_pending(void)
+{
+    return orchfs_async_migration_candidates_pending();
+}
+
+void add_migrate_node(migrate_info_pt ignored, struct offset_info_t* info,
+                      int64_t inode, int64_t new_pages)
+{
+    (void)ignored;
+    if(!migration_initialized || info == NULL)
+        return;
+    LRU_node_info_t node;
+    memset(&node, 0, sizeof(node));
+    node.ino_id = inode;
+    node.offset = info->offset_ans;
+    for(int i = 0; i < VLN_SLOT_SUM; ++i)
+        node.nvm_page_addr[i] = info->nvm_page_id[i];
+    const int error = orchfs_async_migration_enqueue_candidate(
+        inode, info->offset_ans, node.nvm_page_addr, VLN_SLOT_SUM);
+    if(error != 0)
+    {
+        errno = error;
+        perror("enqueue migration candidate");
+        return;
+    }
+    const int64_t used = __atomic_add_fetch(
+        &migration.nvm_page_used, new_pages, __ATOMIC_ACQ_REL);
+    int64_t maximum = __atomic_load_n(&migration.max_page_use,
+                                      __ATOMIC_ACQUIRE);
+    while(used > maximum &&
+          !__atomic_compare_exchange_n(&migration.max_page_use, &maximum,
+                                       used, 1, __ATOMIC_ACQ_REL,
+                                       __ATOMIC_ACQUIRE))
+        ;
+    if(used > migration.mig_threshold)
+        orchfs_async_schedule_migration();
 }

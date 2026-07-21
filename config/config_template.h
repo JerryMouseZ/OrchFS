@@ -89,15 +89,6 @@ extern "C"{
 #define ORCH_DEV_NVM_PATH               "/dev/dax"
 #define ORCH_DEV_SSD_PATH               "/dev/nvme"
 
-// threads
-#define ORCH_CONFIG_NVMTHD              5
-#define ORCH_CONFIG_SSDTHD              32
-
-// SPLIT
-#define ORCH_MAX_SPLIT_BLK              1             
-
-#define ORCH_INODE_BITLOCK_SLOTS        65536
-#define ORCH_INODE_RW_SLOTS			    65536
 #define ORCH_MAX_NAME				    231
 #define ORCH_MAGIC_NAME            	    "ComFS_v1.0"
 #define ORCH_MAGIC_NUM            	    0x37356217

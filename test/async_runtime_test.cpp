@@ -323,6 +323,30 @@ Task<Result<void>> discard_release_awaiter(RangeArbiter& arbiter) {
     co_return Result<void>::success();
 }
 
+struct RuntimePollProbe {
+    Runtime* runtime{};
+    std::size_t worker{};
+    std::atomic<unsigned> calls{0};
+    std::atomic<bool> busy{true};
+    std::atomic<bool> wrong_worker{false};
+
+    static Runtime::PollState poll(void* context) noexcept {
+        auto& probe = *static_cast<RuntimePollProbe*>(context);
+        if (Runtime::current() != probe.runtime ||
+            Runtime::current_worker() != probe.worker) {
+            probe.wrong_worker.store(true, std::memory_order_release);
+        }
+        const unsigned call =
+            probe.calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (call == 1) {
+            return Runtime::PollState::progress;
+        }
+        return probe.busy.load(std::memory_order_acquire)
+                   ? Runtime::PollState::busy
+                   : Runtime::PollState::idle;
+    }
+};
+
 void require_ok(Result<Result<void>> outer, std::string_view message) {
     check(static_cast<bool>(outer), message);
     auto inner = std::move(outer).value();
@@ -349,6 +373,28 @@ int main() {
     check(static_cast<bool>(created), "runtime create");
     auto runtime = std::move(created).value();
     check(runtime->worker_count() == 4, "worker count");
+    for (std::size_t worker = 0; worker < runtime->worker_count(); ++worker) {
+        auto cpu = runtime->worker_cpu(worker);
+        check(static_cast<bool>(cpu), "worker CPU lookup");
+    }
+
+    RuntimePollProbe poll_probe{
+        .runtime = runtime.get(),
+        .worker = runtime->owner_for(0xfeedU),
+    };
+    auto registered = runtime->register_poller(
+        poll_probe.worker, RuntimePollProbe::poll, &poll_probe);
+    check(static_cast<bool>(registered), "worker poller registration");
+    auto poll_registration = std::move(registered).value();
+    wait_until([&] { return poll_probe.calls.load() >= 32; },
+               "worker poller did not run");
+    check(!poll_probe.wrong_worker.load(), "poller ran on wrong worker");
+    poll_probe.busy.store(false, std::memory_order_release);
+    poll_registration.reset();
+    const unsigned calls_after_reset = poll_probe.calls.load();
+    std::this_thread::sleep_for(20ms);
+    check(poll_probe.calls.load() == calls_after_reset,
+          "retired poller was called again");
 
     auto duplicate = Runtime::create();
     check(!duplicate &&

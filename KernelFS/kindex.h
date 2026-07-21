@@ -1,8 +1,8 @@
 #ifndef INDEX_H
 #define INDEX_H
 
-#include <pthread.h>
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +11,8 @@
 #include <errno.h>
 #include <math.h>
 #include <time.h>
+
+#include "../config/config.h"
 
 // node type code
 #define IDX_ROOT                      0
@@ -31,7 +33,7 @@
 // #define MAX_ZIPPED_LAYER              5
 // #define KEY_LEN                       42
 #define NODE_SON_CAPACITY             (1<<LAYER_BITWIDTH)
-#define VLN_SLOT_BITWIDTH             2
+#define VLN_SLOT_BITWIDTH             (ORCH_BLOCK_BW-ORCH_PAGE_BW)
 #define VLN_SLOT_SUM                  (1<<VLN_SLOT_BITWIDTH)
 // 索引本身最多42位,数据块最多支持4MB,组合起来就是64位
 
@@ -52,11 +54,18 @@ struct ker_index_node_t
     int64_t ndtype;                                     // Node type: leafnode, index root...
     int64_t zipped_layer;                               // The number of compressed layers in the index
     uint64_t virnd_flag[2];                             // Is the son node a virtual leaf node
-    uint64_t bit_lock[2];                               // bit lock
+    uint64_t reserved_words[2];                         // fixed on-disk reserved fields
     int64_t son_blk_id[NODE_SON_CAPACITY];              // The block ID of the son node
 };
 typedef struct ker_index_node_t ker_idx_nd_t;
 typedef ker_idx_nd_t* ker_idx_nd_pt;
+
+_Static_assert(offsetof(ker_idx_nd_t, reserved_words) == 32,
+               "formatter index reserved offset");
+_Static_assert(offsetof(ker_idx_nd_t, son_blk_id) == 48,
+               "formatter index sons offset");
+_Static_assert(sizeof(ker_idx_nd_t) <= ORCH_IDX_SIZE,
+               "formatter index node disk size");
 
 struct ker_index_root_t
 {  
@@ -78,6 +87,11 @@ struct ker_virtual_node_t
 };
 typedef struct ker_virtual_node_t ker_vir_nd_t;
 typedef ker_vir_nd_t* ker_vir_nd_pt;
+
+_Static_assert(offsetof(ker_vir_nd_t, nvm_page_id) == 24,
+               "formatter virtual page offset");
+_Static_assert(sizeof(ker_vir_nd_t) <= ORCH_VIRND_SIZE,
+               "formatter virtual node disk size");
 
 struct ker_offset_info_t
 {

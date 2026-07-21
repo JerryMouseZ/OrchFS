@@ -38,27 +38,32 @@ Python 3.x is required on the server to run scripts that modify configuration fi
 ## Building OrchFS:
 Assume current directory is a project root directory.
 
-**1. Change device configuration**
+The production implementation uses one C++20 Runtime for KFS, client sessions,
+SPDK completions, migration, allocation, and journal work. The old LibFS/KFS
+I/O pools and blocking service bridge are no longer built.
+
+**1. Change persistent-memory configuration**
 ```
-python config_parameter.py [dax] [SSD] [NVM_thds] [SSD_thds] [split_size] [fb_flag]
+python config_parameter.py [dax] [fb_flag]
 ```
 - `[dax]`: The device file path of the dax-mode NVM. For example, `/dev/dax0.0`.
-- `[SSD]`: The device file path of the SSD. For example, `/dev/nvme1n1`. If you want to employ multiple SSDs, please configure them as RAID0 using mdRAID. Setting the device file path of the RAID0 device. For example, `/dev/md1`.
-- `[NVM_thds]`: The number of dedicated IO threads for NVM-IOs in parallel IO engine. If you use Intel Optane PM, it is recommended to set it to 4.
-- `[SSD_thds]`: The number of dedicated IO threads for SSD-IOs in parallel IO engine. It is recommended to set this parameter to be greater than 8 and not exceed the number of physical CPU cores on the server.
-- `[split_size]`: The splitting granularity of the parallel IO engine for multi-threaded SSD IO execution. This parameter needs to be a multiple of 32KB. For example, '64k', '256k', '32k', etc..
 - `[fb_flag]`: This parameter can be omitted. If you will test the filebench, this parameter needs to be set to 'fb_mode_on'. Otherwise, this parameter does not need to be set.
+
+The production SSD is selected by PCI BDF and namespace ID through the SPDK
+environment described in `config/config-template.sh`; mounted devices must not
+be used for formatting or destructive validation.
 
 Here is an example for simple workload:
 ```
-python config_parameter.py /dev/dax0.0 /dev/nvme1n1 4 16 32k
+python config_parameter.py /dev/dax0.0
 ```
 
 Here is an example for testing filebench:
 ```
-python config_parameter.py /dev/dax0.0 /dev/nvme1n1 4 16 32k fb_mode_on
+python config_parameter.py /dev/dax0.0 fb_mode_on
 ```
-Replace `[dax]` and `[SSD]` with the device files on the server you are using now. Every time the above two types of workloads switch, the script needs to be run.
+Replace `[dax]` with the DAX device on the server. Every time the above two
+workload modes switch, the script needs to be run.
 
 **2. Compiling and Installing OrchFS**
 
@@ -68,10 +73,9 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ```
 
-The build now requires CMake 3.16 or newer and a C++20 compiler. By default it
-builds the C++20 coroutine runtime, asynchronous LibFS/KFS IPC libraries, the
-SPDK-independent NVMe backend tests, and all original OrchFS targets without
-requiring SPDK.
+The build requires CMake 3.16 or newer and a C++20 compiler. By default it
+builds the client, Runtime, mock integration tests, and hardware-independent
+NVMe logic tests without requiring SPDK.
 
 For the SPDK v26.01 build, runtime configuration, cooperative scheduling
 contract, and destructive device-binding checklist, see
@@ -79,12 +83,20 @@ contract, and destructive device-binding checklist, see
 
 ```bash
 cmake -S . -B build-spdk \
-  -DORCHFS_ENABLE_SPDK=ON \
+  -DORCHFS_BUILD_KFS=ON \
   -DSPDK_ROOT=/opt/orchfs/spdk \
   -DBUILD_TESTING=ON
 cmake --build build-spdk -j
 ctest --test-dir build-spdk --output-on-failure
 ```
+
+`ORCHFS_BUILD_KFS=ON` always enables SPDK. Start `build-spdk/kfs_main` after
+exporting the Runtime/SPDK configuration, and stop it with `SIGTERM` or
+`SIGINT` so RPCs, migration, SPDK, and Runtime workers drain in order.
+
+The staged 64 KiB/QD64 optimization measurements, p99 values, CPU profiles,
+and final layer-gate assessment are recorded in
+[docs/optimization-results-20260721.md](docs/optimization-results-20260721.md).
 
 ## Using OrchFS:
 

@@ -8,11 +8,13 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <new>
 #include <poll.h>
+#include <pthread.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,7 +36,24 @@ namespace {
 constexpr std::uint32_t kMaxRingCapacity = 1U << 20U;
 constexpr std::uint32_t kMaxDataSlotSize = 64U * 1024U * 1024U;
 constexpr std::uint64_t kMaxSharedMemorySize = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kIpcHugePageSize = 2ULL * 1024ULL * 1024ULL;
 constexpr int kControlHandshakeTimeoutMs = 250;
+
+std::atomic<std::uint64_t> process_epoch{1};
+
+void advance_process_epoch_after_fork() noexcept {
+    process_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+const bool process_epoch_tracking_available =
+    ::pthread_atfork(nullptr, nullptr, advance_process_epoch_after_fork) == 0;
+
+[[nodiscard]] bool process_owner_matches(std::uint64_t owner_epoch,
+                                         pid_t owner_pid) noexcept {
+    return process_epoch_tracking_available
+               ? owner_epoch == process_epoch.load(std::memory_order_relaxed)
+               : owner_pid == ::getpid();
+}
 
 class TransportErrorCategory final : public std::error_category {
   public:
@@ -144,8 +163,12 @@ struct SessionLayout {
     layout.lanes_offset = align_up(sizeof(SharedSessionHeader), kIpcCacheLineSize);
 
     std::uint64_t all_lanes_size = 0;
+    std::uint64_t unaligned_total = 0;
     if (!checked_multiply(config.lane_count, layout.lane_stride, all_lanes_size) ||
-        !checked_add(layout.lanes_offset, all_lanes_size, layout.total_size) ||
+        !checked_add(layout.lanes_offset, all_lanes_size, unaligned_total) ||
+        unaligned_total >
+            std::numeric_limits<std::uint64_t>::max() - kIpcHugePageSize + 1U ||
+        (layout.total_size = align_up(unaligned_total, kIpcHugePageSize)) == 0 ||
         layout.total_size > kMaxSharedMemorySize ||
         layout.total_size > std::numeric_limits<std::size_t>::max()) {
         return std::make_error_code(std::errc::value_too_large);
@@ -210,14 +233,40 @@ struct Mapping {
     Mapping& operator=(const Mapping&) = delete;
 };
 
+struct AcquiredSlotData {
+    SharedRingSlot* slot{};
+    std::uint64_t release_generation{};
+    IpcDescriptor descriptor{};
+    std::span<const std::byte> payload{};
+};
+
+struct ReservedSlotData {
+    SharedRingSlot* slot{};
+    std::byte* payload{};
+    std::uint64_t position{};
+};
+
 class RingView {
   public:
     RingView() noexcept = default;
     explicit RingView(SharedRingHeader* header) noexcept
         : header_(header), slots_(reinterpret_cast<SharedRingSlot*>(header + 1)) {}
 
+    [[nodiscard]] bool ready() const noexcept {
+        if (header_ == nullptr) {
+            return false;
+        }
+        const std::uint64_t position =
+            header_->consumer.value.load(std::memory_order_relaxed);
+        const auto slot_index = static_cast<std::uint32_t>(
+            position % header_->capacity);
+        return slots_[slot_index].generation.load(std::memory_order_acquire) ==
+               position + 1U;
+    }
+
     [[nodiscard]] std::error_code try_push(IpcDescriptor descriptor,
                                            std::span<const std::byte> payload,
+                                           std::span<const std::byte> tail,
                                            std::byte* data,
                                            std::uint32_t data_slot_size) noexcept {
         const std::uint64_t position =
@@ -229,12 +278,20 @@ class RingView {
             return TransportErrc::would_block;
         }
 
-        if (payload.size() > data_slot_size) {
+        if (payload.size() > data_slot_size ||
+            tail.size() > data_slot_size - payload.size()) {
             return std::make_error_code(std::errc::message_size);
         }
+        const std::size_t payload_size = payload.size() + tail.size();
         const std::uint64_t data_stride = align_up(data_slot_size, kIpcCacheLineSize);
-        if (!payload.empty()) {
-            std::memcpy(data + data_stride * slot_index, payload.data(), payload.size());
+        std::byte* destination = data + data_stride * slot_index;
+        if (payload_size != 0) {
+            if (!payload.empty()) {
+                std::memcpy(destination, payload.data(), payload.size());
+            }
+            if (!tail.empty()) {
+                std::memcpy(destination + payload.size(), tail.data(), tail.size());
+            }
             descriptor.flags |= DescriptorFlag::has_payload;
         } else {
             descriptor.flags = static_cast<DescriptorFlag>(
@@ -242,7 +299,7 @@ class RingView {
                 ~static_cast<std::uint16_t>(DescriptorFlag::has_payload));
         }
         descriptor.data_slot = slot_index;
-        descriptor.payload_length = static_cast<std::uint32_t>(payload.size());
+        descriptor.payload_length = static_cast<std::uint32_t>(payload_size);
         descriptor.slot_generation = position;
         slot.descriptor = descriptor;
         slot.generation.store(position + 1U, std::memory_order_release);
@@ -298,6 +355,73 @@ class RingView {
         if (stale_session) {
             return TransportErrc::stale_session;
         }
+        return {};
+    }
+
+    [[nodiscard]] std::error_code try_acquire(
+        AcquiredSlotData& acquired, std::byte* data,
+        std::uint32_t data_slot_size, std::uint64_t expected_client_id,
+        std::uint64_t expected_session_generation) noexcept {
+        acquired = {};
+        const std::uint64_t position =
+            header_->consumer.value.load(std::memory_order_relaxed);
+        const auto slot_index = static_cast<std::uint32_t>(
+            position % header_->capacity);
+        SharedRingSlot& slot = slots_[slot_index];
+        if (slot.generation.load(std::memory_order_acquire) != position + 1U) {
+            return TransportErrc::would_block;
+        }
+
+        const IpcDescriptor incoming = slot.descriptor;
+        const bool bad_layout =
+            incoming.protocol_version != kIpcProtocolVersion ||
+            incoming.data_slot != slot_index ||
+            incoming.slot_generation != position ||
+            incoming.payload_length > data_slot_size;
+        const bool stale_session =
+            incoming.client_id != expected_client_id ||
+            incoming.session_generation != expected_session_generation;
+        header_->consumer.value.store(position + 1U, std::memory_order_release);
+        if (bad_layout || stale_session) {
+            slot.generation.store(position + header_->capacity,
+                                  std::memory_order_release);
+            return bad_layout ? make_error_code(TransportErrc::corrupt_layout)
+                              : make_error_code(TransportErrc::stale_session);
+        }
+
+        const std::uint64_t data_stride =
+            align_up(data_slot_size, kIpcCacheLineSize);
+        acquired = AcquiredSlotData{
+            .slot = &slot,
+            .release_generation = position + header_->capacity,
+            .descriptor = incoming,
+            .payload = std::span<const std::byte>(
+                data + data_stride * slot_index, incoming.payload_length),
+        };
+        return {};
+    }
+
+    [[nodiscard]] std::error_code try_reserve(
+        ReservedSlotData& reserved, std::byte* data,
+        std::uint32_t data_slot_size) noexcept {
+        reserved = {};
+        const std::uint64_t position =
+            header_->producer.value.load(std::memory_order_relaxed);
+        const auto slot_index = static_cast<std::uint32_t>(
+            position % header_->capacity);
+        SharedRingSlot& slot = slots_[slot_index];
+        if (slot.generation.load(std::memory_order_acquire) != position) {
+            return TransportErrc::would_block;
+        }
+        const std::uint64_t data_stride =
+            align_up(data_slot_size, kIpcCacheLineSize);
+        header_->producer.value.store(position + 1U,
+                                      std::memory_order_release);
+        reserved = ReservedSlotData{
+            .slot = &slot,
+            .payload = data + data_stride * slot_index,
+            .position = position,
+        };
         return {};
     }
 
@@ -634,9 +758,23 @@ void initialize_ring(void* memory, std::uint32_t capacity) noexcept {
            counter.fetch_add(1, std::memory_order_relaxed);
 }
 
-[[nodiscard]] int create_memfd() noexcept {
-    return static_cast<int>(
-        ::syscall(SYS_memfd_create, "orchfs-ipc", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+[[nodiscard]] int create_memfd(bool& hugepage_backed) noexcept {
+    hugepage_backed = false;
+    const char* configured = ::getenv("ORCHFS_IPC_HUGEPAGES");
+    const bool request_hugepages = configured != nullptr &&
+        (std::strcmp(configured, "1") == 0 ||
+         std::strcmp(configured, "true") == 0);
+    if (request_hugepages) {
+        const int huge_fd = static_cast<int>(::syscall(
+            SYS_memfd_create, "orchfs-ipc-huge",
+            MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_HUGE_2MB));
+        if (huge_fd >= 0) {
+            hugepage_backed = true;
+            return huge_fd;
+        }
+    }
+    return static_cast<int>(::syscall(
+        SYS_memfd_create, "orchfs-ipc", MFD_CLOEXEC | MFD_ALLOW_SEALING));
 }
 
 [[nodiscard]] std::error_code make_unix_address(std::string_view path,
@@ -663,9 +801,158 @@ struct SessionResources {
     std::vector<LaneView> lanes;
     SharedSessionHeader* header{nullptr};
     TransportConfig config{};
+    bool hugepage_backed{};
 };
 
 }  // namespace
+
+ReceivedIpcSlot::ReceivedIpcSlot(
+    SharedRingSlot* slot, std::uint64_t release_generation,
+    IpcDescriptor descriptor, std::span<const std::byte> payload) noexcept
+    : slot_(slot), release_generation_(release_generation),
+      descriptor_(descriptor), payload_(payload) {}
+
+ReceivedIpcSlot::~ReceivedIpcSlot() { reset(); }
+
+ReceivedIpcSlot::ReceivedIpcSlot(ReceivedIpcSlot&& other) noexcept
+    : slot_(std::exchange(other.slot_, nullptr)),
+      release_generation_(other.release_generation_),
+      descriptor_(other.descriptor_), payload_(other.payload_) {
+    other.payload_ = {};
+}
+
+ReceivedIpcSlot& ReceivedIpcSlot::operator=(
+    ReceivedIpcSlot&& other) noexcept {
+    if (this != &other) {
+        reset();
+        slot_ = std::exchange(other.slot_, nullptr);
+        release_generation_ = other.release_generation_;
+        descriptor_ = other.descriptor_;
+        payload_ = other.payload_;
+        other.payload_ = {};
+    }
+    return *this;
+}
+
+ReceivedIpcSlot::operator bool() const noexcept { return slot_ != nullptr; }
+
+const IpcDescriptor& ReceivedIpcSlot::descriptor() const noexcept {
+    return descriptor_;
+}
+
+std::span<const std::byte> ReceivedIpcSlot::payload() const noexcept {
+    return payload_;
+}
+
+void ReceivedIpcSlot::reset() noexcept {
+    auto* slot = std::exchange(slot_, nullptr);
+    payload_ = {};
+    if (slot != nullptr) {
+        slot->generation.store(release_generation_, std::memory_order_release);
+    }
+}
+
+CompletionReservation::CompletionReservation(
+    SharedRingSlot* slot, std::byte* payload,
+    std::uint32_t payload_capacity, std::uint64_t position,
+    std::uint32_t ring_capacity, int event_fd, std::uint64_t client_id,
+    std::uint64_t session_generation) noexcept
+    : slot_(slot), payload_(payload), payload_capacity_(payload_capacity),
+      position_(position), ring_capacity_(ring_capacity), event_fd_(event_fd),
+      client_id_(client_id), session_generation_(session_generation) {}
+
+CompletionReservation::~CompletionReservation() { abandon(); }
+
+CompletionReservation::CompletionReservation(
+    CompletionReservation&& other) noexcept
+    : slot_(std::exchange(other.slot_, nullptr)), payload_(other.payload_),
+      payload_capacity_(other.payload_capacity_), position_(other.position_),
+      ring_capacity_(other.ring_capacity_), event_fd_(other.event_fd_),
+      client_id_(other.client_id_),
+      session_generation_(other.session_generation_) {
+    other.payload_ = nullptr;
+}
+
+CompletionReservation& CompletionReservation::operator=(
+    CompletionReservation&& other) noexcept {
+    if (this != &other) {
+        abandon();
+        slot_ = std::exchange(other.slot_, nullptr);
+        payload_ = other.payload_;
+        payload_capacity_ = other.payload_capacity_;
+        position_ = other.position_;
+        ring_capacity_ = other.ring_capacity_;
+        event_fd_ = other.event_fd_;
+        client_id_ = other.client_id_;
+        session_generation_ = other.session_generation_;
+        other.payload_ = nullptr;
+    }
+    return *this;
+}
+
+CompletionReservation::operator bool() const noexcept {
+    return slot_ != nullptr;
+}
+
+std::span<std::byte> CompletionReservation::payload() const noexcept {
+    return slot_ == nullptr
+               ? std::span<std::byte>{}
+               : std::span<std::byte>(payload_, payload_capacity_);
+}
+
+std::error_code CompletionReservation::publish(
+    IpcDescriptor descriptor, std::size_t payload_size) noexcept {
+    if (slot_ == nullptr || descriptor.request_id == 0 ||
+        payload_size > payload_capacity_) {
+        return std::make_error_code(std::errc::invalid_argument);
+    }
+    descriptor.client_id = client_id_;
+    descriptor.session_generation = session_generation_;
+    descriptor.protocol_version = kIpcProtocolVersion;
+    descriptor.flags = static_cast<DescriptorFlag>(
+        (static_cast<std::uint16_t>(descriptor.flags) |
+         static_cast<std::uint16_t>(DescriptorFlag::response)) &
+        ~static_cast<std::uint16_t>(DescriptorFlag::request));
+    if (payload_size != 0) {
+        descriptor.flags |= DescriptorFlag::has_payload;
+    } else {
+        descriptor.flags = static_cast<DescriptorFlag>(
+            static_cast<std::uint16_t>(descriptor.flags) &
+            ~static_cast<std::uint16_t>(DescriptorFlag::has_payload));
+    }
+    descriptor.data_slot = static_cast<std::uint32_t>(
+        position_ % ring_capacity_);
+    descriptor.payload_length = static_cast<std::uint32_t>(payload_size);
+    descriptor.slot_generation = position_;
+    SharedRingSlot* slot = std::exchange(slot_, nullptr);
+    slot->descriptor = descriptor;
+    slot->generation.store(position_ + 1U, std::memory_order_release);
+    payload_ = nullptr;
+    return signal_event(event_fd_);
+}
+
+std::error_code CompletionReservation::publish_copy(
+    IpcDescriptor descriptor, std::span<const std::byte> payload) noexcept {
+    if (payload.size() > payload_capacity_ ||
+        (payload.data() == nullptr && !payload.empty())) {
+        return std::make_error_code(std::errc::message_size);
+    }
+    if (!payload.empty()) {
+        std::memcpy(payload_, payload.data(), payload.size());
+    }
+    return publish(descriptor, payload.size());
+}
+
+void CompletionReservation::abandon() noexcept {
+    SharedRingSlot* slot = std::exchange(slot_, nullptr);
+    payload_ = nullptr;
+    if (slot != nullptr) {
+        // Abandonment is only used while tearing down a dead session. Return
+        // producer ownership so teardown cannot pin an IPC slot forever.
+        slot->generation.store(position_ + ring_capacity_,
+                               std::memory_order_release);
+    }
+}
 
 std::error_code make_error_code(TransportErrc error) noexcept {
     return {static_cast<int>(error), kTransportErrorCategory};
@@ -674,10 +961,11 @@ std::error_code make_error_code(TransportErrc error) noexcept {
 struct ClientTransport::Impl {
     SessionResources resources;
     std::atomic<std::uint64_t> next_request_id{1};
+    std::uint64_t owner_epoch{process_epoch.load(std::memory_order_relaxed)};
     pid_t owner_pid{::getpid()};
 
     [[nodiscard]] bool owned_by_current_process() const noexcept {
-        return owner_pid == ::getpid();
+        return process_owner_matches(owner_epoch, owner_pid);
     }
 
     ~Impl() {
@@ -695,10 +983,11 @@ struct ClientTransport::Impl {
 
 struct ServerTransport::Impl {
     SessionResources resources;
+    std::uint64_t owner_epoch{process_epoch.load(std::memory_order_relaxed)};
     pid_t owner_pid{::getpid()};
 
     [[nodiscard]] bool owned_by_current_process() const noexcept {
-        return owner_pid == ::getpid();
+        return process_owner_matches(owner_epoch, owner_pid);
     }
 
     ~Impl() {
@@ -714,16 +1003,23 @@ struct ServerTransport::Impl {
 };
 
 struct ControlServer::Impl {
+    struct PendingHandshake {
+        UniqueFd control;
+        std::chrono::steady_clock::time_point deadline;
+    };
+
     UniqueFd listener;
     std::string path;
     TransportConfig limits{};
+    std::vector<PendingHandshake> pending_handshakes;
     std::atomic<std::uint64_t> next_client_id{1};
     dev_t socket_device{0};
     ino_t socket_inode{0};
+    std::uint64_t owner_epoch{process_epoch.load(std::memory_order_relaxed)};
     pid_t owner_pid{::getpid()};
 
     [[nodiscard]] bool owned_by_current_process() const noexcept {
-        return owner_pid == ::getpid();
+        return process_owner_matches(owner_epoch, owner_pid);
     }
 
     ~Impl() {
@@ -745,120 +1041,273 @@ ClientTransport& ClientTransport::operator=(ClientTransport&&) noexcept = defaul
 ClientTransport::ClientTransport(std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 
-ClientTransport ClientTransport::connect(std::string_view socket_path,
-                                         TransportConfig requested,
-                                         std::error_code& error) noexcept {
-    error.clear();
+struct ClientConnector::Impl {
+    enum class Phase : std::uint8_t {
+        connecting,
+        sending_hello,
+        receiving_hello,
+        complete,
+    };
+
+    UniqueFd control;
+    TransportConfig requested{};
+    ClientHello hello{};
+    ServerHello response{};
+    std::vector<UniqueFd> received_fds;
+    Phase phase{Phase::connecting};
+};
+
+ClientConnector::ClientConnector() noexcept = default;
+ClientConnector::~ClientConnector() = default;
+ClientConnector::ClientConnector(ClientConnector&&) noexcept = default;
+ClientConnector& ClientConnector::operator=(ClientConnector&&) noexcept =
+    default;
+ClientConnector::ClientConnector(std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+Result<ClientConnector> ClientConnector::start(
+    std::string_view socket_path, TransportConfig requested) noexcept {
     if (!valid_config(requested)) {
-        error = std::make_error_code(std::errc::invalid_argument);
-        return {};
+        return Result<ClientConnector>::failure(
+            std::make_error_code(std::errc::invalid_argument));
     }
     sockaddr_un address{};
     socklen_t address_length = 0;
-    error = make_unix_address(socket_path, address, address_length);
-    if (error) {
-        return {};
+    if (auto error = make_unix_address(socket_path, address, address_length)) {
+        return Result<ClientConnector>::failure(error);
     }
 
-    UniqueFd socket(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
-    if (!socket) {
-        error = errno_error();
-        return {};
+    try {
+        auto impl = std::make_unique<Impl>();
+        impl->requested = requested;
+        impl->control = UniqueFd(::socket(
+            AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
+        if (!impl->control) {
+            return Result<ClientConnector>::failure(errno_error());
+        }
+        if (::connect(impl->control.get(), reinterpret_cast<sockaddr*>(&address),
+                      address_length) == 0) {
+            impl->phase = Impl::Phase::sending_hello;
+        } else if (errno == EINPROGRESS || errno == EALREADY ||
+                   errno == EAGAIN || errno == EWOULDBLOCK) {
+            impl->phase = Impl::Phase::connecting;
+        } else {
+            return Result<ClientConnector>::failure(errno_error());
+        }
+        impl->hello.lane_count = requested.lane_count;
+        impl->hello.ring_capacity = requested.ring_capacity;
+        impl->hello.data_slot_size = requested.data_slot_size;
+        impl->hello.client_pid = static_cast<std::uint32_t>(::getpid());
+        impl->hello.client_nonce = new_generation();
+        return Result<ClientConnector>::success(
+            ClientConnector(std::move(impl)));
+    } catch (const std::bad_alloc&) {
+        return Result<ClientConnector>::failure(
+            std::make_error_code(std::errc::not_enough_memory));
+    } catch (...) {
+        return Result<ClientConnector>::failure(
+            std::make_error_code(std::errc::io_error));
     }
-    if (::connect(socket.get(), reinterpret_cast<sockaddr*>(&address),
-                  address_length) != 0) {
-        error = errno_error();
-        return {};
+}
+
+Result<std::optional<ClientTransport>> ClientConnector::poll() noexcept {
+    if (!impl_ || impl_->phase == Impl::Phase::complete) {
+        return Result<std::optional<ClientTransport>>::failure(
+            std::make_error_code(std::errc::invalid_argument));
+    }
+    const auto pending = [] {
+        return Result<std::optional<ClientTransport>>::success(
+            std::optional<ClientTransport>{});
+    };
+
+    if (impl_->phase == Impl::Phase::connecting) {
+        int socket_error = 0;
+        socklen_t length = sizeof(socket_error);
+        if (::getsockopt(impl_->control.get(), SOL_SOCKET, SO_ERROR,
+                         &socket_error, &length) != 0) {
+            return Result<std::optional<ClientTransport>>::failure(
+                errno_error());
+        }
+        if (socket_error == EINPROGRESS || socket_error == EALREADY ||
+            socket_error == EAGAIN || socket_error == EWOULDBLOCK) {
+            return pending();
+        }
+        if (socket_error != 0) {
+            return Result<std::optional<ClientTransport>>::failure(
+                std::error_code(socket_error, std::generic_category()));
+        }
+        impl_->phase = Impl::Phase::sending_hello;
     }
 
-    ClientHello hello{};
-    hello.lane_count = requested.lane_count;
-    hello.ring_capacity = requested.ring_capacity;
-    hello.data_slot_size = requested.data_slot_size;
-    hello.client_pid = static_cast<std::uint32_t>(::getpid());
-    hello.client_nonce = new_generation();
-    error = send_packet(socket.get(), &hello, sizeof(hello));
-    if (error) {
-        return {};
+    if (impl_->phase == Impl::Phase::sending_hello) {
+        const auto error = send_packet(impl_->control.get(), &impl_->hello,
+                                       sizeof(impl_->hello));
+        if (error == std::errc::resource_unavailable_try_again ||
+            error == std::errc::operation_would_block) {
+            return pending();
+        }
+        if (error) {
+            return Result<std::optional<ClientTransport>>::failure(error);
+        }
+        impl_->phase = Impl::Phase::receiving_hello;
     }
 
-    ServerHello response{};
-    std::vector<UniqueFd> received_fds;
-    error = receive_packet(socket.get(), &response, sizeof(response), received_fds);
-    if (error) {
-        return {};
+    const auto receive_error = receive_packet(
+        impl_->control.get(), &impl_->response, sizeof(impl_->response),
+        impl_->received_fds);
+    if (receive_error == std::errc::resource_unavailable_try_again ||
+        receive_error == std::errc::operation_would_block) {
+        return pending();
     }
+    if (receive_error) {
+        return Result<std::optional<ClientTransport>>::failure(receive_error);
+    }
+
+    const auto& response = impl_->response;
     if (response.magic != kIpcMagic ||
         response.protocol_version != kIpcProtocolVersion ||
         response.message_size != sizeof(ServerHello)) {
-        error = TransportErrc::protocol_mismatch;
-        return {};
+        return Result<std::optional<ClientTransport>>::failure(
+            make_error_code(TransportErrc::protocol_mismatch));
     }
     if (response.status != 0) {
-        error = {response.status, std::generic_category()};
-        return {};
+        return Result<std::optional<ClientTransport>>::failure(
+            std::error_code(response.status, std::generic_category()));
     }
-    const TransportConfig negotiated{response.lane_count, response.ring_capacity,
-                                     response.data_slot_size};
+    const TransportConfig negotiated{
+        response.lane_count,
+        response.ring_capacity,
+        response.data_slot_size,
+    };
     const std::size_t expected_fds = 1U + 2U * negotiated.lane_count;
-    if (!valid_config(negotiated) || negotiated != requested ||
-        response.fd_count != expected_fds || received_fds.size() != expected_fds ||
+    if (!valid_config(negotiated) || negotiated != impl_->requested ||
+        response.fd_count != expected_fds ||
+        impl_->received_fds.size() != expected_fds ||
         response.shared_memory_size == 0 ||
         response.shared_memory_size > std::numeric_limits<std::size_t>::max()) {
-        error = TransportErrc::protocol_mismatch;
-        return {};
+        return Result<std::optional<ClientTransport>>::failure(
+            make_error_code(TransportErrc::protocol_mismatch));
     }
 
     struct stat memory_status {};
-    if (::fstat(received_fds[0].get(), &memory_status) != 0) {
-        error = errno_error();
-        return {};
+    if (::fstat(impl_->received_fds[0].get(), &memory_status) != 0) {
+        return Result<std::optional<ClientTransport>>::failure(errno_error());
     }
     if (memory_status.st_size < 0 ||
         static_cast<std::uint64_t>(memory_status.st_size) !=
             response.shared_memory_size) {
-        error = TransportErrc::corrupt_layout;
-        return {};
+        return Result<std::optional<ClientTransport>>::failure(
+            make_error_code(TransportErrc::corrupt_layout));
     }
     void* address_ptr = ::mmap(nullptr, response.shared_memory_size,
                                PROT_READ | PROT_WRITE, MAP_SHARED,
-                               received_fds[0].get(), 0);
+                               impl_->received_fds[0].get(), 0);
     if (address_ptr == MAP_FAILED) {
-        error = errno_error();
-        return {};
+        return Result<std::optional<ClientTransport>>::failure(errno_error());
     }
+    Mapping mapping(address_ptr,
+                    static_cast<std::size_t>(response.shared_memory_size));
 
-    auto impl = std::make_unique<Impl>();
-    impl->resources.control = std::move(socket);
-    impl->resources.memory_fd = std::move(received_fds[0]);
-    impl->resources.mapping =
-        Mapping(address_ptr, static_cast<std::size_t>(response.shared_memory_size));
-    impl->resources.config = negotiated;
-    impl->resources.submission_events.reserve(negotiated.lane_count);
-    impl->resources.completion_events.reserve(negotiated.lane_count);
-    for (std::uint32_t lane = 0; lane < negotiated.lane_count; ++lane) {
-        impl->resources.submission_events.push_back(
-            std::move(received_fds[1U + 2U * lane]));
-        impl->resources.completion_events.push_back(
-            std::move(received_fds[2U + 2U * lane]));
+    try {
+        auto transport_impl = std::make_unique<ClientTransport::Impl>();
+        transport_impl->resources.control = std::move(impl_->control);
+        transport_impl->resources.memory_fd =
+            std::move(impl_->received_fds[0]);
+        transport_impl->resources.mapping = std::move(mapping);
+        transport_impl->resources.config = negotiated;
+        transport_impl->resources.submission_events.reserve(
+            negotiated.lane_count);
+        transport_impl->resources.completion_events.reserve(
+            negotiated.lane_count);
+        for (std::uint32_t lane = 0; lane < negotiated.lane_count; ++lane) {
+            transport_impl->resources.submission_events.push_back(
+                std::move(impl_->received_fds[1U + 2U * lane]));
+            transport_impl->resources.completion_events.push_back(
+                std::move(impl_->received_fds[2U + 2U * lane]));
+        }
+        const auto view_error = build_views(
+            transport_impl->resources.mapping, negotiated, response.client_id,
+            response.session_generation, transport_impl->resources.lanes,
+            transport_impl->resources.header);
+        if (view_error) {
+            return Result<std::optional<ClientTransport>>::failure(view_error);
+        }
+        if (transport_impl->resources.header->state.load(
+                std::memory_order_acquire) !=
+            static_cast<std::uint32_t>(SessionState::active)) {
+            return Result<std::optional<ClientTransport>>::failure(
+                make_error_code(TransportErrc::stale_session));
+        }
+        impl_->phase = Impl::Phase::complete;
+        return Result<std::optional<ClientTransport>>::success(
+            std::optional<ClientTransport>(
+                ClientTransport(std::move(transport_impl))));
+    } catch (const std::bad_alloc&) {
+        return Result<std::optional<ClientTransport>>::failure(
+            std::make_error_code(std::errc::not_enough_memory));
+    } catch (...) {
+        return Result<std::optional<ClientTransport>>::failure(
+            std::make_error_code(std::errc::io_error));
     }
-    error = build_views(impl->resources.mapping, negotiated, response.client_id,
-                        response.session_generation, impl->resources.lanes,
-                        impl->resources.header);
-    if (error) {
+}
+
+int ClientConnector::fd() const noexcept {
+    return impl_ ? impl_->control.get() : -1;
+}
+
+ClientTransport ClientTransport::connect(std::string_view socket_path,
+                                         TransportConfig requested,
+                                         std::error_code& error) noexcept {
+    error.clear();
+    auto started = ClientConnector::start(socket_path, requested);
+    if (!started) {
+        error = started.error();
         return {};
     }
-    if (impl->resources.header->state.load(std::memory_order_acquire) !=
-        static_cast<std::uint32_t>(SessionState::active)) {
-        error = TransportErrc::stale_session;
-        return {};
+    auto connector = std::move(started).value();
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(kControlHandshakeTimeoutMs);
+    for (;;) {
+        auto advanced = connector.poll();
+        if (!advanced) {
+            error = advanced.error();
+            return {};
+        }
+        auto transport = std::move(advanced).value();
+        if (transport) {
+            return std::move(*transport);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            error = std::make_error_code(std::errc::timed_out);
+            return {};
+        }
+        const auto remaining = std::chrono::duration_cast<
+            std::chrono::milliseconds>(deadline - now);
+        pollfd descriptor{connector.fd(), POLLIN | POLLOUT, 0};
+        int result = -1;
+        do {
+            result = ::poll(&descriptor, 1,
+                            std::max(1, static_cast<int>(remaining.count())));
+        } while (result < 0 && errno == EINTR);
+        if (result < 0) {
+            error = errno_error();
+            return {};
+        }
     }
-    return ClientTransport(std::move(impl));
 }
 
 std::error_code ClientTransport::try_submit(
     std::uint32_t lane, IpcDescriptor descriptor,
     std::span<const std::byte> payload,
+    std::uint64_t* assigned_request_id) noexcept {
+    return try_submit_scattered(lane, descriptor, payload, {},
+                                assigned_request_id);
+}
+
+std::error_code ClientTransport::try_submit_scattered(
+    std::uint32_t lane, IpcDescriptor descriptor,
+    std::span<const std::byte> prefix, std::span<const std::byte> tail,
     std::uint64_t* assigned_request_id) noexcept {
     if (!impl_ || !impl_->owned_by_current_process() ||
         lane >= impl_->resources.config.lane_count) {
@@ -887,7 +1336,7 @@ std::error_code ClientTransport::try_submit(
 
     LaneView& view = impl_->resources.lanes[lane];
     auto error = view.submissions.try_push(
-        descriptor, payload, view.submission_data,
+        descriptor, prefix, tail, view.submission_data,
         impl_->resources.config.data_slot_size);
     if (error) {
         return error;
@@ -911,6 +1360,29 @@ std::error_code ClientTransport::try_receive_completion(
         descriptor, payload_buffer, payload_size, view.completion_data,
         impl_->resources.config.data_slot_size, impl_->resources.header->client_id,
         impl_->resources.header->session_generation);
+}
+
+std::error_code ClientTransport::try_acquire_completion(
+    std::uint32_t lane, ReceivedIpcSlot& completion) noexcept {
+    completion.reset();
+    if (!impl_ || !impl_->owned_by_current_process() ||
+        lane >= impl_->resources.config.lane_count) {
+        return std::make_error_code(std::errc::invalid_argument);
+    }
+    AcquiredSlotData acquired;
+    LaneView& view = impl_->resources.lanes[lane];
+    const auto error = view.completions.try_acquire(
+        acquired, view.completion_data,
+        impl_->resources.config.data_slot_size,
+        impl_->resources.header->client_id,
+        impl_->resources.header->session_generation);
+    if (error) {
+        return error;
+    }
+    completion = ReceivedIpcSlot(
+        acquired.slot, acquired.release_generation, acquired.descriptor,
+        acquired.payload);
+    return {};
 }
 
 std::error_code ClientTransport::drain_completion_notifications(
@@ -994,6 +1466,60 @@ std::error_code ServerTransport::try_receive_submission(
         impl_->resources.header->session_generation);
 }
 
+bool ServerTransport::submission_ready(std::uint32_t lane) const noexcept {
+    return impl_ && impl_->owned_by_current_process() &&
+           lane < impl_->resources.config.lane_count &&
+           impl_->resources.lanes[lane].submissions.ready();
+}
+
+std::error_code ServerTransport::try_acquire_submission(
+    std::uint32_t lane, ReceivedIpcSlot& submission) noexcept {
+    submission.reset();
+    if (!impl_ || !impl_->owned_by_current_process() ||
+        lane >= impl_->resources.config.lane_count) {
+        return std::make_error_code(std::errc::invalid_argument);
+    }
+    AcquiredSlotData acquired;
+    LaneView& view = impl_->resources.lanes[lane];
+    const auto error = view.submissions.try_acquire(
+        acquired, view.submission_data,
+        impl_->resources.config.data_slot_size,
+        impl_->resources.header->client_id,
+        impl_->resources.header->session_generation);
+    if (error) {
+        return error;
+    }
+    submission = ReceivedIpcSlot(
+        acquired.slot, acquired.release_generation, acquired.descriptor,
+        acquired.payload);
+    return {};
+}
+
+std::error_code ServerTransport::try_reserve_completion(
+    std::uint32_t lane, CompletionReservation& completion) noexcept {
+    completion.abandon();
+    if (!impl_ || !impl_->owned_by_current_process() ||
+        lane >= impl_->resources.config.lane_count) {
+        return std::make_error_code(std::errc::invalid_argument);
+    }
+    ReservedSlotData reserved;
+    LaneView& view = impl_->resources.lanes[lane];
+    const auto error = view.completions.try_reserve(
+        reserved, view.completion_data,
+        impl_->resources.config.data_slot_size);
+    if (error) {
+        return error;
+    }
+    completion = CompletionReservation(
+        reserved.slot, reserved.payload,
+        impl_->resources.config.data_slot_size, reserved.position,
+        impl_->resources.config.ring_capacity,
+        impl_->resources.completion_events[lane].get(),
+        impl_->resources.header->client_id,
+        impl_->resources.header->session_generation);
+    return {};
+}
+
 std::error_code ServerTransport::try_complete(
     std::uint32_t lane, IpcDescriptor descriptor,
     std::span<const std::byte> payload) noexcept {
@@ -1014,7 +1540,7 @@ std::error_code ServerTransport::try_complete(
         ~static_cast<std::uint16_t>(DescriptorFlag::request));
     LaneView& view = impl_->resources.lanes[lane];
     auto error = view.completions.try_push(
-        descriptor, payload, view.completion_data,
+        descriptor, payload, {}, view.completion_data,
         impl_->resources.config.data_slot_size);
     if (error) {
         return error;
@@ -1090,6 +1616,18 @@ TransportConfig ServerTransport::config() const noexcept {
                : TransportConfig{};
 }
 
+SharedMemoryRegion ServerTransport::shared_memory_region() const noexcept {
+    if (!impl_ || !impl_->owned_by_current_process() ||
+        impl_->resources.mapping.address == MAP_FAILED) {
+        return {};
+    }
+    return SharedMemoryRegion{
+        .address = impl_->resources.mapping.address,
+        .size = impl_->resources.mapping.size,
+        .hugepage_backed = impl_->resources.hugepage_backed,
+    };
+}
+
 ControlServer::ControlServer() noexcept = default;
 ControlServer::~ControlServer() = default;
 ControlServer::ControlServer(ControlServer&&) noexcept = default;
@@ -1112,7 +1650,8 @@ ControlServer ControlServer::listen(std::string_view socket_path,
         return {};
     }
 
-    UniqueFd listener(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+    UniqueFd listener(
+        ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
     if (!listener) {
         error = errno_error();
         return {};
@@ -1151,40 +1690,39 @@ ServerTransport ControlServer::accept(std::error_code& error,
         error = std::make_error_code(std::errc::bad_file_descriptor);
         return {};
     }
-    if (cancellation_fd >= 0) {
-        std::array<pollfd, 2> descriptors{{
-            {impl_->listener.get(), POLLIN, 0},
-            {cancellation_fd, POLLIN, 0},
-        }};
-        int poll_result = -1;
-        do {
-            poll_result = ::poll(descriptors.data(), descriptors.size(), -1);
-        } while (poll_result < 0 && errno == EINTR);
-        if (poll_result < 0) {
-            error = errno_error();
-            return {};
-        }
-        if (descriptors[1].revents != 0) {
-            error = std::make_error_code(std::errc::operation_canceled);
-            return {};
-        }
-        if ((descriptors[0].revents & POLLIN) == 0) {
-            error = std::make_error_code(std::errc::io_error);
-            return {};
-        }
+    std::array<pollfd, 2> descriptors{{
+        {impl_->listener.get(), POLLIN, 0},
+        {cancellation_fd, POLLIN, 0},
+    }};
+    const nfds_t descriptor_count = cancellation_fd >= 0 ? 2 : 1;
+    int poll_result = -1;
+    do {
+        poll_result = ::poll(descriptors.data(), descriptor_count, -1);
+    } while (poll_result < 0 && errno == EINTR);
+    if (poll_result < 0) {
+        error = errno_error();
+        return {};
+    }
+    if (cancellation_fd >= 0 && descriptors[1].revents != 0) {
+        error = std::make_error_code(std::errc::operation_canceled);
+        return {};
+    }
+    if ((descriptors[0].revents & POLLIN) == 0) {
+        error = std::make_error_code(std::errc::io_error);
+        return {};
     }
     int accepted_fd = -1;
     do {
-        accepted_fd = ::accept4(impl_->listener.get(), nullptr, nullptr, SOCK_CLOEXEC);
+        accepted_fd = ::accept4(impl_->listener.get(), nullptr, nullptr,
+                                SOCK_CLOEXEC | SOCK_NONBLOCK);
     } while (accepted_fd < 0 && errno == EINTR);
     if (accepted_fd < 0) {
         error = errno_error();
         return {};
     }
-    UniqueFd control(accepted_fd);
-
+    UniqueFd pending_control(accepted_fd);
     std::array<pollfd, 2> handshake_descriptors{{
-        {control.get(), POLLIN, 0},
+        {pending_control.get(), POLLIN, 0},
         {cancellation_fd, POLLIN, 0},
     }};
     const nfds_t handshake_count = cancellation_fd >= 0 ? 2 : 1;
@@ -1209,6 +1747,81 @@ ServerTransport ControlServer::accept(std::error_code& error,
         error = TransportErrc::peer_closed;
         return {};
     }
+
+    return accept_connected(pending_control.release(), error);
+}
+
+ServerTransport ControlServer::try_accept(std::error_code& error) noexcept {
+    error.clear();
+    if (!impl_ || !impl_->owned_by_current_process()) {
+        error = std::make_error_code(std::errc::bad_file_descriptor);
+        return {};
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(impl_->pending_handshakes, [&](const auto& pending) {
+        return pending.deadline <= now;
+    });
+
+    for (;;) {
+        int accepted_fd = -1;
+        do {
+            accepted_fd = ::accept4(impl_->listener.get(), nullptr, nullptr,
+                                    SOCK_CLOEXEC | SOCK_NONBLOCK);
+        } while (accepted_fd < 0 && errno == EINTR);
+        if (accepted_fd < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                error = errno_error();
+                return {};
+            }
+            break;
+        }
+        UniqueFd control(accepted_fd);
+        try {
+            impl_->pending_handshakes.push_back({
+                std::move(control),
+                now + std::chrono::milliseconds(kControlHandshakeTimeoutMs),
+            });
+        } catch (const std::bad_alloc&) {
+            error = std::make_error_code(std::errc::not_enough_memory);
+            return {};
+        } catch (...) {
+            std::terminate();
+        }
+    }
+
+    for (auto pending = impl_->pending_handshakes.begin();
+         pending != impl_->pending_handshakes.end();) {
+        pollfd descriptor{pending->control.get(), POLLIN, 0};
+        int poll_result = -1;
+        do {
+            poll_result = ::poll(&descriptor, 1, 0);
+        } while (poll_result < 0 && errno == EINTR);
+        if (poll_result < 0) {
+            error = errno_error();
+            return {};
+        }
+        if (poll_result == 0) {
+            ++pending;
+            continue;
+        }
+        if ((descriptor.revents & POLLIN) == 0) {
+            pending = impl_->pending_handshakes.erase(pending);
+            continue;
+        }
+
+        const int accepted_fd = pending->control.release();
+        pending = impl_->pending_handshakes.erase(pending);
+        return accept_connected(accepted_fd, error);
+    }
+
+    error = std::make_error_code(std::errc::resource_unavailable_try_again);
+    return {};
+}
+
+ServerTransport ControlServer::accept_connected(
+    int accepted_fd, std::error_code& error) noexcept {
+    UniqueFd control(accepted_fd);
 
     ClientHello hello{};
     std::vector<UniqueFd> unexpected_fds;
@@ -1265,7 +1878,8 @@ ServerTransport ControlServer::accept(std::error_code& error,
         reject(error.value());
         return {};
     }
-    UniqueFd memory_fd(create_memfd());
+    bool hugepage_backed = false;
+    UniqueFd memory_fd(create_memfd(hugepage_backed));
     if (!memory_fd) {
         error = errno_error();
         reject(error.value());
@@ -1327,6 +1941,7 @@ ServerTransport ControlServer::accept(std::error_code& error,
     server_impl->resources.submission_events = std::move(submission_events);
     server_impl->resources.completion_events = std::move(completion_events);
     server_impl->resources.config = requested;
+    server_impl->resources.hugepage_backed = hugepage_backed;
     error = build_views(server_impl->resources.mapping, requested, client_id,
                         generation, server_impl->resources.lanes,
                         server_impl->resources.header);

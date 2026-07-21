@@ -9,15 +9,16 @@
 namespace orchfs::async {
 
 class Runtime;
+class AsyncFilesystem;
 
 struct ServerOptions {
   std::string endpoint{"/tmp/orchfs-kfs.sock"};
   std::size_t lane_count{0};
-  // Zero selects one fixed blocking worker per Runtime worker. These threads
-  // isolate the legacy KFS core from coroutine scheduler workers.
-  std::size_t blocking_worker_count{0};
   std::size_t ring_capacity{64};
   std::size_t data_slot_size{1024U * 1024U};
+  // The authoritative filesystem module is injected at the server seam.
+  // Production supplies KfsCoroutineCore; tests supply an in-memory adapter.
+  std::shared_ptr<AsyncFilesystem> filesystem;
 };
 
 class Server {
@@ -31,6 +32,10 @@ class Server {
   static Result<std::unique_ptr<Server>> start(Runtime& runtime,
                                                ServerOptions options = {});
 
+  // Stop accepting new sessions while allowing existing clients to finish
+  // their already-running coroutine graphs and close themselves normally.
+  // join() preserves this graceful mode once requested.
+  void request_drain() noexcept;
   void request_stop() noexcept;
   Result<void> join();
 

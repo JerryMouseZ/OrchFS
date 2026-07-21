@@ -1,18 +1,19 @@
 #include "orchfs/async/runtime.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
-#include <chrono>
-#include <condition_variable>
+#include <climits>
 #include <deque>
-#include <mutex>
+#include <immintrin.h>
 #include <new>
 #include <pthread.h>
 #include <sched.h>
-#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <utility>
 
@@ -32,6 +33,132 @@ struct WorkItem {
     unsigned pin_depth{0};
     bool owner{false};
 };
+
+struct WorkNode {
+    WorkItem item;
+    WorkNode* next{};
+    bool pooled{};
+    bool remote_pooled{};
+    std::atomic<bool> remote_claimed{false};
+};
+
+class AtomicFlagGuard final {
+public:
+    explicit AtomicFlagGuard(std::atomic_flag& flag) noexcept : flag_(&flag) {
+        while (flag_->test_and_set(std::memory_order_acquire)) {
+            _mm_pause();
+        }
+    }
+
+    ~AtomicFlagGuard() {
+        flag_->clear(std::memory_order_release);
+    }
+
+    AtomicFlagGuard(const AtomicFlagGuard&) = delete;
+    AtomicFlagGuard& operator=(const AtomicFlagGuard&) = delete;
+
+private:
+    std::atomic_flag* flag_;
+};
+
+class CoroutineFramePool final {
+public:
+    CoroutineFramePool() {
+        for (std::size_t index = 0; index < buckets_.size(); ++index) {
+            initialize_bucket(index, kPayloadSizes[index], kSlotCounts[index]);
+        }
+    }
+
+    [[nodiscard]] void* allocate(std::size_t size) {
+        {
+            AtomicFlagGuard guard(lock_);
+            for (std::size_t index = 0; index < buckets_.size(); ++index) {
+                auto& bucket = buckets_[index];
+                if (size > bucket.payload_size || bucket.free_head == nullptr) {
+                    continue;
+                }
+                void* frame = bucket.free_head;
+                bucket.free_head = *static_cast<void**>(frame);
+                return frame;
+            }
+        }
+        return allocate_heap(size);
+    }
+
+    static void release(void* frame) noexcept {
+        if (frame == nullptr) {
+            return;
+        }
+        auto* header = static_cast<FrameHeader*>(frame) - 1;
+        if (header->pool == nullptr) {
+            ::operator delete(header);
+            return;
+        }
+        header->pool->release_pooled(frame, header->bucket);
+    }
+
+    static void* allocate_heap(std::size_t size) {
+        auto* header = static_cast<FrameHeader*>(
+            ::operator new(sizeof(FrameHeader) + size));
+        *header = {};
+        return header + 1;
+    }
+
+private:
+    struct alignas(std::max_align_t) FrameHeader {
+        CoroutineFramePool* pool{};
+        std::size_t bucket{};
+    };
+
+    struct Bucket {
+        std::size_t payload_size{};
+        std::size_t stride{};
+        std::unique_ptr<std::byte[]> storage;
+        void* free_head{};
+    };
+
+    static constexpr std::array<std::size_t, 8> kPayloadSizes{
+        128, 256, 512, 1024, 2048, 4096, 8192, 16384};
+    static constexpr std::array<std::size_t, 8> kSlotCounts{
+        512, 512, 256, 256, 128, 128, 128, 64};
+
+    static constexpr std::size_t align_up(std::size_t size) noexcept {
+        constexpr std::size_t alignment = alignof(std::max_align_t);
+        return (size + alignment - 1U) & ~(alignment - 1U);
+    }
+
+    void initialize_bucket(std::size_t index, std::size_t payload_size,
+                           std::size_t slot_count) {
+        auto& bucket = buckets_[index];
+        bucket.payload_size = payload_size;
+        bucket.stride = align_up(sizeof(FrameHeader) + payload_size);
+        bucket.storage =
+            std::make_unique<std::byte[]>(bucket.stride * slot_count);
+        for (std::size_t slot = 0; slot < slot_count; ++slot) {
+            std::byte* block = bucket.storage.get() + slot * bucket.stride;
+            auto* header = reinterpret_cast<FrameHeader*>(block);
+            *header = FrameHeader{.pool = this, .bucket = index};
+            void* frame = header + 1;
+            *static_cast<void**>(frame) = bucket.free_head;
+            bucket.free_head = frame;
+        }
+    }
+
+    void release_pooled(void* frame, std::size_t bucket_index) noexcept {
+        if (bucket_index >= buckets_.size()) {
+            std::terminate();
+        }
+        AtomicFlagGuard guard(lock_);
+        auto& bucket = buckets_[bucket_index];
+        *static_cast<void**>(frame) = bucket.free_head;
+        bucket.free_head = frame;
+    }
+
+    std::array<Bucket, kPayloadSizes.size()> buckets_;
+    std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+};
+
+thread_local CoroutineFramePool* tls_frame_pool = nullptr;
 
 [[nodiscard]] std::vector<unsigned> current_affinity() {
     cpu_set_t mask;
@@ -53,20 +180,295 @@ struct WorkItem {
     return {error, std::generic_category()};
 }
 
+void futex_wake(std::atomic<std::uint32_t>& epoch, int count) noexcept {
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+    (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&epoch),
+                    FUTEX_WAKE_PRIVATE, count, nullptr, nullptr, 0);
+}
+
+void futex_wait_for(std::atomic<std::uint32_t>& epoch,
+                    std::uint32_t observed) noexcept {
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+    constexpr struct timespec timeout {
+        .tv_sec = 0,
+        .tv_nsec = 10'000'000,
+    };
+    (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(&epoch),
+                    FUTEX_WAIT_PRIVATE, observed, &timeout, nullptr, 0);
+}
+
 } // namespace
 
-struct Runtime::Impl {
-    struct Worker {
-        std::mutex queue_mutex;
-        std::deque<WorkItem> owner_fifo;
-        std::deque<WorkItem> stealable;
+struct Runtime::PollRegistration::State {
+    static constexpr std::uint8_t kActive = 1U << 0U;
+    static constexpr std::uint8_t kInvoking = 1U << 1U;
 
-        std::mutex inbox_mutex;
-        std::deque<WorkItem> inbox;
+    Runtime* runtime{};
+    std::size_t worker{detail::no_worker};
+    PollFunction function{};
+    void* context{};
+    std::atomic<std::uint8_t> lifecycle{kActive};
+};
+
+Runtime::PollRegistration::PollRegistration(PollRegistration&& other) noexcept
+    : state_(std::exchange(other.state_, {})) {}
+
+Runtime::PollRegistration& Runtime::PollRegistration::operator=(
+    PollRegistration&& other) noexcept {
+    if (this != &other) {
+        reset();
+        state_ = std::exchange(other.state_, {});
+    }
+    return *this;
+}
+
+Runtime::PollRegistration::~PollRegistration() {
+    reset();
+}
+
+void Runtime::PollRegistration::reset() noexcept {
+    auto state = std::exchange(state_, {});
+    if (!state) {
+        return;
+    }
+    const std::uint8_t previous = state->lifecycle.fetch_and(
+        static_cast<std::uint8_t>(~State::kActive),
+        std::memory_order_acq_rel);
+    if (Runtime::current() == state->runtime &&
+        Runtime::current_worker() == state->worker) {
+        // A worker may retire its own driver after the callback has returned.
+        // Waiting here would deadlock if reset was requested from that callback.
+        return;
+    }
+    if ((previous & State::kInvoking) == 0U) {
+        return;
+    }
+    while ((state->lifecycle.load(std::memory_order_acquire) &
+            State::kInvoking) != 0U) {
+        std::this_thread::yield();
+    }
+}
+
+struct Runtime::Impl {
+    using PollerList = std::vector<std::shared_ptr<PollRegistration::State>>;
+    using RootRegistry =
+        std::unordered_map<detail::CompletionStateBase*,
+                           std::shared_ptr<detail::CompletionStateBase>>;
+
+    class PinRegistry final {
+    public:
+        PinRegistry()
+            : slots_(std::make_unique<Slot[]>(kCapacity)) {}
+
+        [[nodiscard]] detail::ResumeTarget find(Runtime* runtime,
+                                                 void* coroutine) const noexcept {
+            if (coroutine == nullptr) {
+                return {};
+            }
+            const std::size_t start = hash(coroutine);
+            for (std::size_t probe = 0; probe < kCapacity; ++probe) {
+                const auto& slot = slots_[(start + probe) & (kCapacity - 1)];
+                void* const key = slot.coroutine.load(std::memory_order_acquire);
+                if (key == coroutine) {
+                    const std::uint64_t encoded =
+                        slot.target.load(std::memory_order_acquire);
+                    if (encoded == 0) {
+                        return {};
+                    }
+                    return detail::ResumeTarget{
+                        .runtime = runtime,
+                        .worker = static_cast<std::size_t>(
+                            (encoded & kWorkerMask) - 1),
+                        .pin_depth = static_cast<unsigned>(
+                            (encoded >> kDepthShift) & kDepthMask),
+                        .owner = (encoded & kOwnerMask) != 0,
+                    };
+                }
+                if (key == nullptr) {
+                    return {};
+                }
+            }
+            return {};
+        }
+
+        void set(void* coroutine, detail::ResumeTarget target) noexcept {
+            if (coroutine == nullptr || target.runtime == nullptr ||
+                target.worker >= kWorkerMask || target.pin_depth == 0 ||
+                target.pin_depth > kDepthMask) {
+                std::terminate();
+            }
+            const std::uint64_t encoded =
+                static_cast<std::uint64_t>(target.worker + 1) |
+                (static_cast<std::uint64_t>(target.pin_depth) << kDepthShift) |
+                (target.owner ? kOwnerMask : 0);
+            const std::size_t start = hash(coroutine);
+            for (std::size_t probe = 0; probe < kCapacity; ++probe) {
+                auto& slot = slots_[(start + probe) & (kCapacity - 1)];
+                void* key = slot.coroutine.load(std::memory_order_acquire);
+                if (key == coroutine) {
+                    slot.target.store(encoded, std::memory_order_release);
+                    return;
+                }
+                if (key == nullptr && slot.coroutine.compare_exchange_strong(
+                                          key, coroutine,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+                    slot.target.store(encoded, std::memory_order_release);
+                    return;
+                }
+            }
+            std::terminate();
+        }
+
+        void erase(void* coroutine) noexcept {
+            if (coroutine == nullptr) {
+                std::terminate();
+            }
+            const std::size_t start = hash(coroutine);
+            for (std::size_t probe = 0; probe < kCapacity; ++probe) {
+                auto& slot = slots_[(start + probe) & (kCapacity - 1)];
+                void* const key = slot.coroutine.load(std::memory_order_acquire);
+                if (key == coroutine) {
+                    slot.target.store(0, std::memory_order_release);
+                    return;
+                }
+                if (key == nullptr) {
+                    return;
+                }
+            }
+        }
+
+    private:
+        struct Slot {
+            std::atomic<void*> coroutine{nullptr};
+            std::atomic<std::uint64_t> target{0};
+        };
+
+        static constexpr std::size_t kCapacity = 1U << 18U;
+        static constexpr std::uint64_t kWorkerMask = 0xffffffffULL;
+        static constexpr unsigned kDepthShift = 32U;
+        static constexpr std::uint64_t kDepthMask = 0x7fffffffULL;
+        static constexpr std::uint64_t kOwnerMask = 1ULL << 63U;
+
+        static std::size_t hash(void* coroutine) noexcept {
+            std::uint64_t value = reinterpret_cast<std::uintptr_t>(coroutine);
+            value ^= value >> 33U;
+            value *= 0xff51afd7ed558ccdULL;
+            value ^= value >> 33U;
+            return static_cast<std::size_t>(value) & (kCapacity - 1);
+        }
+
+        std::unique_ptr<Slot[]> slots_;
+    };
+
+    struct Worker {
+        static constexpr std::size_t kWorkNodePoolSize = 4096;
+        static constexpr std::size_t kRemoteWorkNodePoolSize = 4096;
+        static_assert((kRemoteWorkNodePoolSize &
+                       (kRemoteWorkNodePoolSize - 1U)) == 0U);
+
+        std::atomic<WorkNode*> inbox{nullptr};
+        WorkNode* local_head{};
+        WorkNode* local_tail{};
+
+        std::unique_ptr<WorkNode[]> work_node_pool;
+        WorkNode* free_work_nodes{};
+        std::unique_ptr<WorkNode[]> remote_work_node_pool;
+        std::atomic<std::size_t> remote_work_node_cursor{0};
+        CoroutineFramePool coroutine_frames;
 
         std::thread thread;
-        bool take_owner_next{true};
         std::deque<detail::CompletionStateBase*> deferred_completed;
+
+        std::atomic_flag poller_update = ATOMIC_FLAG_INIT;
+        std::vector<std::unique_ptr<const PollerList>> poller_generations;
+        std::atomic<const PollerList*> pollers{nullptr};
+
+        Worker()
+            : work_node_pool(
+                  std::make_unique<WorkNode[]>(kWorkNodePoolSize)),
+              remote_work_node_pool(
+                  std::make_unique<WorkNode[]>(kRemoteWorkNodePoolSize)) {
+            for (std::size_t index = 0; index < kWorkNodePoolSize; ++index) {
+                work_node_pool[index].pooled = true;
+                work_node_pool[index].next =
+                    index + 1 < kWorkNodePoolSize
+                        ? &work_node_pool[index + 1]
+                        : nullptr;
+            }
+            free_work_nodes = work_node_pool.get();
+            for (std::size_t index = 0; index < kRemoteWorkNodePoolSize;
+                 ++index) {
+                remote_work_node_pool[index].pooled = true;
+                remote_work_node_pool[index].remote_pooled = true;
+            }
+            auto initial = std::make_unique<const PollerList>();
+            pollers.store(initial.get(), std::memory_order_relaxed);
+            poller_generations.push_back(std::move(initial));
+        }
+
+        [[nodiscard]] WorkNode* acquire_work_node(bool owner_local) noexcept {
+            if (owner_local && free_work_nodes != nullptr) {
+                WorkNode* node = free_work_nodes;
+                free_work_nodes = node->next;
+                node->next = nullptr;
+                return node;
+            }
+            if (!owner_local) {
+                const std::size_t start = remote_work_node_cursor.fetch_add(
+                    1, std::memory_order_relaxed);
+                for (std::size_t probe = 0;
+                     probe < kRemoteWorkNodePoolSize; ++probe) {
+                    WorkNode& node = remote_work_node_pool[
+                        (start + probe) & (kRemoteWorkNodePoolSize - 1U)];
+                    bool expected = false;
+                    if (node.remote_claimed.compare_exchange_strong(
+                            expected, true, std::memory_order_acquire,
+                            std::memory_order_relaxed)) {
+                        node.next = nullptr;
+                        return &node;
+                    }
+                }
+            }
+            return new (std::nothrow) WorkNode();
+        }
+
+        void release_work_node(WorkNode* node) noexcept {
+            if (node == nullptr) {
+                return;
+            }
+            node->item = {};
+            if (!node->pooled) {
+                delete node;
+                return;
+            }
+            if (node->remote_pooled) {
+                node->next = nullptr;
+                node->remote_claimed.store(false, std::memory_order_release);
+                return;
+            }
+            node->next = free_work_nodes;
+            free_work_nodes = node;
+        }
+
+        ~Worker() {
+            WorkNode* node = inbox.exchange(nullptr, std::memory_order_acquire);
+            while (node != nullptr) {
+                WorkNode* next = node->next;
+                if (!node->pooled) {
+                    delete node;
+                }
+                node = next;
+            }
+            node = local_head;
+            while (node != nullptr) {
+                WorkNode* next = node->next;
+                if (!node->pooled) {
+                    delete node;
+                }
+                node = next;
+            }
+        }
     };
 
     explicit Impl(RuntimeOptions runtime_options)
@@ -82,169 +484,99 @@ struct Runtime::Impl {
     std::atomic<bool> running{false};
     std::atomic<bool> joined{false};
     std::atomic<std::size_t> pending_roots{0};
+    std::atomic<std::size_t> root_submitters{0};
     std::atomic<std::size_t> scheduled_items{0};
     std::atomic<std::size_t> round_robin{0};
-    std::atomic<std::uint64_t> wake_epoch{0};
+    std::atomic<std::uint32_t> wake_epoch{0};
 
-    // Admission and the final worker-exit decision share this mutex.  Without
-    // that linearization point, a worker can observe empty queues and exit
-    // while an external completion concurrently enqueues work after the
-    // observation but before Runtime::join() publishes joined=true.
-    std::shared_mutex schedule_mutex;
-    bool scheduling_closed{false};
+    std::atomic<bool> scheduling_closed{false};
 
-    std::mutex roots_mutex;
-    std::unordered_map<detail::CompletionStateBase*,
-                       std::shared_ptr<detail::CompletionStateBase>> roots;
-    std::deque<detail::CompletionStateBase*> completed_roots;
+    std::atomic_flag roots_update = ATOMIC_FLAG_INIT;
+    RootRegistry roots;
 
-    std::mutex pins_mutex;
-    std::unordered_map<void*, detail::ResumeTarget> pinned_coroutines;
+    PinRegistry pinned_coroutines;
 
-    std::mutex wake_mutex;
-    std::condition_variable wake_cv;
-
-    std::mutex start_mutex;
-    std::condition_variable start_cv;
-    bool start_gate{false};
-    bool abort_start{false};
-
-    std::mutex join_mutex;
+    std::atomic<bool> start_gate{false};
+    std::atomic<bool> abort_start{false};
+    std::atomic<bool> join_started{false};
 
     void wake_one() noexcept {
         wake_epoch.fetch_add(1, std::memory_order_release);
-        wake_cv.notify_one();
+        futex_wake(wake_epoch, 1);
     }
 
     void wake_all() noexcept {
         wake_epoch.fetch_add(1, std::memory_order_release);
-        wake_cv.notify_all();
+        futex_wake(wake_epoch, INT_MAX);
     }
 
     void drain_inbox(std::size_t worker_index) noexcept {
         auto& worker = *workers[worker_index];
-        std::deque<WorkItem> incoming;
-        {
-            std::lock_guard lock(worker.inbox_mutex);
-            incoming.swap(worker.inbox);
-        }
-        if (incoming.empty()) {
+        WorkNode* stack =
+            worker.inbox.exchange(nullptr, std::memory_order_acquire);
+        if (stack == nullptr) {
             return;
         }
 
-        std::lock_guard lock(worker.queue_mutex);
-        while (!incoming.empty()) {
-            WorkItem item = std::move(incoming.front());
-            incoming.pop_front();
-            if (item.owner) {
-                worker.owner_fifo.push_back(std::move(item));
-            } else {
-                worker.stealable.push_back(std::move(item));
-            }
+        WorkNode* fifo = nullptr;
+        while (stack != nullptr) {
+            WorkNode* next = stack->next;
+            stack->next = fifo;
+            fifo = stack;
+            stack = next;
         }
+        WorkNode* tail = fifo;
+        while (tail->next != nullptr) {
+            tail = tail->next;
+        }
+        if (worker.local_tail != nullptr) {
+            worker.local_tail->next = fifo;
+        } else {
+            worker.local_head = fifo;
+        }
+        worker.local_tail = tail;
     }
 
     [[nodiscard]] bool pop_local(std::size_t worker_index,
                                  WorkItem& result) noexcept {
         drain_inbox(worker_index);
         auto& worker = *workers[worker_index];
-        std::lock_guard lock(worker.queue_mutex);
-
-        const bool has_owner = !worker.owner_fifo.empty();
-        const bool has_stealable = !worker.stealable.empty();
-        if (!has_owner && !has_stealable) {
+        WorkNode* node = worker.local_head;
+        if (node == nullptr) {
             return false;
         }
-
-        if (has_owner && has_stealable) {
-            if (worker.take_owner_next) {
-                result = std::move(worker.owner_fifo.front());
-                worker.owner_fifo.pop_front();
-            } else {
-                result = std::move(worker.stealable.front());
-                worker.stealable.pop_front();
-            }
-            worker.take_owner_next = !worker.take_owner_next;
-            return true;
+        worker.local_head = node->next;
+        if (worker.local_head == nullptr) {
+            worker.local_tail = nullptr;
         }
-
-        if (has_owner) {
-            result = std::move(worker.owner_fifo.front());
-            worker.owner_fifo.pop_front();
-        } else {
-            result = std::move(worker.stealable.front());
-            worker.stealable.pop_front();
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool steal(std::size_t thief, WorkItem& result) noexcept {
-        const std::size_t count = workers.size();
-        for (std::size_t step = 1; step < count; ++step) {
-            const std::size_t victim_index = (thief + step) % count;
-            auto& victim = *workers[victim_index];
-            std::lock_guard lock(victim.queue_mutex);
-            if (victim.stealable.empty()) {
-                continue;
-            }
-            result = std::move(victim.stealable.back());
-            victim.stealable.pop_back();
-            result.owner = false;
-            return true;
-        }
-        return false;
-    }
-
-    [[nodiscard]] bool queues_empty() noexcept {
-        for (auto& worker_ptr : workers) {
-            auto& worker = *worker_ptr;
-            {
-                std::lock_guard lock(worker.inbox_mutex);
-                if (!worker.inbox.empty()) {
-                    return false;
-                }
-            }
-            {
-                std::lock_guard lock(worker.queue_mutex);
-                if (!worker.owner_fifo.empty() || !worker.stealable.empty()) {
-                    return false;
-                }
-            }
-        }
+        result = node->item;
+        worker.release_work_node(node);
         return true;
     }
 
     [[nodiscard]] bool close_scheduling_if_drained() noexcept {
-        std::unique_lock admission_lock(schedule_mutex);
-        if (scheduling_closed) {
+        if (scheduling_closed.load(std::memory_order_acquire)) {
             return true;
         }
         if (!stop_requested.load(std::memory_order_acquire) ||
+            root_submitters.load(std::memory_order_acquire) != 0 ||
             pending_roots.load(std::memory_order_acquire) != 0 ||
-            scheduled_items.load(std::memory_order_acquire) != 0 ||
-            !queues_empty()) {
+            scheduled_items.load(std::memory_order_seq_cst) != 0) {
             return false;
         }
-        scheduling_closed = true;
-        return true;
-    }
-
-    void reap_completed() noexcept {
-        std::deque<std::shared_ptr<detail::CompletionStateBase>> garbage;
-        {
-            std::lock_guard lock(roots_mutex);
-            while (!completed_roots.empty()) {
-                auto* completed = completed_roots.front();
-                completed_roots.pop_front();
-                auto found = roots.find(completed);
-                if (found != roots.end()) {
-                    garbage.push_back(std::move(found->second));
-                    roots.erase(found);
-                }
-            }
+        bool expected = false;
+        if (!scheduling_closed.compare_exchange_strong(
+                expected, true, std::memory_order_seq_cst,
+                std::memory_order_seq_cst)) {
+            return expected;
         }
-        // Coroutine frames are destroyed here, after resume() has returned.
-        garbage.clear();
+        if (pending_roots.load(std::memory_order_acquire) != 0 ||
+            root_submitters.load(std::memory_order_acquire) != 0 ||
+            scheduled_items.load(std::memory_order_seq_cst) != 0) {
+            scheduling_closed.store(false, std::memory_order_seq_cst);
+            return false;
+        }
+        return true;
     }
 
     void publish_deferred_completions(std::size_t worker_index) noexcept {
@@ -252,34 +584,67 @@ struct Runtime::Impl {
         if (deferred.empty()) {
             return;
         }
-        std::lock_guard lock(roots_mutex);
-        while (!deferred.empty()) {
-            completed_roots.push_back(deferred.front());
-            deferred.pop_front();
+        {
+            AtomicFlagGuard guard(roots_update);
+            for (auto* completed : deferred) {
+                roots.erase(completed);
+            }
         }
+        deferred.clear();
+    }
+
+    [[nodiscard]] PollState poll_services(std::size_t worker_index) noexcept {
+        PollState aggregate = PollState::idle;
+        const auto* pollers = workers[worker_index]->pollers.load(
+            std::memory_order_acquire);
+        for (const auto& poller : *pollers) {
+            std::uint8_t expected = PollRegistration::State::kActive;
+            if (!poller->lifecycle.compare_exchange_strong(
+                    expected,
+                    static_cast<std::uint8_t>(
+                        PollRegistration::State::kActive |
+                        PollRegistration::State::kInvoking),
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                continue;
+            }
+            const PollState state = poller->function(poller->context);
+            poller->lifecycle.fetch_and(
+                static_cast<std::uint8_t>(
+                    ~PollRegistration::State::kInvoking),
+                std::memory_order_release);
+            if (state == PollState::progress) {
+                aggregate = PollState::progress;
+            } else if (state == PollState::busy &&
+                       aggregate == PollState::idle) {
+                aggregate = PollState::busy;
+            }
+        }
+        return aggregate;
     }
 
     void worker_loop(std::size_t worker_index) noexcept {
-        {
-            std::unique_lock lock(start_mutex);
-            start_cv.wait(lock, [this] { return start_gate; });
-            if (abort_start) {
-                return;
-            }
+        while (!start_gate.load(std::memory_order_acquire)) {
+            start_gate.wait(false, std::memory_order_acquire);
+        }
+        if (abort_start.load(std::memory_order_acquire)) {
+            return;
         }
 
         tls_runtime = runtime;
         tls_worker = worker_index;
         tls_pin_depth = 0;
         tls_owner = false;
+        tls_frame_pool = &workers[worker_index]->coroutine_frames;
 
         std::size_t spins = 0;
-        std::uint64_t observed_epoch =
+        std::uint32_t observed_epoch =
             wake_epoch.load(std::memory_order_acquire);
 
         for (;;) {
+            const PollState service_state = poll_services(worker_index);
             WorkItem item;
-            if (pop_local(worker_index, item) || steal(worker_index, item)) {
+            if (pop_local(worker_index, item)) {
                 spins = 0;
                 tls_worker = worker_index;
                 tls_pin_depth = item.pin_depth;
@@ -290,36 +655,44 @@ struct Runtime::Impl {
                 tls_owner = false;
                 publish_deferred_completions(worker_index);
                 scheduled_items.fetch_sub(1, std::memory_order_acq_rel);
-                reap_completed();
                 continue;
             }
 
-            reap_completed();
-            if (close_scheduling_if_drained()) {
+            if (service_state == PollState::progress) {
+                spins = 0;
+                continue;
+            }
+
+            if ((worker_index == 0 && close_scheduling_if_drained()) ||
+                (worker_index != 0 &&
+                 scheduling_closed.load(std::memory_order_acquire))) {
                 break;
             }
 
             if (spins++ < options.spin_before_park) {
-                std::this_thread::yield();
+                _mm_pause();
+                continue;
+            }
+
+            if (service_state == PollState::busy) {
+                spins = 0;
+                _mm_pause();
                 continue;
             }
 
             spins = 0;
-            std::unique_lock lock(wake_mutex);
             // request_stop() advances wake_epoch before notifying.  Do not use
             // stop_requested itself as a wake predicate: a stopped Runtime may
             // still have roots suspended on external I/O, and a permanently
             // true predicate would make every idle worker busy-spin while the
             // completion is outstanding.
-            wake_cv.wait_for(lock, std::chrono::milliseconds(10), [&] {
-                return wake_epoch.load(std::memory_order_acquire) !=
-                       observed_epoch;
-            });
+            futex_wait_for(wake_epoch, observed_epoch);
             observed_epoch = wake_epoch.load(std::memory_order_acquire);
         }
 
         tls_pin_depth = 0;
         tls_owner = false;
+        tls_frame_pool = nullptr;
         tls_worker = detail::no_worker;
         tls_runtime = nullptr;
     }
@@ -468,12 +841,10 @@ Result<void> Runtime::start() noexcept {
         std::terminate();
     }
 
-    {
-        std::lock_guard lock(impl_->start_mutex);
-        impl_->abort_start = static_cast<bool>(start_error);
-        impl_->start_gate = true;
-    }
-    impl_->start_cv.notify_all();
+    impl_->abort_start.store(static_cast<bool>(start_error),
+                             std::memory_order_release);
+    impl_->start_gate.store(true, std::memory_order_release);
+    impl_->start_gate.notify_all();
 
     if (start_error) {
         for (auto& worker : impl_->workers) {
@@ -504,21 +875,38 @@ Runtime::~Runtime() {
 Result<void> Runtime::submit_root(
     std::shared_ptr<detail::CompletionStateBase> state,
     std::coroutine_handle<> coroutine) noexcept {
-    std::size_t worker = 0;
-    {
-        std::lock_guard lock(impl_->roots_mutex);
-        if (!impl_->accepting.load(std::memory_order_relaxed)) {
-            return Result<void>::failure(Errc::runtime_stopping);
-        }
-        impl_->roots.emplace(state.get(), state);
-        impl_->pending_roots.fetch_add(1, std::memory_order_release);
-        worker = impl_->round_robin.fetch_add(1, std::memory_order_relaxed) %
-                 impl_->workers.size();
+    impl_->root_submitters.fetch_add(1, std::memory_order_acq_rel);
+    if (!impl_->accepting.load(std::memory_order_acquire)) {
+        impl_->root_submitters.fetch_sub(1, std::memory_order_release);
+        return Result<void>::failure(Errc::runtime_stopping);
     }
 
+    try {
+        AtomicFlagGuard guard(impl_->roots_update);
+        const bool inserted = impl_->roots.emplace(state.get(), state).second;
+        if (!inserted) {
+            std::terminate();
+        }
+    } catch (const std::bad_alloc&) {
+        impl_->root_submitters.fetch_sub(1, std::memory_order_release);
+        return Result<void>::failure(
+            std::make_error_code(std::errc::not_enough_memory));
+    } catch (...) {
+        std::terminate();
+    }
+    impl_->pending_roots.fetch_add(1, std::memory_order_release);
+    impl_->root_submitters.fetch_sub(1, std::memory_order_release);
+    impl_->wake_all();
+
+    const std::size_t worker =
+        impl_->round_robin.fetch_add(1, std::memory_order_relaxed) %
+        impl_->workers.size();
+
     if (!schedule_internal(coroutine, worker, 0, false)) {
-        std::lock_guard lock(impl_->roots_mutex);
-        impl_->roots.erase(state.get());
+        {
+            AtomicFlagGuard guard(impl_->roots_update);
+            impl_->roots.erase(state.get());
+        }
         impl_->pending_roots.fetch_sub(1, std::memory_order_release);
         return Result<void>::failure(Errc::runtime_stopping);
     }
@@ -526,11 +914,8 @@ Result<void> Runtime::submit_root(
 }
 
 void Runtime::request_stop() noexcept {
-    {
-        std::lock_guard lock(impl_->roots_mutex);
-        impl_->accepting.store(false, std::memory_order_release);
-        impl_->stop_requested.store(true, std::memory_order_release);
-    }
+    impl_->accepting.store(false, std::memory_order_release);
+    impl_->stop_requested.store(true, std::memory_order_release);
     impl_->wake_all();
 }
 
@@ -539,8 +924,16 @@ Result<void> Runtime::join() noexcept {
         return Result<void>::failure(Errc::join_from_worker);
     }
 
-    std::lock_guard join_lock(impl_->join_mutex);
     if (impl_->joined.load(std::memory_order_acquire)) {
+        return Result<void>::success();
+    }
+    bool expected = false;
+    if (!impl_->join_started.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        while (!impl_->joined.load(std::memory_order_acquire)) {
+            impl_->joined.wait(false, std::memory_order_acquire);
+        }
         return Result<void>::success();
     }
 
@@ -552,12 +945,68 @@ Result<void> Runtime::join() noexcept {
     }
     impl_->running.store(false, std::memory_order_release);
     impl_->joined.store(true, std::memory_order_release);
-    impl_->reap_completed();
+    impl_->joined.notify_all();
     return Result<void>::success();
 }
 
 std::size_t Runtime::worker_count() const noexcept {
     return impl_->workers.size();
+}
+
+Result<unsigned> Runtime::worker_cpu(std::size_t worker) const noexcept {
+    if (worker >= impl_->cpus.size()) {
+        return Result<unsigned>::failure(Errc::invalid_worker);
+    }
+    return Result<unsigned>::success(impl_->cpus[worker]);
+}
+
+Result<Runtime::PollRegistration> Runtime::register_poller(
+    std::size_t worker, PollFunction function, void* context) noexcept {
+    if (worker >= impl_->workers.size()) {
+        return Result<PollRegistration>::failure(Errc::invalid_worker);
+    }
+    if (function == nullptr) {
+        return Result<PollRegistration>::failure(
+            std::make_error_code(std::errc::invalid_argument));
+    }
+    if (!impl_->running.load(std::memory_order_acquire) ||
+        impl_->joined.load(std::memory_order_acquire)) {
+        return Result<PollRegistration>::failure(Errc::runtime_stopping);
+    }
+
+    try {
+        auto state = std::make_shared<PollRegistration::State>();
+        state->runtime = this;
+        state->worker = worker;
+        state->function = function;
+        state->context = context;
+
+        auto& target = *impl_->workers[worker];
+        {
+            AtomicFlagGuard guard(target.poller_update);
+            const auto* current = target.pollers.load(std::memory_order_acquire);
+            auto updated = std::make_unique<Impl::PollerList>();
+            updated->reserve(current->size() + 1);
+            for (const auto& existing : *current) {
+                if ((existing->lifecycle.load(std::memory_order_acquire) &
+                     PollRegistration::State::kActive) != 0U) {
+                    updated->push_back(existing);
+                }
+            }
+            updated->push_back(state);
+            const auto* published = updated.get();
+            target.poller_generations.push_back(std::move(updated));
+            target.pollers.store(published, std::memory_order_release);
+        }
+        impl_->wake_all();
+        return Result<PollRegistration>::success(
+            PollRegistration(std::move(state)));
+    } catch (const std::bad_alloc&) {
+        return Result<PollRegistration>::failure(
+            std::make_error_code(std::errc::not_enough_memory));
+    } catch (...) {
+        std::terminate();
+    }
 }
 
 std::size_t Runtime::owner_for(std::uint64_t key) const noexcept {
@@ -569,6 +1018,18 @@ std::size_t Runtime::owner_for(std::uint64_t key) const noexcept {
     key *= 0xc4ceb9fe1a85ec53ULL;
     key ^= key >> 33U;
     return static_cast<std::size_t>(key % impl_->workers.size());
+}
+
+bool Runtime::notify(std::size_t worker) noexcept {
+    if (worker >= impl_->workers.size() ||
+        !impl_->running.load(std::memory_order_acquire) ||
+        impl_->joined.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // The futex epoch is process-wide. Waking all avoids relying on a parked
+    // worker consuming a wake intended for another owner's poller.
+    impl_->wake_all();
+    return true;
 }
 
 Runtime* Runtime::current() noexcept {
@@ -584,14 +1045,8 @@ bool Runtime::schedule(std::coroutine_handle<> coroutine,
     if (!coroutine || impl_->workers.empty()) {
         return false;
     }
-    detail::ResumeTarget pinned;
-    {
-        std::lock_guard lock(impl_->pins_mutex);
-        auto found = impl_->pinned_coroutines.find(coroutine.address());
-        if (found != impl_->pinned_coroutines.end()) {
-            pinned = found->second;
-        }
-    }
+    const detail::ResumeTarget pinned =
+        impl_->pinned_coroutines.find(this, coroutine.address());
 
     if (pinned.runtime != nullptr && worker && *worker != pinned.worker) {
         return false;
@@ -617,28 +1072,46 @@ bool Runtime::schedule_internal(std::coroutine_handle<> coroutine,
     if (!coroutine || worker >= impl_->workers.size()) {
         return false;
     }
-
-    std::shared_lock admission_lock(impl_->schedule_mutex);
-    if (impl_->scheduling_closed ||
+    if (impl_->scheduling_closed.load(std::memory_order_acquire) ||
         !impl_->running.load(std::memory_order_acquire) ||
         impl_->joined.load(std::memory_order_acquire)) {
         return false;
     }
 
-    WorkItem item{coroutine, pin_depth, owner || pin_depth != 0};
-    impl_->scheduled_items.fetch_add(1, std::memory_order_acq_rel);
-
     auto& target = *impl_->workers[worker];
+    const bool owner_local = tls_runtime == this && tls_worker == worker;
+    auto* node = target.acquire_work_node(owner_local);
+    if (node == nullptr) {
+        return false;
+    }
+    node->item = WorkItem{coroutine, pin_depth, owner || pin_depth != 0};
+
+    // Increment before the second admission check. This pairs with the final
+    // close CAS: either the item is visible in scheduled_items, or it observes
+    // scheduling_closed and rolls itself back before publishing to an inbox.
+    impl_->scheduled_items.fetch_add(1, std::memory_order_seq_cst);
+    if (impl_->scheduling_closed.load(std::memory_order_seq_cst) ||
+        !impl_->running.load(std::memory_order_acquire) ||
+        impl_->joined.load(std::memory_order_acquire)) {
+        impl_->scheduled_items.fetch_sub(1, std::memory_order_seq_cst);
+        target.release_work_node(node);
+        return false;
+    }
+
     if (tls_runtime == this && tls_worker == worker) {
-        std::lock_guard lock(target.queue_mutex);
-        if (item.owner) {
-            target.owner_fifo.push_back(std::move(item));
+        if (target.local_tail != nullptr) {
+            target.local_tail->next = node;
         } else {
-            target.stealable.push_back(std::move(item));
+            target.local_head = node;
         }
+        target.local_tail = node;
     } else {
-        std::lock_guard lock(target.inbox_mutex);
-        target.inbox.push_back(std::move(item));
+        WorkNode* head = target.inbox.load(std::memory_order_relaxed);
+        do {
+            node->next = head;
+        } while (!target.inbox.compare_exchange_weak(
+            head, node, std::memory_order_release,
+            std::memory_order_relaxed));
     }
     impl_->wake_one();
     return true;
@@ -650,8 +1123,7 @@ void Runtime::register_pin(std::coroutine_handle<> coroutine,
         target.worker >= impl_->workers.size() || target.pin_depth == 0) {
         std::terminate();
     }
-    std::lock_guard lock(impl_->pins_mutex);
-    impl_->pinned_coroutines[coroutine.address()] = target;
+    impl_->pinned_coroutines.set(coroutine.address(), target);
 }
 
 void Runtime::transfer_pin(std::coroutine_handle<> coroutine,
@@ -660,13 +1132,13 @@ void Runtime::transfer_pin(std::coroutine_handle<> coroutine,
         tls_worker >= impl_->workers.size()) {
         std::terminate();
     }
-    std::lock_guard lock(impl_->pins_mutex);
     impl_->pinned_coroutines.erase(coroutine.address());
     if (tls_pin_depth == 0) {
         impl_->pinned_coroutines.erase(continuation.address());
     } else {
-        impl_->pinned_coroutines[continuation.address()] =
-            {this, tls_worker, tls_pin_depth, tls_owner};
+        impl_->pinned_coroutines.set(
+            continuation.address(),
+            {this, tls_worker, tls_pin_depth, tls_owner});
     }
 }
 
@@ -674,13 +1146,13 @@ void Runtime::unregister_pin(std::coroutine_handle<> coroutine) noexcept {
     if (!coroutine) {
         std::terminate();
     }
-    std::lock_guard lock(impl_->pins_mutex);
     if (tls_pin_depth == 0) {
         impl_->pinned_coroutines.erase(coroutine.address());
-        return;
+    } else {
+        impl_->pinned_coroutines.set(
+            coroutine.address(),
+            {this, tls_worker, tls_pin_depth, tls_owner});
     }
-    impl_->pinned_coroutines[coroutine.address()] =
-        {this, tls_worker, tls_pin_depth, tls_owner};
 }
 
 void Runtime::on_root_completed(detail::CompletionStateBase* state) noexcept {
@@ -755,6 +1227,16 @@ Result<void> Runtime::YieldAwaiter::await_resume() const noexcept {
 }
 
 namespace detail {
+
+void* allocate_coroutine_frame(std::size_t size) {
+    return tls_frame_pool != nullptr
+               ? tls_frame_pool->allocate(size)
+               : CoroutineFramePool::allocate_heap(size);
+}
+
+void deallocate_coroutine_frame(void* frame) noexcept {
+    CoroutineFramePool::release(frame);
+}
 
 ResumeTarget current_resume_target() noexcept {
     return {tls_runtime, tls_worker, tls_pin_depth, tls_owner};

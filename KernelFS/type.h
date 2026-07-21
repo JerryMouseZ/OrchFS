@@ -18,13 +18,13 @@
 #include <string.h>
 #include <error.h>
 #include <errno.h>
-#include <pthread.h>
 #include <inttypes.h>
 #include <time.h>
 #include <x86intrin.h>
 #include <stdarg.h> 
 
 #include "../config/config.h"
+#include "../include/orchfs/disk_format.h"
 
 
 #define ORCHK_MAX_NAME             230
@@ -48,32 +48,7 @@ struct orch_kfs_dirent
 typedef struct orch_kfs_dirent orch_kfs_dirent_t;
 typedef orch_kfs_dirent_t* orch_kfs_dirent_pt;
 
-/* inode.
- */
-struct orch_kfs_inode
-{
-	// 64-bit fields
-    int64_t        i_number;             // inode id
-    int64_t        i_size;               // file size
-    int64_t        i_idxroot;            // the address of the index root
-    int64_t        i_nlink;              
-
-	// 32-bit fields
-    uid_t          i_uid;                
-    gid_t          i_gid;                
-    mode_t         i_mode;               
-    int32_t        i_type;               // the type of the file
-
-    // times
-    struct timespec i_atim;              /* Time of last access */
-    struct timespec i_mtim;              /* Time of last modification */
-    struct timespec i_ctim;              /* Time of last status change */
-    //56B
-
-    //char        padding[16];
-    pthread_spinlock_t     i_lock;
-};
-typedef struct orch_kfs_inode orch_kfs_inode_t;
+typedef struct orchfs_inode_disk orch_kfs_inode_t;
 typedef orch_kfs_inode_t* orch_kfs_inode_pt;
 
 /* Super block

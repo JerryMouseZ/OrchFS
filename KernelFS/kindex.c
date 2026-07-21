@@ -26,7 +26,7 @@ void node_init(ker_idx_nd_pt idxnd_spt, int64_t init_zipped_layer, int32_t ntype
     for(int i = 0; i < NODE_SON_CAPACITY/64; i++)
     {
         idxnd_spt->virnd_flag[i] = 0;
-        idxnd_spt->bit_lock[i] = 0;
+        idxnd_spt->reserved_words[i] = 0;
     }
     for(int i = 0; i < NODE_SON_CAPACITY; i++)
         idxnd_spt->son_blk_id[i] = EMPTY_BLKID;
@@ -110,5 +110,4 @@ alloc_error:
 //     printf("root cache create error!\n");
 //     exit(0);
 }
-
 

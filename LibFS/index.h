@@ -1,7 +1,6 @@
 #ifndef INDEX_H
 #define INDEX_H
 
-#include <pthread.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,6 +9,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <math.h>
+#include <stddef.h>
 #include <time.h>
 
 #include "../config/config.h"
@@ -53,11 +53,19 @@ struct index_node_t
     int64_t ndtype;                                     // Node type: leafnode, index root...
     int64_t zipped_layer;                               // The number of compressed layers in the index
     uint64_t virnd_flag[2];                             // Is the son node a virtual leaf node
-    uint64_t bit_lock[2];                               // bit lock
+    uint64_t reserved_words[2];                         // fixed on-disk reserved fields
     int64_t son_blk_id[NODE_SON_CAPACITY];              // The block ID of the son node
 };
 typedef struct index_node_t idx_nd_t;
 typedef idx_nd_t* idx_nd_pt;
+
+_Static_assert(offsetof(idx_nd_t, ndtype) == 0, "index ndtype offset");
+_Static_assert(offsetof(idx_nd_t, zipped_layer) == 8, "index layer offset");
+_Static_assert(offsetof(idx_nd_t, virnd_flag) == 16, "index flags offset");
+_Static_assert(offsetof(idx_nd_t, reserved_words) == 32,
+               "index reserved offset");
+_Static_assert(offsetof(idx_nd_t, son_blk_id) == 48, "index sons offset");
+_Static_assert(sizeof(idx_nd_t) <= ORCH_IDX_SIZE, "index node disk size");
 
 struct index_root_t
 {  
@@ -79,6 +87,14 @@ struct virtual_node_t
 };
 typedef struct virtual_node_t vir_nd_t;
 typedef vir_nd_t* vir_nd_pt;
+
+_Static_assert(offsetof(vir_nd_t, nvm_page_id) == 24,
+               "virtual page offset");
+_Static_assert(offsetof(vir_nd_t, buf_meta_id) ==
+                   24 + sizeof(int64_t) * VLN_SLOT_SUM,
+               "virtual bufmeta offset");
+_Static_assert(sizeof(vir_nd_t) <= ORCH_VIRND_SIZE,
+               "virtual node disk size");
 
 struct offset_info_t
 {
@@ -111,32 +127,27 @@ int append_nvm_pages(root_id_t root_id, int64_t inode_id,
 off_info_t query_offset_info(root_id_t root_id, int64_t inode_id, int64_t blk_offset);
 
 
-void change_ssd_blk_info(root_id_t root_id, int64_t inode_id, 
+int change_ssd_blk_info(root_id_t root_id, int64_t inode_id,
                         int64_t blk_offset, int64_t changed_blkid);
 
 
-void change_nvm_page_info(root_id_t root_id, int64_t inode_id, 
-                        int64_t blk_offset, int32_t pos, int64_t changed_pageid);
+int change_nvm_page_info(root_id_t root_id, int64_t inode_id,
+                         int64_t blk_offset, int32_t pos,
+                         int64_t changed_pageid);
 
 
-void change_virnd_to_ssdblk(root_id_t root_id, int64_t inode_id, int64_t blk_offset, 
-                            int64_t changed_blkid);
+int change_virnd_to_ssdblk(root_id_t root_id, int64_t inode_id,
+                           int64_t blk_offset, int64_t changed_blkid);
 
 
 int insert_strata_page_and_metabuf(root_id_t root_id, int64_t inode_id, int64_t blk_offset, 
                                 int32_t pos, nvm_page_id_t nvm_page_id, bufmeta_id_t buf_id);
 
 
-void delete_all_index(root_id_t root_id, int64_t inode_id);
+int delete_all_index(root_id_t root_id, int64_t inode_id);
 
 
 void delete_part_index(root_id_t root_id, int64_t inode_id, int64_t blk_offset);
-
-
-void lock_range_lock(root_id_t root_id, int64_t inode_id, int64_t blk_start_off, int64_t blk_end_off);
-
-
-void unlock_range_lock(root_id_t root_id, int64_t inode_id, int64_t blk_start_off, int64_t blk_end_off);
 
 
 void sync_all_index(idx_nd_pt now_idx_pt, int64_t inode_id);

@@ -4,23 +4,21 @@
 #include "orchfs/async/runtime.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <coroutine>
 #include <cstring>
 #include <deque>
+#include <fcntl.h>
 #include <limits>
-#include <mutex>
 #include <new>
-#include <poll.h>
-#include <thread>
+#include <memory_resource>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <sys/eventfd.h>
-#include <unistd.h>
 
 namespace orchfs::async {
 namespace {
@@ -28,6 +26,7 @@ namespace {
 struct RpcReply {
   IpcDescriptor descriptor;
   std::vector<std::byte> payload;
+  std::size_t payload_size{};
 };
 
 template <typename T>
@@ -158,26 +157,26 @@ class ConnectAwaiter {
       return false;
     }
     worker_ = Runtime::current_worker();
-    try {
-      thread_ = std::thread([this, continuation] {
-        transport_ = ClientTransport::connect(endpoint_, config_, error_);
-        if (!runtime_->schedule(continuation, worker_)) {
-          std::terminate();
-        }
-      });
-    } catch (const std::system_error& error) {
-      error_ = error.code();
+    continuation_ = continuation;
+    auto started = ClientConnector::start(endpoint_, config_);
+    if (!started) {
+      error_ = started.error();
       return false;
-    } catch (...) {
-      std::terminate();
     }
+    connector_.emplace(std::move(started).value());
+    auto registered = runtime_->register_poller(
+        worker_, &ConnectAwaiter::poll, this);
+    if (!registered) {
+      error_ = registered.error();
+      connector_.reset();
+      return false;
+    }
+    registration_ = std::move(registered).value();
     return true;
   }
 
   Result<ClientTransport> await_resume() noexcept {
-    if (thread_.joinable()) {
-      thread_.join();
-    }
+    registration_.reset();
     if (error_) {
       return Result<ClientTransport>::failure(error_);
     }
@@ -189,11 +188,41 @@ class ConnectAwaiter {
   }
 
  private:
+  static Runtime::PollState poll(void* context) noexcept {
+    return static_cast<ConnectAwaiter*>(context)->poll_once();
+  }
+
+  Runtime::PollState poll_once() noexcept {
+    if (!connector_) {
+      return Runtime::PollState::idle;
+    }
+    auto advanced = connector_->poll();
+    if (!advanced) {
+      error_ = advanced.error();
+    } else {
+      auto value = std::move(advanced).value();
+      if (!value) {
+        return Runtime::PollState::busy;
+      }
+      transport_ = std::move(*value);
+    }
+    connector_.reset();
+    registration_.reset();
+    const auto continuation =
+        std::exchange(continuation_, std::coroutine_handle<>{});
+    if (!continuation || !runtime_->schedule(continuation, worker_)) {
+      std::terminate();
+    }
+    return Runtime::PollState::progress;
+  }
+
   Runtime* runtime_;
   std::string endpoint_;
   TransportConfig config_;
   std::size_t worker_{};
-  std::thread thread_;
+  std::optional<ClientConnector> connector_;
+  Runtime::PollRegistration registration_;
+  std::coroutine_handle<> continuation_{};
   ClientTransport transport_;
   std::error_code error_;
 };
@@ -205,14 +234,51 @@ class Session final : public std::enable_shared_from_this<Session> {
   struct Pending {
     IpcDescriptor descriptor;
     std::vector<std::byte> request_payload;
+    std::array<std::byte, sizeof(RpcRequest)> inline_request{};
+    std::span<const std::byte> request_tail;
+    std::span<std::byte> response_target;
     RpcReply reply;
     std::error_code error;
     std::coroutine_handle<> continuation{};
     std::size_t resume_worker{};
     std::uint32_t lane{};
     bool detached{};
+    bool direct_response{};
     bool stop_after_completion{};
+    bool uses_inline_request{};
+
+    std::span<const std::byte> request_head() const noexcept {
+      return uses_inline_request
+                 ? std::span<const std::byte>(inline_request)
+                 : std::span<const std::byte>(request_payload);
+    }
   };
+
+ private:
+  struct InboxNode {
+    std::shared_ptr<Pending> pending;
+    InboxNode* next{};
+  };
+
+  struct LaneState {
+    LaneState(Session& session_value, std::uint32_t lane_value,
+              std::size_t owner_value)
+        : session(&session_value), lane(lane_value), owner(owner_value) {}
+
+    Session* session;
+    std::uint32_t lane;
+    std::size_t owner;
+    Runtime::PollRegistration registration;
+    std::atomic<InboxNode*> inbox{nullptr};
+    std::atomic<std::size_t> active_submitters{0};
+    std::atomic<bool> drained{false};
+    std::pmr::unsynchronized_pool_resource pending_pool;
+    std::pmr::unordered_map<std::uint64_t, std::shared_ptr<Pending>> pending{
+        &pending_pool};
+    std::deque<std::shared_ptr<Pending>> outbound;
+  };
+
+ public:
 
   static Result<std::shared_ptr<Session>> create(Runtime& runtime,
                                                  ClientTransport transport) {
@@ -220,7 +286,10 @@ class Session final : public std::enable_shared_from_this<Session> {
     try {
       session = std::shared_ptr<Session>(
           new Session(runtime, std::move(transport)));
-      session->start();
+      const auto error = session->start();
+      if (error) {
+        return Result<std::shared_ptr<Session>>::failure(error);
+      }
     } catch (const std::bad_alloc&) {
       return Result<std::shared_ptr<Session>>::failure(
           std::make_error_code(std::errc::not_enough_memory));
@@ -237,15 +306,16 @@ class Session final : public std::enable_shared_from_this<Session> {
 
   ~Session() {
     request_stop();
-    if (io_thread_.joinable()) {
-      if (io_thread_.get_id() == std::this_thread::get_id()) {
-        io_thread_.detach();
-      } else {
-        io_thread_.join();
+    control_registration_.reset();
+    for (auto& lane : lanes_) {
+      lane->registration.reset();
+      InboxNode* node =
+          lane->inbox.exchange(nullptr, std::memory_order_acquire);
+      while (node != nullptr) {
+        InboxNode* next = node->next;
+        delete node;
+        node = next;
       }
-    }
-    if (wake_fd_ >= 0) {
-      ::close(wake_fd_);
     }
   }
 
@@ -286,7 +356,9 @@ class Session final : public std::enable_shared_from_this<Session> {
 
   Task<Result<RpcReply>> rpc(
       Opcode opcode, Result<std::vector<std::byte>> encoded_request,
-      bool stop_after_completion = false) {
+      bool stop_after_completion = false,
+      std::span<const std::byte> request_tail = {},
+      std::span<std::byte> response_target = {}) {
     if (!encoded_request) {
       co_return Result<RpcReply>::failure(encoded_request.error());
     }
@@ -294,13 +366,16 @@ class Session final : public std::enable_shared_from_this<Session> {
     auto payload = std::move(encoded_request).value();
     std::shared_ptr<Pending> pending;
     try {
-      pending = std::make_shared<Pending>();
+      pending = make_pending();
       pending->descriptor.opcode = opcode;
       pending->descriptor.flags = DescriptorFlag::request |
                                   DescriptorFlag::has_payload;
       pending->descriptor.payload_length =
-          static_cast<std::uint32_t>(payload.size());
+          static_cast<std::uint32_t>(payload.size() + request_tail.size());
       pending->request_payload = std::move(payload);
+      pending->request_tail = request_tail;
+      pending->response_target = response_target;
+      pending->direct_response = !response_target.empty();
       pending->stop_after_completion = stop_after_completion;
     } catch (const std::bad_alloc&) {
       co_return Result<RpcReply>::failure(
@@ -309,6 +384,42 @@ class Session final : public std::enable_shared_from_this<Session> {
 
     auto reply = co_await PendingAwaiter(shared_from_this(), pending);
     co_return reply;
+  }
+
+  Task<Result<RpcReply>> rpc_header(
+      Opcode opcode, RpcRequest request, std::size_t data_size = 0,
+      std::span<const std::byte> request_tail = {},
+      std::span<std::byte> response_target = {}) {
+    if (sizeof(RpcRequest) > config_.data_slot_size ||
+        data_size != request_tail.size() ||
+        data_size > config_.data_slot_size - sizeof(RpcRequest) ||
+        data_size > std::numeric_limits<std::uint32_t>::max()) {
+      co_return Result<RpcReply>::failure(
+          std::make_error_code(std::errc::message_size));
+    }
+    request.schema_version = kRpcSchemaVersion;
+    request.path1_length = 0;
+    request.path2_length = 0;
+    request.data_length = static_cast<std::uint32_t>(data_size);
+
+    std::shared_ptr<Pending> pending;
+    try {
+      pending = make_pending();
+      std::memcpy(pending->inline_request.data(), &request, sizeof(request));
+      pending->uses_inline_request = true;
+      pending->descriptor.opcode = opcode;
+      pending->descriptor.flags = DescriptorFlag::request |
+                                  DescriptorFlag::has_payload;
+      pending->descriptor.payload_length =
+          static_cast<std::uint32_t>(sizeof(RpcRequest) + data_size);
+      pending->request_tail = request_tail;
+      pending->response_target = response_target;
+      pending->direct_response = !response_target.empty();
+    } catch (const std::bad_alloc&) {
+      co_return Result<RpcReply>::failure(
+          std::make_error_code(std::errc::not_enough_memory));
+    }
+    co_return co_await PendingAwaiter(shared_from_this(), pending);
   }
 
   [[nodiscard]] std::size_t max_payload() const noexcept {
@@ -349,28 +460,90 @@ class Session final : public std::enable_shared_from_this<Session> {
   void request_stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
     accepting_.store(false, std::memory_order_release);
-    wake_io_thread();
+    (void)runtime_->notify(control_owner_);
+    for (const auto& lane : lanes_) {
+      (void)runtime_->notify(lane->owner);
+    }
   }
 
  private:
-  Session(Runtime& runtime, ClientTransport transport)
-      : runtime_(&runtime), transport_(std::move(transport)),
-        config_(transport_.config()) {
-    wake_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (wake_fd_ < 0) {
-      throw std::system_error(errno, std::generic_category(), "eventfd");
+  std::shared_ptr<Pending> make_pending() {
+    if (Runtime::current() == runtime_) {
+      const std::size_t worker = Runtime::current_worker();
+      if (worker != detail::no_worker && !lanes_.empty()) {
+        auto& lane = *lanes_[worker % lanes_.size()];
+        return std::allocate_shared<Pending>(
+            std::pmr::polymorphic_allocator<Pending>(&lane.pending_pool));
+      }
     }
-    outbound_.resize(config_.lane_count);
+    return std::make_shared<Pending>();
   }
 
-  void start() {
-    auto self = shared_from_this();
-    io_thread_ = std::thread([self = std::move(self)] { self->io_loop(); });
+  Session(Runtime& runtime, ClientTransport transport)
+      : runtime_(&runtime), transport_(std::move(transport)),
+        config_(transport_.config()),
+        control_owner_(runtime.owner_for(transport_.client_id())) {
+    lanes_.reserve(config_.lane_count);
+    for (std::uint32_t lane = 0; lane < config_.lane_count; ++lane) {
+      lanes_.push_back(std::make_unique<LaneState>(
+          *this, lane, lane % runtime.worker_count()));
+    }
+  }
+
+  std::error_code start() noexcept {
+    keep_alive_ = shared_from_this();
+    for (auto& lane : lanes_) {
+      auto registered = runtime_->register_poller(
+          lane->owner, &Session::poll_lane, lane.get());
+      if (!registered) {
+        const auto error = registered.error();
+        request_stop();
+        for (auto& registered_lane : lanes_) {
+          registered_lane->registration.reset();
+        }
+        keep_alive_.reset();
+        return error;
+      }
+      lane->registration = std::move(registered).value();
+    }
+    auto registered = runtime_->register_poller(
+        control_owner_, &Session::poll_control, this);
+    if (!registered) {
+      const auto error = registered.error();
+      request_stop();
+      for (auto& lane : lanes_) {
+        lane->registration.reset();
+      }
+      keep_alive_.reset();
+      return error;
+    }
+    control_registration_ = std::move(registered).value();
+    return {};
   }
 
   bool enqueue(const std::shared_ptr<Pending>& pending) noexcept {
-    if (pending->request_payload.size() > config_.data_slot_size) {
+    const auto request_head = pending->request_head();
+    if (request_head.size() > config_.data_slot_size ||
+        pending->request_tail.size() >
+            config_.data_slot_size - request_head.size()) {
       pending->error = std::make_error_code(std::errc::message_size);
+      return false;
+    }
+    if (pending->lane >= lanes_.size()) {
+      pending->error = std::make_error_code(std::errc::invalid_argument);
+      return false;
+    }
+
+    auto& lane = *lanes_[pending->lane];
+    lane.active_submitters.fetch_add(1, std::memory_order_acq_rel);
+    const auto finish_submit = [&lane] {
+      if (lane.active_submitters.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        lane.active_submitters.notify_all();
+      }
+    };
+    if (!accepting_.load(std::memory_order_acquire)) {
+      pending->error = std::make_error_code(std::errc::not_connected);
+      finish_submit();
       return false;
     }
 
@@ -378,36 +551,72 @@ class Session final : public std::enable_shared_from_this<Session> {
     pending->descriptor.session_generation = transport_.session_generation();
     pending->descriptor.request_id =
         next_request_id_.fetch_add(1, std::memory_order_relaxed);
+    if (pending->descriptor.request_id == 0) {
+      pending->descriptor.request_id =
+          next_request_id_.fetch_add(1, std::memory_order_relaxed);
+    }
     pending->descriptor.resume_worker =
         static_cast<std::uint32_t>(pending->resume_worker);
 
-    bool inserted = false;
-    try {
-      std::lock_guard lock(queue_mutex_);
-      // Recheck while holding the same mutex used by fail_all().  Otherwise a
-      // request can observe accepting=true, race the I/O thread's terminal
-      // cleanup, and be inserted after that thread has exited.
-      if (!accepting_.load(std::memory_order_acquire)) {
-        pending->error = std::make_error_code(std::errc::not_connected);
+    if (Runtime::current() == runtime_ &&
+        Runtime::current_worker() == lane.owner) {
+      outstanding_.fetch_add(1, std::memory_order_acq_rel);
+      try {
+        if (!lane.pending.emplace(
+                 pending->descriptor.request_id, pending).second) {
+          pending->error =
+              std::make_error_code(std::errc::device_or_resource_busy);
+          outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+          finish_submit();
+          return false;
+        }
+        auto error = transport_.try_submit_scattered(
+            lane.lane, pending->descriptor, request_head,
+            pending->request_tail, nullptr);
+        if (error == make_error_code(TransportErrc::would_block)) {
+          lane.outbound.push_back(pending);
+        } else if (error) {
+          lane.pending.erase(pending->descriptor.request_id);
+          pending->error = error;
+          outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+          finish_submit();
+          return false;
+        }
+      } catch (const std::bad_alloc&) {
+        lane.pending.erase(pending->descriptor.request_id);
+        pending->error = std::make_error_code(std::errc::not_enough_memory);
+        outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+        finish_submit();
         return false;
+      } catch (...) {
+        std::terminate();
       }
-      inserted = pending_.emplace(pending->descriptor.request_id, pending).second;
-      if (!inserted) {
-        pending->error = std::make_error_code(std::errc::device_or_resource_busy);
-        return false;
-      }
-      outbound_[pending->lane].push_back(pending);
-    } catch (const std::bad_alloc&) {
-      if (inserted) {
-        std::lock_guard lock(queue_mutex_);
-        pending_.erase(pending->descriptor.request_id);
-      }
-      pending->error = std::make_error_code(std::errc::not_enough_memory);
-      return false;
-    } catch (...) {
-      std::terminate();
+      finish_submit();
+      return true;
     }
-    wake_io_thread();
+
+    auto* node = new (std::nothrow) InboxNode{.pending = pending};
+    if (node == nullptr) {
+      pending->error = std::make_error_code(std::errc::not_enough_memory);
+      finish_submit();
+      return false;
+    }
+    if (!accepting_.load(std::memory_order_acquire)) {
+      delete node;
+      pending->error = std::make_error_code(std::errc::not_connected);
+      finish_submit();
+      return false;
+    }
+    outstanding_.fetch_add(1, std::memory_order_acq_rel);
+    InboxNode* head = lane.inbox.load(std::memory_order_relaxed);
+    do {
+      node->next = head;
+    } while (!lane.inbox.compare_exchange_weak(
+        head, node, std::memory_order_release, std::memory_order_relaxed));
+    finish_submit();
+    if (!runtime_->notify(lane.owner)) {
+      request_stop();
+    }
     return true;
   }
 
@@ -450,149 +659,168 @@ class Session final : public std::enable_shared_from_this<Session> {
       if (!enqueue_detached(Opcode::shutdown_session, kInvalidRemoteHandle,
                             true)) {
         // There is no remaining Client or File owner to retry this request.
-        // Break the I/O thread's self-ownership cycle and let transport teardown
+        // Break the session's self-ownership cycle and let transport teardown
         // make the server clean up the abandoned session.
         request_stop();
       }
     }
   }
 
-  void wake_io_thread() noexcept {
-    if (wake_fd_ < 0) {
-      return;
-    }
-    const std::uint64_t one = 1;
-    const auto result = ::write(wake_fd_, &one, sizeof(one));
-    (void)result;
-  }
-
-  void drain_wake_fd() noexcept {
-    std::uint64_t value;
-    while (::read(wake_fd_, &value, sizeof(value)) == sizeof(value)) {
-    }
-  }
-
   void finish_pending(const std::shared_ptr<Pending>& pending,
                       std::error_code error, IpcDescriptor descriptor = {},
-                      std::vector<std::byte> payload = {}) noexcept {
+                      std::vector<std::byte> payload = {},
+                      std::size_t direct_payload_size = 0) noexcept {
     pending->error = error;
     pending->reply.descriptor = descriptor;
     pending->reply.payload = std::move(payload);
+    pending->reply.payload_size = pending->reply.payload.empty()
+                                      ? direct_payload_size
+                                      : pending->reply.payload.size();
     if (pending->continuation) {
       if (!runtime_->schedule(pending->continuation, pending->resume_worker)) {
         std::terminate();
       }
     }
+    outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+    (void)runtime_->notify(control_owner_);
     if (pending->stop_after_completion) {
       request_stop();
     }
   }
 
-  void fail_all(std::error_code error) noexcept {
+  void fail_lane(LaneState& lane, std::error_code error) noexcept {
     std::vector<std::shared_ptr<Pending>> failed;
-    {
-      std::lock_guard lock(queue_mutex_);
-      failed.reserve(pending_.size());
-      for (auto& [id, pending] : pending_) {
+    try {
+      failed.reserve(lane.pending.size());
+      for (auto& [id, pending] : lane.pending) {
         (void)id;
         failed.push_back(std::move(pending));
       }
-      pending_.clear();
-      for (auto& queue : outbound_) {
-        queue.clear();
-      }
+    } catch (...) {
+      std::terminate();
     }
+    lane.pending.clear();
+    lane.outbound.clear();
     for (auto& pending : failed) {
       finish_pending(pending, error);
     }
   }
 
-  void pump_submissions() noexcept {
-    for (std::uint32_t lane = 0; lane < config_.lane_count; ++lane) {
-      for (;;) {
-        std::shared_ptr<Pending> pending;
-        {
-          std::lock_guard lock(queue_mutex_);
-          if (outbound_[lane].empty()) {
-            break;
-          }
-          pending = outbound_[lane].front();
-        }
-
-        auto error = transport_.try_submit(
-            lane, pending->descriptor, pending->request_payload,
-            nullptr);
-        if (error == make_error_code(TransportErrc::would_block)) {
-          break;
-        }
-        {
-          std::lock_guard lock(queue_mutex_);
-          if (!outbound_[lane].empty() &&
-              outbound_[lane].front() == pending) {
-            outbound_[lane].pop_front();
-          }
-          if (error) {
-            pending_.erase(pending->descriptor.request_id);
-          }
-        }
-        if (error) {
-          finish_pending(pending, error);
-        }
-      }
+  bool drain_inbox(LaneState& lane) noexcept {
+    InboxNode* stack =
+        lane.inbox.exchange(nullptr, std::memory_order_acquire);
+    const bool progress = stack != nullptr;
+    InboxNode* fifo = nullptr;
+    while (stack != nullptr) {
+      InboxNode* next = stack->next;
+      stack->next = fifo;
+      fifo = stack;
+      stack = next;
     }
-  }
-
-  void pump_completions(std::uint32_t lane,
-                        std::vector<std::byte>& buffer) noexcept {
-    std::uint64_t notifications{};
-    const auto notify_error =
-        transport_.drain_completion_notifications(lane, notifications);
-    if (notify_error &&
-        notify_error != make_error_code(TransportErrc::would_block)) {
-      fail_all(notify_error);
-      request_stop();
-      return;
-    }
-
-    for (;;) {
-      IpcDescriptor descriptor;
-      std::size_t payload_size{};
-      auto error = transport_.try_receive_completion(
-          lane, descriptor, buffer, payload_size);
-      if (error == make_error_code(TransportErrc::would_block)) {
-        return;
-      }
-      if (error == make_error_code(TransportErrc::buffer_too_small)) {
-        try {
-          buffer.resize(payload_size);
-        } catch (...) {
-          fail_all(std::make_error_code(std::errc::not_enough_memory));
-          request_stop();
-          return;
-        }
+    while (fifo != nullptr) {
+      InboxNode* next = fifo->next;
+      auto pending = std::move(fifo->pending);
+      delete fifo;
+      fifo = next;
+      if (!accepting_.load(std::memory_order_acquire)) {
+        finish_pending(pending,
+                       std::make_error_code(std::errc::not_connected));
         continue;
       }
-      if (error) {
-        fail_all(error);
-        request_stop();
-        return;
-      }
-
-      std::shared_ptr<Pending> pending;
-      {
-        std::lock_guard lock(queue_mutex_);
-        auto found = pending_.find(descriptor.request_id);
-        if (found == pending_.end()) {
+      try {
+        const bool inserted = lane.pending.emplace(
+            pending->descriptor.request_id, pending).second;
+        if (!inserted) {
+          finish_pending(
+              pending,
+              std::make_error_code(std::errc::device_or_resource_busy));
           continue;
         }
-        pending = std::move(found->second);
-        pending_.erase(found);
+        try {
+          lane.outbound.push_back(pending);
+        } catch (...) {
+          lane.pending.erase(pending->descriptor.request_id);
+          throw;
+        }
+      } catch (const std::bad_alloc&) {
+        finish_pending(pending,
+                       std::make_error_code(std::errc::not_enough_memory));
+      } catch (...) {
+        std::terminate();
+      }
+    }
+    return progress;
+  }
+
+  bool pump_submissions(LaneState& lane) noexcept {
+    bool progress = false;
+    for (;;) {
+      if (lane.outbound.empty()) {
+        break;
+      }
+      auto pending = lane.outbound.front();
+
+      auto error = transport_.try_submit_scattered(
+          lane.lane, pending->descriptor, pending->request_head(),
+          pending->request_tail, nullptr);
+      if (error == make_error_code(TransportErrc::would_block)) {
+        break;
+      }
+      progress = true;
+      if (!lane.outbound.empty() && lane.outbound.front() == pending) {
+        lane.outbound.pop_front();
+      }
+      if (error) {
+        lane.pending.erase(pending->descriptor.request_id);
+        finish_pending(pending, error);
+      }
+    }
+    return progress;
+  }
+
+  bool pump_completions(LaneState& lane) noexcept {
+    bool progress = false;
+    for (;;) {
+      ReceivedIpcSlot completion;
+      auto error = transport_.try_acquire_completion(
+          lane.lane, completion);
+      if (error == make_error_code(TransportErrc::would_block)) {
+        return progress;
+      }
+      progress = true;
+      if (error) {
+        fail_lane(lane, error);
+        request_stop();
+        return true;
+      }
+
+      const auto descriptor = completion.descriptor();
+      const auto received_payload = completion.payload();
+      auto found = lane.pending.find(descriptor.request_id);
+      if (found == lane.pending.end()) {
+        continue;
+      }
+      auto pending = std::move(found->second);
+      lane.pending.erase(found);
+      if (pending->direct_response) {
+        if (received_payload.size() > pending->response_target.size()) {
+          finish_pending(
+              pending, std::make_error_code(std::errc::protocol_error));
+          continue;
+        }
+        if (!received_payload.empty()) {
+          std::memcpy(pending->response_target.data(), received_payload.data(),
+                      received_payload.size());
+        }
+        finish_pending(pending, {}, descriptor, {}, received_payload.size());
+        continue;
       }
       std::vector<std::byte> payload;
       try {
-        payload.resize(payload_size);
-        if (payload_size != 0) {
-          std::memcpy(payload.data(), buffer.data(), payload_size);
+        payload.resize(received_payload.size());
+        if (!received_payload.empty()) {
+          std::memcpy(payload.data(), received_payload.data(),
+                      received_payload.size());
         }
       } catch (...) {
         finish_pending(pending,
@@ -603,81 +831,106 @@ class Session final : public std::enable_shared_from_this<Session> {
     }
   }
 
-  bool empty() noexcept {
-    std::lock_guard lock(queue_mutex_);
-    return pending_.empty();
+  static bool lane_empty(const LaneState& lane) noexcept {
+    return lane.pending.empty() && lane.outbound.empty() &&
+           lane.inbox.load(std::memory_order_acquire) == nullptr &&
+           lane.active_submitters.load(std::memory_order_acquire) == 0;
   }
 
-  void io_loop() noexcept {
-    std::vector<pollfd> poll_fds;
-    std::vector<std::byte> payload_buffer;
-    try {
-      poll_fds.reserve(config_.lane_count + 1);
-      poll_fds.push_back({wake_fd_, POLLIN, 0});
-      for (std::uint32_t lane = 0; lane < config_.lane_count; ++lane) {
-        poll_fds.push_back(
-            {transport_.completion_event_fd(lane), POLLIN, 0});
-      }
-      payload_buffer.resize(config_.data_slot_size);
-    } catch (...) {
-      fail_all(std::make_error_code(std::errc::not_enough_memory));
-      request_stop();
-      return;
+  static Runtime::PollState poll_lane(void* context) noexcept {
+    auto& lane = *static_cast<LaneState*>(context);
+    return lane.session->poll_lane_once(lane);
+  }
+
+  Runtime::PollState poll_lane_once(LaneState& lane) noexcept {
+    if (lane.drained.load(std::memory_order_acquire)) {
+      return Runtime::PollState::idle;
     }
+    bool progress = drain_inbox(lane);
+    progress |= pump_submissions(lane);
+    progress |= pump_completions(lane);
+    if (stop_requested_.load(std::memory_order_acquire)) {
+      accepting_.store(false, std::memory_order_release);
+      if (lane.active_submitters.load(std::memory_order_acquire) == 0) {
+        progress |= drain_inbox(lane);
+        if (!lane.pending.empty()) {
+          fail_lane(
+              lane,
+              peer_failed_.load(std::memory_order_acquire)
+                  ? std::make_error_code(std::errc::connection_reset)
+                  : std::make_error_code(std::errc::not_connected));
+          progress = true;
+        }
+      }
+      if (lane_empty(lane)) {
+        lane.drained.store(true, std::memory_order_release);
+        lane.registration.reset();
+        (void)runtime_->notify(control_owner_);
+        return Runtime::PollState::progress;
+      }
+    }
+    if (progress) {
+      return Runtime::PollState::progress;
+    }
+    return lane.pending.empty() ? Runtime::PollState::idle
+                                : Runtime::PollState::busy;
+  }
 
-    for (;;) {
-      pump_submissions();
-      for (std::uint32_t lane = 0; lane < config_.lane_count; ++lane) {
-        pump_completions(lane, payload_buffer);
-      }
+  static Runtime::PollState poll_control(void* context) noexcept {
+    return static_cast<Session*>(context)->poll_control_once();
+  }
 
-      if (!transport_.peer_alive()) {
-        request_stop();
-        fail_all(std::make_error_code(std::errc::connection_reset));
-        break;
-      }
-      if (stop_requested_.load(std::memory_order_acquire) && empty()) {
-        break;
-      }
-
-      const int result = ::poll(poll_fds.data(), poll_fds.size(), 2);
-      if (result < 0 && errno != EINTR) {
-        request_stop();
-        fail_all(std::error_code(errno, std::generic_category()));
-        break;
-      }
-      if (poll_fds[0].revents & POLLIN) {
-        drain_wake_fd();
-      }
-      for (auto& fd : poll_fds) {
-        fd.revents = 0;
-      }
+  Runtime::PollState poll_control_once() noexcept {
+    if (finished_.load(std::memory_order_acquire)) {
+      return Runtime::PollState::idle;
+    }
+    constexpr std::uint32_t kHealthPollMask = 1023;
+    const bool idle = outstanding_.load(std::memory_order_acquire) == 0;
+    if (idle || (++health_poll_ticks_ & kHealthPollMask) == 0) {
       transport_.heartbeat();
+      if (!transport_.peer_alive()) {
+        peer_failed_.store(true, std::memory_order_release);
+        request_stop();
+      }
     }
-
-    // Make every terminal path reject future RPCs. request_stop() is
-    // idempotent and closes the enqueue-vs-fail_all race via enqueue's locked
-    // accepting check above.
-    request_stop();
-    fail_all(std::make_error_code(std::errc::not_connected));
+    if (!stop_requested_.load(std::memory_order_acquire)) {
+      return idle ? Runtime::PollState::idle : Runtime::PollState::busy;
+    }
+    const bool all_drained = std::all_of(
+        lanes_.begin(), lanes_.end(), [](const auto& lane) {
+          return lane->drained.load(std::memory_order_acquire);
+        });
+    if (!all_drained) {
+      return Runtime::PollState::busy;
+    }
+    finished_.store(true, std::memory_order_release);
+    finished_.notify_all();
+    // keep_alive_ may be the last owner. Hold the session until this callback
+    // returns, while keeping shared_ptr traffic off the steady polling path.
+    auto self = shared_from_this();
+    control_registration_.reset();
+    keep_alive_.reset();
+    return Runtime::PollState::progress;
   }
 
   Runtime* runtime_;
   ClientTransport transport_;
   TransportConfig config_;
-  int wake_fd_{-1};
-  std::thread io_thread_;
+  std::size_t control_owner_{};
+  Runtime::PollRegistration control_registration_;
+  std::shared_ptr<Session> keep_alive_;
+  std::vector<std::unique_ptr<LaneState>> lanes_;
 
   std::atomic<bool> accepting_{true};
   std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> peer_failed_{false};
+  std::atomic<bool> finished_{false};
   std::atomic<bool> client_alive_{true};
   std::atomic<bool> shutdown_enqueued_{false};
   std::atomic<std::size_t> open_handles_{0};
+  std::atomic<std::size_t> outstanding_{0};
   std::atomic<std::uint64_t> next_request_id_{1};
-
-  std::mutex queue_mutex_;
-  std::unordered_map<std::uint64_t, std::shared_ptr<Pending>> pending_;
-  std::vector<std::deque<std::shared_ptr<Pending>>> outbound_;
+  std::uint32_t health_poll_ticks_{};
 };
 
 Client::Client(std::shared_ptr<Session> session) noexcept
@@ -995,8 +1248,8 @@ Task<Result<std::size_t>> File::read_unlocked(std::span<std::byte> buffer) {
     request.handle = handle_;
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::implicit_offset);
-    auto reply = co_await session_->rpc(
-        Opcode::read, make_request(session_->max_payload(), request));
+    auto reply = co_await session_->rpc_header(
+        Opcode::read, request, 0, {}, buffer.subspan(completed, chunk));
     if (!reply) {
       co_return Result<std::size_t>::failure(reply.error());
     }
@@ -1004,11 +1257,14 @@ Task<Result<std::size_t>> File::read_unlocked(std::span<std::byte> buffer) {
       co_return Result<std::size_t>::failure(error);
     }
     const std::size_t bytes = reply.value().descriptor.result_length;
-    if (bytes > chunk || reply.value().payload.size() != bytes) {
+    if (bytes > chunk || reply.value().payload_size != bytes) {
       co_return Result<std::size_t>::failure(
           std::make_error_code(std::errc::protocol_error));
     }
-    std::memcpy(buffer.data() + completed, reply.value().payload.data(), bytes);
+    if (!reply.value().payload.empty()) {
+      std::memcpy(buffer.data() + completed, reply.value().payload.data(),
+                  bytes);
+    }
     completed += bytes;
     if (bytes != chunk) {
       break;
@@ -1045,10 +1301,8 @@ Task<Result<std::size_t>> File::write_unlocked(
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::implicit_offset) |
                     static_cast<std::uint32_t>(RpcRequestFlag::data_follows);
-    auto reply = co_await session_->rpc(
-        Opcode::write,
-        make_request(session_->max_payload(), request, {}, {},
-                     buffer.subspan(completed, chunk)));
+    auto reply = co_await session_->rpc_header(
+        Opcode::write, request, chunk, buffer.subspan(completed, chunk));
     if (!reply) {
       co_return Result<std::size_t>::failure(reply.error());
     }
@@ -1087,8 +1341,8 @@ Task<Result<std::size_t>> File::read_at(std::uint64_t offset,
     request.handle = handle_;
     request.offset = static_cast<std::int64_t>(offset + completed);
     request.length = chunk;
-    auto reply = co_await session_->rpc(
-        Opcode::read_at, make_request(session_->max_payload(), request));
+    auto reply = co_await session_->rpc_header(
+        Opcode::read_at, request, 0, {}, buffer.subspan(completed, chunk));
     if (!reply) {
       co_return Result<std::size_t>::failure(reply.error());
     }
@@ -1096,11 +1350,14 @@ Task<Result<std::size_t>> File::read_at(std::uint64_t offset,
       co_return Result<std::size_t>::failure(error);
     }
     const std::size_t bytes = reply.value().descriptor.result_length;
-    if (bytes > chunk || reply.value().payload.size() != bytes) {
+    if (bytes > chunk || reply.value().payload_size != bytes) {
       co_return Result<std::size_t>::failure(
           std::make_error_code(std::errc::protocol_error));
     }
-    std::memcpy(buffer.data() + completed, reply.value().payload.data(), bytes);
+    if (!reply.value().payload.empty()) {
+      std::memcpy(buffer.data() + completed, reply.value().payload.data(),
+                  bytes);
+    }
     completed += bytes;
     if (bytes != chunk) {
       break;
@@ -1129,10 +1386,8 @@ Task<Result<std::size_t>> File::write_at(
     request.offset = static_cast<std::int64_t>(offset + completed);
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::data_follows);
-    auto reply = co_await session_->rpc(
-        Opcode::write_at,
-        make_request(session_->max_payload(), request, {}, {},
-                     buffer.subspan(completed, chunk)));
+    auto reply = co_await session_->rpc_header(
+        Opcode::write_at, request, chunk, buffer.subspan(completed, chunk));
     if (!reply) {
       co_return Result<std::size_t>::failure(reply.error());
     }
@@ -1260,7 +1515,7 @@ Task<Result<int>> File::get_flags() {
   }
   RpcRequest request;
   request.handle = handle_;
-  request.value = -1;
+  request.value = F_GETFL;
   auto reply = co_await session_->rpc(
       Opcode::set_flags, make_request(session_->max_payload(), request));
   if (!reply) {
@@ -1279,7 +1534,8 @@ Task<Result<void>> File::set_flags(int flags) {
   }
   RpcRequest request;
   request.handle = handle_;
-  request.value = flags;
+  request.value = F_SETFL;
+  request.open_flags = flags;
   auto reply = co_await session_->rpc(
       Opcode::set_flags, make_request(session_->max_payload(), request));
   if (!reply) {

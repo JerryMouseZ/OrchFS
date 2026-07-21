@@ -1,349 +1,215 @@
 #include "meta_cache.h"
+
 #include "index.h"
-#include "../util/hashtable.h"
-#include "../util/orch_list.h"
 #include "../config/config.h"
 #include "../KernelFS/device.h"
 
-#ifdef __cplusplus       
-extern "C"{
-#endif
+#include <errno.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-
-void init_metadata_cache()
+static int64_t cache_base(int cache_id)
 {
-    cache_data[INODE_CACHE].seg_blknum = INODE_CACHE_EXTBLKS;
-    cache_data[INODE_CACHE].unit_size = ORCH_INODE_SIZE;
-    cache_data[INODE_CACHE].seg_num = MAX_INODE_NUM / INODE_CACHE_EXTBLKS;
-    int64_t this_seg_num = cache_data[INODE_CACHE].seg_num;
-    cache_data[INODE_CACHE].sync_flist = malloc(sizeof(int32_t) * this_seg_num);
-    cache_data[INODE_CACHE].meta_memsp_pt = malloc(sizeof(char*) * this_seg_num);
-    cache_data[INODE_CACHE].seg_lock_pt = malloc(sizeof(pthread_spinlock_t) * this_seg_num);
-    for(int64_t i = 0; i < this_seg_num; i++)
-    {
-        cache_data[INODE_CACHE].meta_memsp_pt[i] = NULL;
-        cache_data[INODE_CACHE].sync_flist[i] = 0;
-        pthread_spin_init(cache_data[INODE_CACHE].seg_lock_pt + i, PTHREAD_PROCESS_SHARED);
-    }
+    if(cache_id == INODE_CACHE)
+        return OFFSET_INODE;
+    if(cache_id == IDXND_CACHE)
+        return OFFSET_INDEX;
+    return OFFSET_VIRND;
+}
 
-    cache_data[IDXND_CACHE].seg_blknum = IDXND_CACHE_EXTBLKS;
-    cache_data[IDXND_CACHE].unit_size = ORCH_IDX_SIZE;
-    cache_data[IDXND_CACHE].seg_num = MAX_INDEX_NUM / IDXND_CACHE_EXTBLKS;
-    this_seg_num = cache_data[IDXND_CACHE].seg_num;
-    cache_data[IDXND_CACHE].sync_flist = malloc(sizeof(int32_t) * this_seg_num);
-    cache_data[IDXND_CACHE].meta_memsp_pt = malloc(sizeof(char*) * this_seg_num);
-    cache_data[IDXND_CACHE].seg_lock_pt = malloc(sizeof(pthread_spinlock_t) * this_seg_num);
-    for(int64_t i = 0; i < this_seg_num; i++)
+static char* load_segment(int cache_id, int64_t segment)
+{
+    cache_data_pt cache = cache_data + cache_id;
+    if(segment < 0 || segment >= cache->seg_num)
     {
-        cache_data[IDXND_CACHE].meta_memsp_pt[i] = NULL;
-        cache_data[IDXND_CACHE].sync_flist[i] = 0;
-        pthread_spin_init(cache_data[IDXND_CACHE].seg_lock_pt + i, PTHREAD_PROCESS_SHARED);
+        errno = EINVAL;
+        return NULL;
     }
-    // fprintf(stderr,"index create!\n");
+    char* current = atomic_load_explicit(
+        cache->meta_memsp_pt + segment, memory_order_acquire);
+    if(current != NULL)
+        return current;
 
-    cache_data[VIRND_CACHE].seg_blknum = VIRND_CACHE_EXTBLKS;
-    cache_data[VIRND_CACHE].unit_size = ORCH_VIRND_SIZE;
-    cache_data[VIRND_CACHE].seg_num = MAX_VIRND_NUM / VIRND_CACHE_EXTBLKS;
-    this_seg_num = cache_data[VIRND_CACHE].seg_num;
-    cache_data[VIRND_CACHE].sync_flist = malloc(sizeof(int32_t) * this_seg_num);
-    cache_data[VIRND_CACHE].meta_memsp_pt = malloc(sizeof(char*) * this_seg_num);
-    cache_data[VIRND_CACHE].seg_lock_pt = malloc(sizeof(pthread_spinlock_t) * this_seg_num);
-    for(int64_t i = 0; i < this_seg_num; i++)
+    const int64_t length = cache->unit_size * cache->seg_blknum;
+    char* loaded = malloc((size_t)length);
+    if(loaded == NULL)
     {
-        cache_data[VIRND_CACHE].meta_memsp_pt[i] = NULL;
-        cache_data[VIRND_CACHE].sync_flist[i] = 0;
-        pthread_spin_init(cache_data[VIRND_CACHE].seg_lock_pt + i, PTHREAD_PROCESS_SHARED);
+        errno = ENOMEM;
+        return NULL;
     }
-    // fprintf(stderr,"virnd create!\n");
-    return;
-// mem_error:
-//     printf("malloc error! -- init_metadata_memory\n");
-//     exit(0);
+    nvm_read(loaded, length, cache_base(cache_id) + segment * length);
+    char* expected = NULL;
+    if(!atomic_compare_exchange_strong_explicit(
+           cache->meta_memsp_pt + segment, &expected, loaded,
+           memory_order_release, memory_order_acquire))
+    {
+        free(loaded);
+        loaded = expected;
+    }
+    return loaded;
+}
+
+static int initialize_cache(int cache_id, int64_t unit_size,
+                            int64_t segment_blocks, int64_t block_count)
+{
+    cache_data_pt cache = cache_data + cache_id;
+    cache->seg_blknum = segment_blocks;
+    cache->unit_size = unit_size;
+    cache->seg_num = block_count / segment_blocks;
+    cache->meta_memsp_pt = calloc(
+        (size_t)cache->seg_num, sizeof(*cache->meta_memsp_pt));
+    if(cache->meta_memsp_pt == NULL)
+    {
+        cache->seg_num = 0;
+        return ENOMEM;
+    }
+    for(int64_t segment = 0; segment < cache->seg_num; ++segment)
+        atomic_init(cache->meta_memsp_pt + segment, NULL);
+    return 0;
+}
+
+int init_metadata_cache(void)
+{
+    int error = initialize_cache(INODE_CACHE, ORCH_INODE_SIZE,
+                                 INODE_CACHE_EXTBLKS, MAX_INODE_NUM);
+    if(error == 0)
+        error = initialize_cache(IDXND_CACHE, ORCH_IDX_SIZE,
+                                 IDXND_CACHE_EXTBLKS, MAX_INDEX_NUM);
+    if(error == 0)
+        error = initialize_cache(VIRND_CACHE, ORCH_VIRND_SIZE,
+                                 VIRND_CACHE_EXTBLKS, MAX_VIRND_NUM);
+    if(error != 0)
+        close_metadata_cache();
+    return error;
+}
+
+static void sync_unit(int cache_id, int64_t block)
+{
+    cache_data_pt cache = cache_data + cache_id;
+    const int64_t segment = block / cache->seg_blknum;
+    const int64_t position = block % cache->seg_blknum;
+    char* memory = load_segment(cache_id, segment);
+    if(memory == NULL)
+        return;
+    nvm_write(memory + position * cache->unit_size, cache->unit_size,
+              cache_base(cache_id) + block * cache->unit_size);
 }
 
 void sync_inode(int64_t inode_id)
 {
-    int64_t seg_id = inode_id / INODE_CACHE_EXTBLKS;
-    int64_t seg_pos = inode_id % INODE_CACHE_EXTBLKS;
-    assert(seg_id < cache_data[INODE_CACHE].seg_num);
-    pthread_spin_lock(cache_data[INODE_CACHE].seg_lock_pt + seg_id);
-    int64_t wback_len = ORCH_INODE_SIZE * INODE_CACHE_EXTBLKS;
-    int64_t wdev_addr = OFFSET_INODE + seg_id*wback_len + seg_pos*ORCH_INODE_SIZE;
-    int64_t wmem_addr = (int64_t)cache_data[INODE_CACHE].meta_memsp_pt[seg_id] + seg_pos*ORCH_INODE_SIZE;
-    write_data_to_devs((void*)wmem_addr, ORCH_INODE_SIZE, wdev_addr);
-    pthread_spin_unlock(cache_data[INODE_CACHE].seg_lock_pt + seg_id);
+    sync_unit(INODE_CACHE, inode_id);
 }
 
-void sync_index_blk(int64_t indexid)
+void sync_index_blk(int64_t index_id)
 {
-    int64_t seg_id = indexid / IDXND_CACHE_EXTBLKS;
-    int64_t seg_pos = indexid % IDXND_CACHE_EXTBLKS;
-    assert(seg_id < cache_data[IDXND_CACHE].seg_num);
-    pthread_spin_lock(cache_data[IDXND_CACHE].seg_lock_pt + seg_id);
-    int64_t wback_len = ORCH_IDX_SIZE * IDXND_CACHE_EXTBLKS;
-    int64_t wdev_addr = OFFSET_INDEX + seg_id*wback_len + seg_pos*ORCH_IDX_SIZE;
-    int64_t wmem_addr = (int64_t)cache_data[IDXND_CACHE].meta_memsp_pt[seg_id] + seg_pos*ORCH_IDX_SIZE;
-    write_data_to_devs((void*)wmem_addr, ORCH_IDX_SIZE, wdev_addr);
-    pthread_spin_unlock(cache_data[IDXND_CACHE].seg_lock_pt + seg_id);
-    // if(indexid == 0)
-    // {
-    //     idx_root_pt sync_root_pt1 = wmem_addr;
-    //     // printf("check info: %lld %lld %lld %lld\n", seg_id, seg_pos, wmem_addr, 
-    //     //     sync_root_pt1->idx_entry_blkid);
-    // }
+    sync_unit(IDXND_CACHE, index_id);
 }
 
-void sync_virnd_blk(int64_t virnodeid)
+void sync_virnd_blk(int64_t virtual_node_id)
 {
-    int64_t seg_id = virnodeid / VIRND_CACHE_EXTBLKS;
-    int64_t seg_pos = virnodeid % VIRND_CACHE_EXTBLKS;
-    assert(seg_id < cache_data[VIRND_CACHE].seg_num);
-    pthread_spin_lock(cache_data[VIRND_CACHE].seg_lock_pt + seg_id);
-    int64_t wback_len = ORCH_VIRND_SIZE * VIRND_CACHE_EXTBLKS;
-    int64_t wdev_addr = OFFSET_VIRND+ seg_id*wback_len + seg_pos*ORCH_VIRND_SIZE;
-    int64_t wmem_addr = (int64_t)cache_data[VIRND_CACHE].meta_memsp_pt[seg_id] + seg_pos*ORCH_VIRND_SIZE;
-    write_data_to_devs((void*)wmem_addr, ORCH_VIRND_SIZE, wdev_addr);
-    pthread_spin_unlock(cache_data[VIRND_CACHE].seg_lock_pt + seg_id);
+    sync_unit(VIRND_CACHE, virtual_node_id);
 }
 
-
-void close_metadata_cache()
+void close_metadata_cache(void)
 {
-    for(int i = MIN_CACHE_ID; i <= MAX_CACHE_ID; i++)
+    for(int cache_id = MIN_CACHE_ID; cache_id <= MAX_CACHE_ID; ++cache_id)
     {
-        int64_t this_seg_num = cache_data[i].seg_num;
-        // fprintf(stderr,"begin %d %lld\n",i,this_seg_num);
-        for(int64_t j = 0; j < this_seg_num; j++)
+        cache_data_pt cache = cache_data + cache_id;
+        const int64_t length = cache->unit_size * cache->seg_blknum;
+        for(int64_t segment = 0; segment < cache->seg_num; ++segment)
         {
-            // fprintf(stderr,"idx %d\n",j);
-            pthread_spin_lock(cache_data[i].seg_lock_pt + j);
-            if(cache_data[i].meta_memsp_pt[j] != NULL)
-            {
-                // 写回数据
-                int64_t wback_len = 0, wdev_addr = 0;
-                if(i == INODE_CACHE)
-                {
-                    wback_len = ORCH_INODE_SIZE * INODE_CACHE_EXTBLKS;
-                    wdev_addr = OFFSET_INODE+ j*wback_len;
-                }
-                else if(i == IDXND_CACHE)
-                {
-                    wback_len = ORCH_IDX_SIZE * IDXND_CACHE_EXTBLKS;
-                    wdev_addr = OFFSET_INDEX+ j*wback_len;
-                }
-                else if(i == VIRND_CACHE)
-                {
-                    wback_len = ORCH_VIRND_SIZE * VIRND_CACHE_EXTBLKS;
-                    wdev_addr = OFFSET_VIRND+ j*wback_len;
-                }
-                // printf("waddr: %lld %lld\n",wback_len, wdev_addr);
-                write_data_to_devs(cache_data[i].meta_memsp_pt[j], wback_len, wdev_addr);
-                free(cache_data[i].meta_memsp_pt[j]);
-                cache_data[i].sync_flist[j] = 0;
-            }
-            pthread_spin_unlock(cache_data[i].seg_lock_pt + j);
-            pthread_spin_destroy(cache_data[i].seg_lock_pt + j);
+            char* memory = atomic_load_explicit(
+                cache->meta_memsp_pt + segment, memory_order_acquire);
+            if(memory == NULL)
+                continue;
+            nvm_write(memory, length,
+                      cache_base(cache_id) + segment * length);
+            free(memory);
         }
-        free(cache_data[i].sync_flist);
-        // fprintf(stderr,"lock %d %lld %lld\n",i,this_seg_num,cache_data[i].seg_lock_pt);
-        if(cache_data[i].seg_lock_pt != NULL)
-            free((void*)cache_data[i].seg_lock_pt);
-        else
-        {
-            fprintf(stderr,"lock structure error1!\n");
-            exit(0);
-        }
-        // fprintf(stderr,"%d %"PRId64" %"PRId64"\n",i,this_seg_num,cache_data[i].meta_memsp_pt);
-        if(cache_data[i].meta_memsp_pt != NULL)
-            free(cache_data[i].meta_memsp_pt);
-        else
-        {
-            fprintf(stderr,"lock structure error3!\n");
-            exit(0);
-        }
+        free(cache->meta_memsp_pt);
+        cache->meta_memsp_pt = NULL;
+        cache->seg_num = 0;
     }
-    return;
 }
-
 
 void create_file_metadata_cache(int64_t inode_id)
 {
-    int64_t seg_id = inode_id / INODE_CACHE_EXTBLKS;
-    // int64_t seg_pos = inode_id % INODE_CACHE_EXTBLKS;
-    assert(seg_id < cache_data[INODE_CACHE].seg_num);
-    pthread_spin_lock(cache_data[INODE_CACHE].seg_lock_pt + seg_id);
-    if(cache_data[INODE_CACHE].meta_memsp_pt[seg_id] == NULL)
-    {
-        int64_t malloc_size = cache_data[INODE_CACHE].unit_size * cache_data[INODE_CACHE].seg_blknum;
-        cache_data[INODE_CACHE].meta_memsp_pt[seg_id] = malloc(malloc_size);
-        if(cache_data[INODE_CACHE].meta_memsp_pt[seg_id] == NULL)
-            goto malloc_failed;
-       
-        int64_t rback_len = ORCH_INODE_SIZE * INODE_CACHE_EXTBLKS;
-        int64_t rdev_addr = OFFSET_INODE + seg_id*rback_len;
-        // printf("addr0: %lld\n",rdev_addr);
-        read_data_from_devs(cache_data[INODE_CACHE].meta_memsp_pt[seg_id], rback_len, rdev_addr);
-    }
-    pthread_spin_unlock(cache_data[INODE_CACHE].seg_lock_pt + seg_id);
-    // fprintf(stderr,"addr: %lld\n",cache_data[INODE_CACHE].meta_memsp_pt[seg_id]);
-    // void* target_pt = cache_data[INODE_CACHE].meta_memsp_pt[seg_id] + seg_pos*ORCH_INODE_SIZE;
-    cache_data[INODE_CACHE].sync_flist[seg_id] = 1;
-    // memset(target_pt, 0x00, ORCH_INODE_SIZE);
-    return;
-
-malloc_failed:
-    printf("malloc failed!\n");
-    exit(1);
+    (void)load_segment(INODE_CACHE, inode_id / INODE_CACHE_EXTBLKS);
 }
-
 
 void delete_file_metadata_cache(int64_t inode_id)
 {
-    return;
+    (void)inode_id;
 }
 
 void close_file_metadata_cache(int64_t inode_id)
 {
-    return;
+    (void)inode_id;
 }
 
-
-void* inodeid_to_memaddr(int64_t inodeid)
+void* inodeid_to_memaddr(int64_t inode_id)
 {
-    int64_t seg_id = inodeid / INODE_CACHE_EXTBLKS;
-    int64_t seg_pos = inodeid % INODE_CACHE_EXTBLKS;
-    assert(seg_id < cache_data[INODE_CACHE].seg_num);
-    pthread_spin_lock(cache_data[INODE_CACHE].seg_lock_pt + seg_id);
-    if(cache_data[INODE_CACHE].meta_memsp_pt[seg_id] == NULL)
+    if(inode_id < 0 || inode_id >= MAX_INODE_NUM)
     {
-        goto error;
+        errno = EINVAL;
+        return NULL;
     }
-    pthread_spin_unlock(cache_data[INODE_CACHE].seg_lock_pt + seg_id);
-    // fprintf(stderr,"addr1: %lld\n",cache_data[INODE_CACHE].meta_memsp_pt[seg_id]);
-    void* target_pt = cache_data[INODE_CACHE].meta_memsp_pt[seg_id] + seg_pos*ORCH_INODE_SIZE;
-    cache_data[INODE_CACHE].sync_flist[seg_id] = 1;
-    // fprintf(stderr,"addr2: %lld\n",target_pt);
-    return target_pt;
-error:
-    pthread_spin_unlock(cache_data[INODE_CACHE].seg_lock_pt + seg_id);
-    printf("inode does not exist! -- inodeid_to_memaddr\n");
-    exit(0);
+    const int64_t segment = inode_id / INODE_CACHE_EXTBLKS;
+    const int64_t position = inode_id % INODE_CACHE_EXTBLKS;
+    char* memory = load_segment(INODE_CACHE, segment);
+    return memory == NULL ? NULL : memory + position * ORCH_INODE_SIZE;
 }
 
-
-void* indexid_to_memaddr(int64_t inodeid, int64_t indexid, int create_flag)
+void* indexid_to_memaddr(int64_t inode_id, int64_t index_id, int create_flag)
 {
-    int64_t seg_id = indexid / IDXND_CACHE_EXTBLKS;
-    int64_t seg_pos = indexid % IDXND_CACHE_EXTBLKS;
-    if(seg_id >= cache_data[IDXND_CACHE].seg_num)
+    (void)inode_id;
+    (void)create_flag;
+    if(index_id < 0 || index_id >= MAX_INDEX_NUM)
     {
-        printf("seg_id: %"PRId64" %"PRId64" %"PRId64"\n",indexid ,inodeid, cache_data[IDXND_CACHE].seg_num);
-        fflush(stdout);
-        goto id_error;
+        errno = EINVAL;
+        return NULL;
     }
-    pthread_spin_lock(cache_data[IDXND_CACHE].seg_lock_pt + seg_id);
-    if(cache_data[IDXND_CACHE].meta_memsp_pt[seg_id] == NULL)
+    const int64_t segment = index_id / IDXND_CACHE_EXTBLKS;
+    const int64_t position = index_id % IDXND_CACHE_EXTBLKS;
+    char* memory = load_segment(IDXND_CACHE, segment);
+    return memory == NULL ? NULL : memory + position * ORCH_IDX_SIZE;
+}
+
+void* virnodeid_to_memaddr(int64_t inode_id, int64_t virtual_node_id,
+                           int create_flag)
+{
+    (void)inode_id;
+    (void)create_flag;
+    if(virtual_node_id < 0 || virtual_node_id >= MAX_VIRND_NUM)
     {
-        if(create_flag == CREATE)
-        {
-            int64_t malloc_size = cache_data[IDXND_CACHE].unit_size * cache_data[IDXND_CACHE].seg_blknum;
-            cache_data[IDXND_CACHE].meta_memsp_pt[seg_id] = malloc(malloc_size);
-            if(cache_data[IDXND_CACHE].meta_memsp_pt[seg_id] == NULL)
-                goto malloc_failed;
-            
-            int64_t rback_len = ORCH_IDX_SIZE * IDXND_CACHE_EXTBLKS;
-            int64_t rdev_addr = OFFSET_INDEX + seg_id*rback_len;
-            // printf("read: %lld %lld %lld\n",cache_data[IDXND_CACHE].meta_memsp_pt[seg_id], rdev_addr, rback_len);
-            read_data_from_devs(cache_data[IDXND_CACHE].meta_memsp_pt[seg_id], rback_len, rdev_addr);
-        }
-        else
-            goto error;
+        errno = EINVAL;
+        return NULL;
     }
-    pthread_spin_unlock(cache_data[IDXND_CACHE].seg_lock_pt + seg_id);
-    void* target_pt = cache_data[IDXND_CACHE].meta_memsp_pt[seg_id] + seg_pos*ORCH_IDX_SIZE;
-    cache_data[IDXND_CACHE].sync_flist[seg_id] = 1;
-    return target_pt;
-error:
-    pthread_spin_unlock(cache_data[IDXND_CACHE].seg_lock_pt + seg_id);
-    printf("inode does not exist! -- indexid_to_memaddr\n");
-    exit(0);
-malloc_failed:
-    printf("malloc failed!\n");
-    exit(1);
-id_error:
-    printf("seg_id is error!\n");
-    exit(1);
+    const int64_t segment = virtual_node_id / VIRND_CACHE_EXTBLKS;
+    const int64_t position = virtual_node_id % VIRND_CACHE_EXTBLKS;
+    char* memory = load_segment(VIRND_CACHE, segment);
+    return memory == NULL ? NULL : memory + position * ORCH_VIRND_SIZE;
 }
 
-
-void* virnodeid_to_memaddr(int64_t inodeid, int64_t virnodeid, int create_flag)
+int64_t bufmetaid_to_devaddr(int64_t buffer_id)
 {
-    int64_t seg_id = virnodeid / VIRND_CACHE_EXTBLKS;
-    int64_t seg_pos = virnodeid % VIRND_CACHE_EXTBLKS;
-    assert(seg_id < cache_data[VIRND_CACHE].seg_num);
-    pthread_spin_lock(cache_data[VIRND_CACHE].seg_lock_pt + seg_id);
-    if(cache_data[VIRND_CACHE].meta_memsp_pt[seg_id] == NULL)
-    {
-        if(create_flag == CREATE)
-        {
-            int64_t malloc_size = cache_data[VIRND_CACHE].unit_size * cache_data[VIRND_CACHE].seg_blknum;
-            cache_data[VIRND_CACHE].meta_memsp_pt[seg_id] = malloc(malloc_size);
-            if(cache_data[VIRND_CACHE].meta_memsp_pt[seg_id] == NULL)
-                goto malloc_failed;
-            
-            int64_t rback_len = ORCH_VIRND_SIZE * VIRND_CACHE_EXTBLKS;
-            int64_t rdev_addr = OFFSET_VIRND+ seg_id*rback_len;
-            read_data_from_devs(cache_data[VIRND_CACHE].meta_memsp_pt[seg_id], rback_len, rdev_addr);
-        }
-        else
-            goto error;
-    }
-    pthread_spin_unlock(cache_data[VIRND_CACHE].seg_lock_pt + seg_id);
-    void* target_pt = cache_data[VIRND_CACHE].meta_memsp_pt[seg_id] + seg_pos*ORCH_VIRND_SIZE;
-    cache_data[VIRND_CACHE].sync_flist[seg_id] = 1;
-    return target_pt;
-error:
-    pthread_spin_unlock(cache_data[VIRND_CACHE].seg_lock_pt + seg_id);
-    printf("inode does not exist! -- virnodeid_to_memaddr\n");
-    exit(0);
-malloc_failed:
-    printf("malloc failed!\n");
-    exit(1);
+    if(buffer_id < 0 || buffer_id >= MAX_BUFMETA_NUM)
+        return -1;
+    return buffer_id * ORCH_BUFMETA_SIZE + OFFSET_BUFMETA;
 }
 
-int64_t bufmetaid_to_devaddr(int64_t buf_meta_id)
+int64_t nvmpage_to_devaddr(int64_t page_id)
 {
-    if(buf_meta_id < 0 || buf_meta_id >= MAX_BUFMETA_NUM)
-        goto buf_meta_id_error;
-    int64_t ret_addr = buf_meta_id * ORCH_BUFMETA_SIZE + OFFSET_BUFMETA;
-    return ret_addr;
-buf_meta_id_error:
-    printf("buf meta id: %" PRId64" is error!\n", buf_meta_id);
-    exit(1);
+    if(page_id < 0 || page_id >= MAX_PAGE_NUM)
+        return -1;
+    return page_id * ORCH_PAGE_SIZE + OFFSET_PAGE;
 }
 
-int64_t nvmpage_to_devaddr(int64_t nvm_page_id)
+int64_t ssdblk_to_devaddr(int64_t block_id)
 {
-    if(nvm_page_id < 0 || nvm_page_id >= MAX_PAGE_NUM)
-        goto nvm_page_id_error;
-    int64_t ret_addr = nvm_page_id * ORCH_PAGE_SIZE + OFFSET_PAGE;
-    return ret_addr;
-nvm_page_id_error:
-    printf("nvm page id: %" PRId64" is error!\n", nvm_page_id);
-    exit(1);
+    if(block_id < 0 || block_id >= MAX_BLOCK_NUM)
+        return -1;
+    return block_id * ORCH_BLOCK_SIZE + OFFSET_BLOCK;
 }
-
-int64_t ssdblk_to_devaddr(int64_t ssd_blk_id)
-{
-    if(ssd_blk_id < 0 || ssd_blk_id >= MAX_BLOCK_NUM)
-        goto ssd_blk_id_error;
-    int64_t ret_addr = ssd_blk_id * ORCH_BLOCK_SIZE + OFFSET_BLOCK;
-    return ret_addr;
-ssd_blk_id_error:
-    printf("ssd block id: %" PRId64" is error!\n", ssd_blk_id);
-    exit(1);
-}
-
-#ifdef __cplusplus
-}
-#endif

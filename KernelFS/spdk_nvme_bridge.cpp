@@ -2,23 +2,80 @@
 
 #include "spdk_nvme_backend.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <memory>
 #include <new>
 #include <span>
 #include <system_error>
-
-struct orchfs_spdk_backend {
-    std::unique_ptr<orchfs::nvme::SpdkNvmeBackend> implementation;
-};
+#include <vector>
 
 namespace {
 
+class BridgeCompletionPool;
+
 struct BridgeCompletion {
-    orchfs_spdk_completion_fn callback;
-    void *context;
+    orchfs_spdk_completion_fn callback{};
+    void *context{};
+    BridgeCompletionPool *pool{};
 };
+
+class BridgeCompletionPool final {
+public:
+    explicit BridgeCompletionPool(std::size_t count)
+        : storage_(std::make_unique<BridgeCompletion[]>(count)) {
+        free_.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            free_.push_back(&storage_[index]);
+        }
+    }
+
+    BridgeCompletion *acquire() noexcept {
+        Guard guard(lock_);
+        if (free_.empty()) {
+            return nullptr;
+        }
+        BridgeCompletion *completion = free_.back();
+        free_.pop_back();
+        return completion;
+    }
+
+    void release(BridgeCompletion *completion) noexcept {
+        if (completion == nullptr) {
+            return;
+        }
+        *completion = {};
+        Guard guard(lock_);
+        free_.push_back(completion);
+    }
+
+private:
+    class Guard final {
+    public:
+        explicit Guard(std::atomic_flag &lock) noexcept : lock_(lock) {
+            while (lock_.test_and_set(std::memory_order_acquire)) {
+            }
+        }
+        ~Guard() { lock_.clear(std::memory_order_release); }
+
+    private:
+        std::atomic_flag &lock_;
+    };
+
+    std::unique_ptr<BridgeCompletion[]> storage_;
+    std::vector<BridgeCompletion *> free_;
+    std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+};
+
+} // namespace
+
+struct orchfs_spdk_backend {
+    std::unique_ptr<orchfs::nvme::SpdkNvmeBackend> implementation;
+    std::vector<std::unique_ptr<BridgeCompletionPool>> completion_pools;
+};
+
+namespace {
 
 int error_to_errno(const std::error_code &error) noexcept {
     if (!error) {
@@ -58,12 +115,23 @@ int error_to_errno(const std::error_code &error) noexcept {
     return EIO;
 }
 
+void release_bridge_completion(BridgeCompletion *completion) noexcept {
+    BridgeCompletionPool *pool = completion->pool;
+    if (pool != nullptr) {
+        pool->release(completion);
+    } else {
+        delete completion;
+    }
+}
+
 void bridge_completion(void *context,
                        std::error_code error,
                        std::size_t bytes) noexcept {
-    std::unique_ptr<BridgeCompletion> completion(
-        static_cast<BridgeCompletion *>(context));
-    completion->callback(completion->context, error_to_errno(error), bytes);
+    auto *completion = static_cast<BridgeCompletion *>(context);
+    const auto callback = completion->callback;
+    void *callback_context = completion->context;
+    release_bridge_completion(completion);
+    callback(callback_context, error_to_errno(error), bytes);
 }
 
 orchfs::nvme::Config make_cpp_config(const orchfs_spdk_config &config) {
@@ -90,26 +158,32 @@ orchfs::nvme::Config make_cpp_config(const orchfs_spdk_config &config) {
 }
 
 template <typename Submit>
-int submit_with_bridge_callback(orchfs_spdk_completion_fn callback,
+int submit_with_bridge_callback(orchfs_spdk_backend &backend,
+                                std::size_t poller_id,
+                                orchfs_spdk_completion_fn callback,
                                 void *callback_context,
                                 Submit &&submit) {
-    if (callback == nullptr) {
+    if (callback == nullptr || poller_id >= backend.completion_pools.size()) {
         return EINVAL;
     }
-    auto completion =
-        std::unique_ptr<BridgeCompletion>(new (std::nothrow) BridgeCompletion{
-            .callback = callback,
-            .context = callback_context,
-        });
-    if (!completion) {
+    BridgeCompletionPool *pool = backend.completion_pools[poller_id].get();
+    BridgeCompletion *completion = pool->acquire();
+    if (completion != nullptr) {
+        completion->pool = pool;
+    } else {
+        completion = new (std::nothrow) BridgeCompletion();
+    }
+    if (completion == nullptr) {
         return ENOMEM;
     }
+    completion->callback = callback;
+    completion->context = callback_context;
 
-    std::error_code error = submit(&bridge_completion, completion.get());
+    std::error_code error = submit(&bridge_completion, completion);
     if (error) {
+        release_bridge_completion(completion);
         return error_to_errno(error);
     }
-    (void)completion.release();
     return 0;
 }
 
@@ -125,9 +199,9 @@ void orchfs_spdk_config_init(orchfs_spdk_config *config) {
         .pci_bdf = nullptr,
         .namespace_id = 1,
         .poller_count = 1,
-        .queue_depth = 128,
-        .bounce_buffers_per_poller = 64,
-        .max_transfer_size = 0,
+        .queue_depth = 32,
+        .bounce_buffers_per_poller = 32,
+        .max_transfer_size = 1024U * 1024U,
         .application_name = "orchfs_kfs",
         .reactor_mask = "0x1",
         .hugepage_directory = nullptr,
@@ -157,9 +231,29 @@ int orchfs_spdk_open(const orchfs_spdk_config *config,
             return EIO;
         }
 
+        std::vector<std::unique_ptr<BridgeCompletionPool>> completion_pools;
+        try {
+            completion_pools.reserve(config->poller_count);
+            const std::size_t completion_count =
+                static_cast<std::size_t>(config->queue_depth) * 2U + 16U;
+            for (std::size_t index = 0; index < config->poller_count; ++index) {
+                completion_pools.push_back(
+                    std::make_unique<BridgeCompletionPool>(completion_count));
+            }
+        } catch (const std::bad_alloc &) {
+            implementation->request_stop();
+            for (std::size_t index = 0; index < implementation->poller_count();
+                 ++index) {
+                (void)implementation->poll(index);
+            }
+            (void)implementation->close();
+            return ENOMEM;
+        }
+
         auto wrapper = std::unique_ptr<orchfs_spdk_backend>(
             new (std::nothrow) orchfs_spdk_backend{
                 .implementation = std::move(implementation),
+                .completion_pools = std::move(completion_pools),
             });
         if (!wrapper) {
             implementation->request_stop();
@@ -190,6 +284,8 @@ int orchfs_spdk_submit_read(orchfs_spdk_backend *backend,
         return EINVAL;
     }
     return submit_with_bridge_callback(
+        *backend,
+        poller_id,
         callback,
         callback_context,
         [&](orchfs::nvme::CompletionCallback cpp_callback, void *cpp_context) {
@@ -214,6 +310,8 @@ int orchfs_spdk_submit_write(orchfs_spdk_backend *backend,
         return EINVAL;
     }
     return submit_with_bridge_callback(
+        *backend,
+        poller_id,
         callback,
         callback_context,
         [&](orchfs::nvme::CompletionCallback cpp_callback, void *cpp_context) {
@@ -235,12 +333,32 @@ int orchfs_spdk_submit_flush(orchfs_spdk_backend *backend,
         return EINVAL;
     }
     return submit_with_bridge_callback(
+        *backend,
+        poller_id,
         callback,
         callback_context,
         [&](orchfs::nvme::CompletionCallback cpp_callback, void *cpp_context) {
             return backend->implementation->submit_flush(
                 poller_id, cpp_callback, cpp_context);
         });
+}
+
+int orchfs_spdk_register_memory(orchfs_spdk_backend *backend, void *address,
+                                size_t length) {
+    if (backend == nullptr || backend->implementation == nullptr) {
+        return EINVAL;
+    }
+    return error_to_errno(
+        backend->implementation->register_memory(address, length));
+}
+
+int orchfs_spdk_unregister_memory(orchfs_spdk_backend *backend,
+                                  void *address, size_t length) {
+    if (backend == nullptr || backend->implementation == nullptr) {
+        return EINVAL;
+    }
+    return error_to_errno(
+        backend->implementation->unregister_memory(address, length));
 }
 
 int orchfs_spdk_poll(orchfs_spdk_backend *backend,

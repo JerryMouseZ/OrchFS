@@ -11,8 +11,8 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
-#include <cstdarg>
 #include <climits>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -21,26 +21,24 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <optional>
 #include <sched.h>
-#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <unistd.h>
 
 namespace {
 
 using orchfs::async::Client;
 using orchfs::async::ClientOptions;
-using orchfs::async::DirEntry;
 using orchfs::async::Directory;
+using orchfs::async::DirEntry;
 using orchfs::async::Errc;
 using orchfs::async::File;
 using orchfs::async::FileStat;
@@ -54,17 +52,58 @@ constexpr int kMaximumLocalFd = 1048575;
 constexpr std::size_t kDirectoryBatchSize = 32;
 constexpr std::uint64_t kDirectoryTokenMagic = 0x4f52434844495231ULL;
 
+// Application threads may wait for a POSIX call, but they must never create
+// or depend on a service thread.  This gate is used only at the synchronous
+// ABI boundary to hand ownership of a small piece of adapter state to one
+// caller at a time.  The actual filesystem operation is always submitted to
+// the session's fixed Runtime owner.
+class OwnerGate {
+public:
+  OwnerGate() = default;
+  OwnerGate(const OwnerGate &) = delete;
+  OwnerGate &operator=(const OwnerGate &) = delete;
+
+  void acquire() noexcept {
+    bool expected = false;
+    while (!occupied_.compare_exchange_weak(
+        expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+      expected = true;
+      occupied_.wait(true, std::memory_order_relaxed);
+      expected = false;
+    }
+  }
+
+  void release() noexcept {
+    occupied_.store(false, std::memory_order_release);
+    occupied_.notify_one();
+  }
+
+private:
+  std::atomic<bool> occupied_{false};
+};
+
+class OwnerLease {
+public:
+  explicit OwnerLease(OwnerGate &gate) noexcept : gate_(&gate) {
+    gate_->acquire();
+  }
+  ~OwnerLease() { gate_->release(); }
+  OwnerLease(const OwnerLease &) = delete;
+  OwnerLease &operator=(const OwnerLease &) = delete;
+
+private:
+  OwnerGate *gate_;
+};
+
 struct FileSlot {
   FileSlot(File value, std::optional<Directory> directory_value,
            std::string opened_path, int flags)
-      : file(std::move(value)),
-        directory(std::move(directory_value)),
-        directory_checked(directory.has_value()),
-        path(std::move(opened_path)),
+      : file(std::move(value)), directory(std::move(directory_value)),
+        directory_checked(directory.has_value()), path(std::move(opened_path)),
         open_flags(flags),
         descriptor_flags((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0) {}
 
-  std::shared_mutex mutex;
+  OwnerGate owner;
   File file;
   std::optional<Directory> directory;
   bool directory_checked{};
@@ -82,7 +121,7 @@ struct DirectoryToken {
 struct DirectorySlot {
   explicit DirectorySlot(Directory value) : directory(std::move(value)) {}
 
-  std::mutex mutex;
+  OwnerGate owner;
   Directory directory;
   std::array<DirEntry, kDirectoryBatchSize> batch;
   std::size_t cursor{};
@@ -92,40 +131,47 @@ struct DirectorySlot {
   struct dirent64 entry64 {};
 };
 
+using FileTable = std::unordered_map<int, std::shared_ptr<FileSlot>>;
+using DirectoryTable =
+    std::unordered_map<DIR *, std::shared_ptr<DirectorySlot>>;
+
 struct AdapterState {
   pid_t owner_pid{::getpid()};
-  std::shared_mutex lifecycle_mutex;
+  OwnerGate lifecycle_owner;
   std::unique_ptr<Runtime> runtime;
   std::optional<Client> client;
   std::error_code initialization_error;
-  bool ever_connected{};
+  std::atomic<bool> ever_connected{false};
 
-  std::mutex files_mutex;
-  std::unordered_map<int, std::shared_ptr<FileSlot>> files;
-  int next_fd{3};
+  std::atomic<std::shared_ptr<const FileTable>> files{
+      std::make_shared<const FileTable>()};
+  std::atomic<std::uint64_t> next_fd{3};
 
-  std::mutex directories_mutex;
-  std::unordered_map<DIR*, std::shared_ptr<DirectorySlot>> directories;
+  std::atomic<std::shared_ptr<const DirectoryTable>> directories{
+      std::make_shared<const DirectoryTable>()};
 };
 
-AdapterState& state() {
+AdapterState &state() {
   // The LD_PRELOAD destructor performs the ordered teardown.  Keeping the
   // state object itself alive avoids static-destruction-order races with libc.
-  static std::atomic<AdapterState*> value{new AdapterState};
+  static std::atomic<AdapterState *> value{new AdapterState};
   const pid_t process = ::getpid();
   for (;;) {
-    AdapterState* current = value.load(std::memory_order_acquire);
+    AdapterState *current = value.load(std::memory_order_acquire);
     if (current->owner_pid == process) {
       return *current;
     }
 
     // Only the calling thread survives fork(). Parent Runtime threads and any
-    // mutexes they held cannot be joined or safely destroyed in the child, so
-    // abandon that process-local state and lazily establish a fresh session.
-    // CAS also handles multiple child threads making their first adapter call
-    // concurrently without racing on the process-local state pointer.
-    auto* replacement = new AdapterState;
-    replacement->ever_connected = current->ever_connected;
+    // Runtime ownership state cannot be joined or safely destroyed in the
+    // child, so abandon that process-local state and lazily establish a fresh
+    // session. CAS also handles multiple child threads making their first
+    // adapter call concurrently without racing on the process-local state
+    // pointer.
+    auto *replacement = new AdapterState;
+    replacement->ever_connected.store(
+        current->ever_connected.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
     if (value.compare_exchange_strong(current, replacement,
                                       std::memory_order_acq_rel,
                                       std::memory_order_acquire)) {
@@ -145,23 +191,23 @@ int errno_from_error(std::error_code error) noexcept {
   }
   if (error.category() == orchfs::async::error_category()) {
     switch (static_cast<Errc>(error.value())) {
-      case Errc::runtime_stopping:
-        return ESHUTDOWN;
-      case Errc::runtime_already_exists:
-        return EALREADY;
-      case Errc::invalid_handle:
-      case Errc::already_consumed:
-        return EBADF;
-      case Errc::invalid_task:
-      case Errc::invalid_worker:
-      case Errc::invalid_range:
-        return EINVAL;
-      case Errc::join_from_worker:
-        return EDEADLK;
-      case Errc::not_in_runtime:
-      case Errc::wrong_runtime:
-      case Errc::pinned_to_worker:
-        return EPROTO;
+    case Errc::runtime_stopping:
+      return ESHUTDOWN;
+    case Errc::runtime_already_exists:
+      return EALREADY;
+    case Errc::invalid_handle:
+    case Errc::already_consumed:
+      return EBADF;
+    case Errc::invalid_task:
+    case Errc::invalid_worker:
+    case Errc::invalid_range:
+      return EINVAL;
+    case Errc::join_from_worker:
+      return EDEADLK;
+    case Errc::not_in_runtime:
+    case Errc::wrong_runtime:
+    case Errc::pinned_to_worker:
+      return EPROTO;
     }
   }
   return EIO;
@@ -180,7 +226,7 @@ Return fail(int error, Return failure_value) noexcept {
 }
 
 template <typename T>
-Result<T> run(AdapterState& adapter, Task<Result<T>> task) {
+Result<T> run(AdapterState &adapter, Task<Result<T>> task) {
   if (!adapter.runtime) {
     const auto error = adapter.initialization_error
                            ? adapter.initialization_error
@@ -198,13 +244,13 @@ Result<T> run(AdapterState& adapter, Task<Result<T>> task) {
   return std::move(joined).value();
 }
 
-bool ready(const AdapterState& adapter) noexcept {
+bool ready(const AdapterState &adapter) noexcept {
   return adapter.runtime && adapter.client && adapter.client->valid();
 }
 
 std::size_t configured_worker_count() noexcept {
   constexpr std::size_t kDefaultWorkerCount = 4;
-  const char* text = std::getenv("ORCHFS_CLIENT_WORKERS");
+  const char *text = std::getenv("ORCHFS_CLIENT_WORKERS");
   if (!text || !*text) {
     cpu_set_t affinity;
     CPU_ZERO(&affinity);
@@ -216,7 +262,7 @@ std::size_t configured_worker_count() noexcept {
     }
     return kDefaultWorkerCount;
   }
-  char* end = nullptr;
+  char *end = nullptr;
   errno = 0;
   const unsigned long long parsed = std::strtoull(text, &end, 10);
   if (errno != 0 || end == text || *end != '\0' || parsed == 0 ||
@@ -226,12 +272,12 @@ std::size_t configured_worker_count() noexcept {
   return static_cast<std::size_t>(parsed);
 }
 
-std::size_t configured_size(const char* name, std::size_t fallback) noexcept {
-  const char* text = std::getenv(name);
+std::size_t configured_size(const char *name, std::size_t fallback) noexcept {
+  const char *text = std::getenv(name);
   if (!text || !*text) {
     return fallback;
   }
-  char* end = nullptr;
+  char *end = nullptr;
   errno = 0;
   const unsigned long long parsed = std::strtoull(text, &end, 10);
   if (errno != 0 || end == text || *end != '\0' || parsed == 0 ||
@@ -241,38 +287,98 @@ std::size_t configured_size(const char* name, std::size_t fallback) noexcept {
   return static_cast<std::size_t>(parsed);
 }
 
-std::shared_ptr<FileSlot> find_file(AdapterState& adapter, int fd) {
-  std::lock_guard lock(adapter.files_mutex);
-  const auto found = adapter.files.find(fd);
-  return found == adapter.files.end() ? nullptr : found->second;
+std::shared_ptr<FileSlot> find_file(AdapterState &adapter, int fd) {
+  const auto snapshot = adapter.files.load(std::memory_order_acquire);
+  const auto found = snapshot->find(fd);
+  return found == snapshot->end() ? nullptr : found->second;
 }
 
-int insert_file(AdapterState& adapter, std::shared_ptr<FileSlot> slot) {
-  std::lock_guard lock(adapter.files_mutex);
-  if (adapter.files.size() >= static_cast<std::size_t>(kMaximumLocalFd - 2)) {
-    return -1;
-  }
+int insert_file(AdapterState &adapter, std::shared_ptr<FileSlot> slot) {
   for (int attempts = 0; attempts < kMaximumLocalFd; ++attempts) {
-    int candidate = adapter.next_fd++;
-    if (adapter.next_fd > kMaximumLocalFd) {
-      adapter.next_fd = 3;
+    const std::uint64_t sequence =
+        adapter.next_fd.fetch_add(1, std::memory_order_relaxed);
+    const int candidate =
+        3 + static_cast<int>((sequence - 3) % (kMaximumLocalFd - 2));
+    auto current = adapter.files.load(std::memory_order_acquire);
+    if (current->size() >= static_cast<std::size_t>(kMaximumLocalFd - 2)) {
+      return -1;
     }
-    if (!adapter.files.contains(candidate)) {
-      adapter.files.emplace(candidate, std::move(slot));
+    if (current->contains(candidate)) {
+      continue;
+    }
+    auto replacement = std::make_shared<FileTable>(*current);
+    replacement->emplace(candidate, slot);
+    std::shared_ptr<const FileTable> published = std::move(replacement);
+    if (adapter.files.compare_exchange_weak(current, std::move(published),
+                                            std::memory_order_release,
+                                            std::memory_order_acquire)) {
       return candidate;
     }
   }
   return -1;
 }
 
-std::shared_ptr<DirectorySlot> find_directory(AdapterState& adapter,
-                                               DIR* directory) {
-  std::lock_guard lock(adapter.directories_mutex);
-  const auto found = adapter.directories.find(directory);
-  return found == adapter.directories.end() ? nullptr : found->second;
+void erase_file(AdapterState &adapter, int fd,
+                const std::shared_ptr<FileSlot> &slot) {
+  auto current = adapter.files.load(std::memory_order_acquire);
+  for (;;) {
+    const auto found = current->find(fd);
+    if (found == current->end() || found->second != slot) {
+      return;
+    }
+    auto replacement = std::make_shared<FileTable>(*current);
+    replacement->erase(fd);
+    std::shared_ptr<const FileTable> published = std::move(replacement);
+    if (adapter.files.compare_exchange_weak(current, std::move(published),
+                                            std::memory_order_release,
+                                            std::memory_order_acquire)) {
+      return;
+    }
+  }
 }
 
-void populate_stat(const FileStat& input, struct stat& output) noexcept {
+std::shared_ptr<DirectorySlot> find_directory(AdapterState &adapter,
+                                              DIR *directory) {
+  const auto snapshot = adapter.directories.load(std::memory_order_acquire);
+  const auto found = snapshot->find(directory);
+  return found == snapshot->end() ? nullptr : found->second;
+}
+
+void insert_directory(AdapterState &adapter, DIR *key,
+                      std::shared_ptr<DirectorySlot> slot) {
+  auto current = adapter.directories.load(std::memory_order_acquire);
+  for (;;) {
+    auto replacement = std::make_shared<DirectoryTable>(*current);
+    replacement->emplace(key, slot);
+    std::shared_ptr<const DirectoryTable> published = std::move(replacement);
+    if (adapter.directories.compare_exchange_weak(current, std::move(published),
+                                                  std::memory_order_release,
+                                                  std::memory_order_acquire)) {
+      return;
+    }
+  }
+}
+
+void erase_directory(AdapterState &adapter, DIR *key,
+                     const std::shared_ptr<DirectorySlot> &slot) {
+  auto current = adapter.directories.load(std::memory_order_acquire);
+  for (;;) {
+    const auto found = current->find(key);
+    if (found == current->end() || found->second != slot) {
+      return;
+    }
+    auto replacement = std::make_shared<DirectoryTable>(*current);
+    replacement->erase(key);
+    std::shared_ptr<const DirectoryTable> published = std::move(replacement);
+    if (adapter.directories.compare_exchange_weak(current, std::move(published),
+                                                  std::memory_order_release,
+                                                  std::memory_order_acquire)) {
+      return;
+    }
+  }
+}
+
+void populate_stat(const FileStat &input, struct stat &output) noexcept {
   std::memset(&output, 0, sizeof(output));
   output.st_dev = static_cast<dev_t>(input.device);
   output.st_ino = static_cast<ino_t>(input.inode);
@@ -292,8 +398,8 @@ void populate_stat(const FileStat& input, struct stat& output) noexcept {
   output.st_ctim.tv_nsec = static_cast<long>(input.ctime_nanoseconds);
 }
 
-void populate_statfs(const FileSystemStat& input,
-                     struct statfs& output) noexcept {
+void populate_statfs(const FileSystemStat &input,
+                     struct statfs &output) noexcept {
   std::memset(&output, 0, sizeof(output));
   output.f_type = static_cast<decltype(output.f_type)>(input.type);
   output.f_bsize = static_cast<decltype(output.f_bsize)>(input.block_size);
@@ -308,17 +414,17 @@ void populate_statfs(const FileSystemStat& input,
   output.f_flags = static_cast<decltype(output.f_flags)>(input.flags);
 }
 
-bool valid_path(const char* path) noexcept {
+bool valid_path(const char *path) noexcept {
   return path != nullptr && *path != '\0';
 }
 
-std::optional<std::string> joined_openat_path(const FileSlot& directory,
-                                              const char* path) {
+std::optional<std::string> joined_openat_path(const FileSlot &directory,
+                                              const char *path) {
   try {
     return (std::filesystem::path(directory.path) / path)
         .lexically_normal()
         .generic_string();
-  } catch (const std::bad_alloc&) {
+  } catch (const std::bad_alloc &) {
     errno = ENOMEM;
     return std::nullopt;
   } catch (...) {
@@ -327,8 +433,7 @@ std::optional<std::string> joined_openat_path(const FileSlot& directory,
   }
 }
 
-std::error_code ensure_directory_handle(AdapterState& adapter,
-                                        FileSlot& slot) {
+std::error_code ensure_directory_handle(AdapterState &adapter, FileSlot &slot) {
   if (slot.directory) {
     return {};
   }
@@ -351,8 +456,8 @@ std::error_code ensure_directory_handle(AdapterState& adapter,
   return opened.error();
 }
 
-std::optional<std::string> path_for_openat(AdapterState& adapter, int dirfd,
-                                           const char* path) {
+std::optional<std::string> path_for_openat(AdapterState &adapter, int dirfd,
+                                           const char *path) {
   if (!valid_path(path)) {
     errno = path ? ENOENT : EFAULT;
     return std::nullopt;
@@ -367,7 +472,7 @@ std::optional<std::string> path_for_openat(AdapterState& adapter, int dirfd,
   }
 
   {
-    std::shared_lock lock(directory->mutex);
+    OwnerLease lock(directory->owner);
     if (directory->closed) {
       errno = EBADF;
       return std::nullopt;
@@ -385,7 +490,7 @@ std::optional<std::string> path_for_openat(AdapterState& adapter, int dirfd,
   // preserves the inode selected by open(2), even if its pathname is renamed
   // or recreated before the first openat(2), without taxing ordinary file
   // opens with a second RPC.
-  std::unique_lock lock(directory->mutex);
+  OwnerLease lock(directory->owner);
   if (directory->closed) {
     errno = EBADF;
     return std::nullopt;
@@ -398,7 +503,7 @@ std::optional<std::string> path_for_openat(AdapterState& adapter, int dirfd,
 }
 
 template <typename Entry>
-void populate_directory_entry(const DirEntry& input, Entry& output) noexcept {
+void populate_directory_entry(const DirEntry &input, Entry &output) noexcept {
   std::memset(&output, 0, sizeof(output));
   output.d_ino = static_cast<decltype(output.d_ino)>(input.inode);
   output.d_off = static_cast<decltype(output.d_off)>(input.offset);
@@ -412,21 +517,21 @@ void populate_directory_entry(const DirEntry& input, Entry& output) noexcept {
 }
 
 template <typename Entry>
-Entry* read_directory_entry(AdapterState& adapter, DIR* directory,
+Entry *read_directory_entry(AdapterState &adapter, DIR *directory,
                             Entry DirectorySlot::*entry_member) {
   auto slot = find_directory(adapter, directory);
   if (!slot) {
-    return fail(EBADF, static_cast<Entry*>(nullptr));
+    return fail(EBADF, static_cast<Entry *>(nullptr));
   }
-  std::lock_guard lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
-    return fail(EBADF, static_cast<Entry*>(nullptr));
+    return fail(EBADF, static_cast<Entry *>(nullptr));
   }
   if (slot->cursor == slot->count) {
     slot->cursor = 0;
     auto result = run(adapter, slot->directory.next_batch(slot->batch));
     if (!result) {
-      return fail(result.error(), static_cast<Entry*>(nullptr));
+      return fail(result.error(), static_cast<Entry *>(nullptr));
     }
     slot->count = std::move(result).value();
     if (slot->count == 0) {
@@ -434,16 +539,16 @@ Entry* read_directory_entry(AdapterState& adapter, DIR* directory,
       return nullptr;
     }
   }
-  Entry& output = slot.get()->*entry_member;
+  Entry &output = slot.get()->*entry_member;
   populate_directory_entry(slot->batch[slot->cursor++], output);
   return &output;
 }
 
-}  // namespace
+} // namespace
 
 extern "C" int orchfs_async_adapter_init(void) {
-  auto& adapter = state();
-  std::unique_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (ready(adapter)) {
     return 0;
   }
@@ -468,7 +573,7 @@ extern "C" int orchfs_async_adapter_init(void) {
     }
 
     ClientOptions client_options;
-    if (const char* endpoint = std::getenv("ORCHFS_ASYNC_ENDPOINT");
+    if (const char *endpoint = std::getenv("ORCHFS_ASYNC_ENDPOINT");
         endpoint && *endpoint) {
       client_options.endpoint = endpoint;
     }
@@ -476,8 +581,8 @@ extern "C" int orchfs_async_adapter_init(void) {
         "ORCHFS_IPC_RING_CAPACITY", client_options.ring_capacity);
     client_options.data_slot_size = configured_size(
         "ORCHFS_IPC_DATA_SLOT_SIZE", client_options.data_slot_size);
-    auto connected = run(adapter, Client::connect(*adapter.runtime,
-                                                   std::move(client_options)));
+    auto connected = run(
+        adapter, Client::connect(*adapter.runtime, std::move(client_options)));
     if (!connected) {
       adapter.initialization_error = connected.error();
       if (created_runtime) {
@@ -488,10 +593,10 @@ extern "C" int orchfs_async_adapter_init(void) {
       return fail(adapter.initialization_error, -1);
     }
     adapter.client.emplace(std::move(connected).value());
-    adapter.ever_connected = true;
+    adapter.ever_connected.store(true, std::memory_order_release);
     adapter.initialization_error.clear();
     return 0;
-  } catch (const std::bad_alloc&) {
+  } catch (const std::bad_alloc &) {
     adapter.initialization_error =
         std::make_error_code(std::errc::not_enough_memory);
   } catch (...) {
@@ -508,9 +613,9 @@ extern "C" int orchfs_async_adapter_init(void) {
 }
 
 extern "C" int orchfs_async_adapter_ready(void) {
-  auto& adapter = state();
+  auto &adapter = state();
   {
-    std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+    OwnerLease lifecycle_lock(adapter.lifecycle_owner);
     if (ready(adapter)) {
       return 1;
     }
@@ -520,34 +625,31 @@ extern "C" int orchfs_async_adapter_ready(void) {
   return orchfs_async_adapter_init() == 0 ? 1 : 0;
 }
 
-extern "C" int orchfs_async_adapter_allow_host_fallback(
-    int adapter_was_ready, int error_number) {
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+extern "C" int orchfs_async_adapter_allow_host_fallback(int adapter_was_ready,
+                                                        int error_number) {
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (adapter_was_ready) {
     // The operation reached a live session, so ENOENT is a filesystem lookup
     // result rather than a missing control socket from connect(2).
     return error_number == ENOENT;
   }
-  return !adapter.ever_connected;
+  return !adapter.ever_connected.load(std::memory_order_acquire);
 }
 
 extern "C" void orchfs_async_adapter_shutdown(void) {
-  auto& adapter = state();
-  std::unique_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!adapter.runtime) {
     adapter.client.reset();
     return;
   }
 
-  std::unordered_map<int, std::shared_ptr<FileSlot>> files;
-  {
-    std::lock_guard lock(adapter.files_mutex);
-    files.swap(adapter.files);
-  }
-  for (auto& [fd, slot] : files) {
+  auto files = adapter.files.exchange(std::make_shared<const FileTable>(),
+                                      std::memory_order_acq_rel);
+  for (const auto &[fd, slot] : *files) {
     (void)fd;
-    std::unique_lock lock(slot->mutex);
+    OwnerLease lock(slot->owner);
     (void)run(adapter, slot->file.close());
     if (slot->directory) {
       (void)run(adapter, slot->directory->close());
@@ -555,25 +657,22 @@ extern "C" void orchfs_async_adapter_shutdown(void) {
     }
   }
 
-  std::unordered_map<DIR*, std::shared_ptr<DirectorySlot>> directories;
-  {
-    std::lock_guard lock(adapter.directories_mutex);
-    directories.swap(adapter.directories);
-  }
-  for (auto& [token, slot] : directories) {
+  auto directories = adapter.directories.exchange(
+      std::make_shared<const DirectoryTable>(), std::memory_order_acq_rel);
+  for (const auto &[token, slot] : *directories) {
     {
-      std::lock_guard lock(slot->mutex);
+      OwnerLease lock(slot->owner);
       (void)run(adapter, slot->directory.close());
     }
-    delete reinterpret_cast<DirectoryToken*>(token);
+    delete reinterpret_cast<DirectoryToken *>(token);
   }
 
   // Destroy every slot while Runtime is still alive. A failed remote close
   // leaves RAII handles that perform best-effort detached cleanup from their
   // destructors; letting these maps outlive runtime.reset() would leave their
   // Session::runtime_ pointers dangling.
-  files.clear();
-  directories.clear();
+  files.reset();
+  directories.reset();
 
   if (adapter.client && adapter.client->valid()) {
     (void)run(adapter, adapter.client->shutdown());
@@ -584,7 +683,7 @@ extern "C" void orchfs_async_adapter_shutdown(void) {
   adapter.runtime.reset();
 }
 
-extern "C" int orchfs_async_open(const char* path, int flags, ...) {
+extern "C" int orchfs_async_open(const char *path, int flags, ...) {
   mode_t mode = 0644;
   if ((flags & O_CREAT) != 0) {
     va_list arguments;
@@ -596,8 +695,8 @@ extern "C" int orchfs_async_open(const char* path, int flags, ...) {
     return fail(path ? ENOENT : EFAULT, -1);
   }
 
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
@@ -607,23 +706,22 @@ extern "C" int orchfs_async_open(const char* path, int flags, ...) {
   }
 
   try {
-    auto slot = std::make_shared<FileSlot>(std::move(opened).value(),
-                                          std::nullopt,
-                                          std::string(path), flags);
+    auto slot = std::make_shared<FileSlot>(
+        std::move(opened).value(), std::nullopt, std::string(path), flags);
     const int fd = insert_file(adapter, std::move(slot));
     if (fd < 0) {
       return fail(EMFILE, -1);
     }
     return fd;
-  } catch (const std::bad_alloc&) {
+  } catch (const std::bad_alloc &) {
     return fail(ENOMEM, -1);
   } catch (...) {
     return fail(EIO, -1);
   }
 }
 
-extern "C" int orchfs_async_openat(int dirfd, const char* path, int flags,
-                                    ...) {
+extern "C" int orchfs_async_openat(int dirfd, const char *path, int flags,
+                                   ...) {
   mode_t mode = 0644;
   if ((flags & O_CREAT) != 0) {
     va_list arguments;
@@ -632,8 +730,8 @@ extern "C" int orchfs_async_openat(int dirfd, const char* path, int flags,
     va_end(arguments);
   }
 
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
@@ -643,15 +741,14 @@ extern "C" int orchfs_async_openat(int dirfd, const char* path, int flags,
   }
   Result<File> opened = [&]() {
     if (*path == '/' || dirfd == AT_FDCWD) {
-      return run(adapter,
-                 adapter.client->open(*combined_path, flags, mode));
+      return run(adapter, adapter.client->open(*combined_path, flags, mode));
     }
     auto parent = find_file(adapter, dirfd);
     if (!parent) {
       return Result<File>::failure(
           std::make_error_code(std::errc::bad_file_descriptor));
     }
-    std::shared_lock parent_lock(parent->mutex);
+    OwnerLease parent_lock(parent->owner);
     if (parent->closed) {
       return Result<File>::failure(
           std::make_error_code(std::errc::bad_file_descriptor));
@@ -660,23 +757,24 @@ extern "C" int orchfs_async_openat(int dirfd, const char* path, int flags,
       return Result<File>::failure(
           std::make_error_code(std::errc::not_a_directory));
     }
-    return run(adapter, adapter.client->open_at(
-                            *parent->directory, std::string(path), flags, mode));
+    return run(adapter,
+               adapter.client->open_at(*parent->directory, std::string(path),
+                                       flags, mode));
   }();
   if (!opened) {
     return fail(opened.error(), -1);
   }
 
   try {
-    auto slot = std::make_shared<FileSlot>(std::move(opened).value(),
-                                          std::nullopt,
-                                          std::move(*combined_path), flags);
+    auto slot =
+        std::make_shared<FileSlot>(std::move(opened).value(), std::nullopt,
+                                   std::move(*combined_path), flags);
     const int fd = insert_file(adapter, std::move(slot));
     if (fd < 0) {
       return fail(EMFILE, -1);
     }
     return fd;
-  } catch (const std::bad_alloc&) {
+  } catch (const std::bad_alloc &) {
     return fail(ENOMEM, -1);
   } catch (...) {
     return fail(EIO, -1);
@@ -684,13 +782,13 @@ extern "C" int orchfs_async_openat(int dirfd, const char* path, int flags,
 }
 
 extern "C" int orchfs_async_close(int fd) {
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, -1);
   }
-  std::unique_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, -1);
   }
@@ -700,13 +798,7 @@ extern "C" int orchfs_async_close(int fd) {
     // must still retire it instead of leaking it until a pathname reconnect.
     slot->closed = true;
     slot->directory.reset();
-    {
-      std::lock_guard files_lock(adapter.files_mutex);
-      const auto found = adapter.files.find(fd);
-      if (found != adapter.files.end() && found->second == slot) {
-        adapter.files.erase(found);
-      }
-    }
+    erase_file(adapter, fd, slot);
     return 0;
   }
   auto result = run(adapter, slot->file.close());
@@ -722,22 +814,16 @@ extern "C" int orchfs_async_close(int fd) {
     slot->directory.reset();
   }
   slot->closed = true;
-  {
-    std::lock_guard files_lock(adapter.files_mutex);
-    const auto found = adapter.files.find(fd);
-    if (found != adapter.files.end() && found->second == slot) {
-      adapter.files.erase(found);
-    }
-  }
+  erase_file(adapter, fd, slot);
   return 0;
 }
 
-extern "C" ssize_t orchfs_async_read(int fd, void* buffer, size_t length) {
+extern "C" ssize_t orchfs_async_read(int fd, void *buffer, size_t length) {
   if (!buffer && length != 0) {
     return fail(EFAULT, static_cast<ssize_t>(-1));
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, static_cast<ssize_t>(-1));
@@ -745,12 +831,12 @@ extern "C" ssize_t orchfs_async_read(int fd, void* buffer, size_t length) {
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, static_cast<ssize_t>(-1));
   }
-  std::unique_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, static_cast<ssize_t>(-1));
   }
-  auto result = run(adapter, slot->file.read(
-                                 {static_cast<std::byte*>(buffer), length}));
+  auto result =
+      run(adapter, slot->file.read({static_cast<std::byte *>(buffer), length}));
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -760,13 +846,13 @@ extern "C" ssize_t orchfs_async_read(int fd, void* buffer, size_t length) {
   return static_cast<ssize_t>(result.value());
 }
 
-extern "C" ssize_t orchfs_async_write(int fd, const void* buffer,
-                                       size_t length) {
+extern "C" ssize_t orchfs_async_write(int fd, const void *buffer,
+                                      size_t length) {
   if (!buffer && length != 0) {
     return fail(EFAULT, static_cast<ssize_t>(-1));
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, static_cast<ssize_t>(-1));
@@ -774,12 +860,13 @@ extern "C" ssize_t orchfs_async_write(int fd, const void* buffer,
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, static_cast<ssize_t>(-1));
   }
-  std::unique_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, static_cast<ssize_t>(-1));
   }
-  auto result = run(adapter, slot->file.write(
-                                 {static_cast<const std::byte*>(buffer), length}));
+  auto result =
+      run(adapter,
+          slot->file.write({static_cast<const std::byte *>(buffer), length}));
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -789,14 +876,14 @@ extern "C" ssize_t orchfs_async_write(int fd, const void* buffer,
   return static_cast<ssize_t>(result.value());
 }
 
-extern "C" ssize_t orchfs_async_pread(int fd, void* buffer, size_t length,
-                                       off_t offset) {
+extern "C" ssize_t orchfs_async_pread(int fd, void *buffer, size_t length,
+                                      off_t offset) {
   if ((!buffer && length != 0) || offset < 0) {
     return fail(!buffer && length != 0 ? EFAULT : EINVAL,
                 static_cast<ssize_t>(-1));
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, static_cast<ssize_t>(-1));
@@ -804,13 +891,13 @@ extern "C" ssize_t orchfs_async_pread(int fd, void* buffer, size_t length,
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, static_cast<ssize_t>(-1));
   }
-  std::shared_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, static_cast<ssize_t>(-1));
   }
-  auto result = run(adapter, slot->file.read_at(
-                                 static_cast<std::uint64_t>(offset),
-                                 {static_cast<std::byte*>(buffer), length}));
+  auto result = run(
+      adapter, slot->file.read_at(static_cast<std::uint64_t>(offset),
+                                  {static_cast<std::byte *>(buffer), length}));
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -820,14 +907,14 @@ extern "C" ssize_t orchfs_async_pread(int fd, void* buffer, size_t length,
   return static_cast<ssize_t>(result.value());
 }
 
-extern "C" ssize_t orchfs_async_pwrite(int fd, const void* buffer,
-                                        size_t length, off_t offset) {
+extern "C" ssize_t orchfs_async_pwrite(int fd, const void *buffer,
+                                       size_t length, off_t offset) {
   if ((!buffer && length != 0) || offset < 0) {
     return fail(!buffer && length != 0 ? EFAULT : EINVAL,
                 static_cast<ssize_t>(-1));
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, static_cast<ssize_t>(-1));
@@ -835,13 +922,14 @@ extern "C" ssize_t orchfs_async_pwrite(int fd, const void* buffer,
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, static_cast<ssize_t>(-1));
   }
-  std::shared_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, static_cast<ssize_t>(-1));
   }
-  auto result = run(adapter, slot->file.write_at(
-                                 static_cast<std::uint64_t>(offset),
-                                 {static_cast<const std::byte*>(buffer), length}));
+  auto result = run(
+      adapter,
+      slot->file.write_at(static_cast<std::uint64_t>(offset),
+                          {static_cast<const std::byte *>(buffer), length}));
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -852,8 +940,8 @@ extern "C" ssize_t orchfs_async_pwrite(int fd, const void* buffer,
 }
 
 extern "C" off_t orchfs_async_lseek(int fd, off_t offset, int whence) {
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, static_cast<off_t>(-1));
@@ -861,7 +949,7 @@ extern "C" off_t orchfs_async_lseek(int fd, off_t offset, int whence) {
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, static_cast<off_t>(-1));
   }
-  std::unique_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, static_cast<off_t>(-1));
   }
@@ -876,12 +964,12 @@ extern "C" off_t orchfs_async_lseek(int fd, off_t offset, int whence) {
   return static_cast<off_t>(result.value());
 }
 
-extern "C" int orchfs_async_fstat(int fd, struct stat* stat_buffer) {
+extern "C" int orchfs_async_fstat(int fd, struct stat *stat_buffer) {
   if (!stat_buffer) {
     return fail(EFAULT, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, -1);
@@ -889,7 +977,7 @@ extern "C" int orchfs_async_fstat(int fd, struct stat* stat_buffer) {
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
-  std::shared_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, -1);
   }
@@ -901,13 +989,12 @@ extern "C" int orchfs_async_fstat(int fd, struct stat* stat_buffer) {
   return 0;
 }
 
-extern "C" int orchfs_async_stat(const char* path,
-                                  struct stat* stat_buffer) {
+extern "C" int orchfs_async_stat(const char *path, struct stat *stat_buffer) {
   if (!valid_path(path) || !stat_buffer) {
     return fail(!path || !stat_buffer ? EFAULT : ENOENT, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
@@ -919,12 +1006,12 @@ extern "C" int orchfs_async_stat(const char* path,
   return 0;
 }
 
-extern "C" int orchfs_async_fstatfs(int fd, struct statfs* stat_buffer) {
+extern "C" int orchfs_async_fstatfs(int fd, struct statfs *stat_buffer) {
   if (!stat_buffer) {
     return fail(EFAULT, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, -1);
@@ -932,7 +1019,7 @@ extern "C" int orchfs_async_fstatfs(int fd, struct statfs* stat_buffer) {
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
-  std::shared_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, -1);
   }
@@ -944,13 +1031,13 @@ extern "C" int orchfs_async_fstatfs(int fd, struct statfs* stat_buffer) {
   return 0;
 }
 
-extern "C" int orchfs_async_statfs(const char* path,
-                                    struct statfs* stat_buffer) {
+extern "C" int orchfs_async_statfs(const char *path,
+                                   struct statfs *stat_buffer) {
   if (!valid_path(path) || !stat_buffer) {
     return fail(!path || !stat_buffer ? EFAULT : ENOENT, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
@@ -970,17 +1057,18 @@ extern "C" int orchfs_async_statfs(const char* path,
   return 0;
 }
 
-extern "C" int orchfs_async_truncate(const char* path, off_t length) {
+extern "C" int orchfs_async_truncate(const char *path, off_t length) {
   if (!valid_path(path) || length < 0) {
     return fail(!path ? EFAULT : EINVAL, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
-  auto result = run(adapter, adapter.client->truncate(
-                                 path, static_cast<std::uint64_t>(length)));
+  auto result =
+      run(adapter,
+          adapter.client->truncate(path, static_cast<std::uint64_t>(length)));
   return result ? 0 : fail(result.error(), -1);
 }
 
@@ -988,8 +1076,8 @@ extern "C" int orchfs_async_ftruncate(int fd, off_t length) {
   if (length < 0) {
     return fail(EINVAL, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, -1);
@@ -997,7 +1085,7 @@ extern "C" int orchfs_async_ftruncate(int fd, off_t length) {
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
-  std::shared_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, -1);
   }
@@ -1007,8 +1095,8 @@ extern "C" int orchfs_async_ftruncate(int fd, off_t length) {
 }
 
 extern "C" int orchfs_async_fsync(int fd) {
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, -1);
@@ -1016,7 +1104,7 @@ extern "C" int orchfs_async_fsync(int fd) {
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
-  std::shared_lock lock(slot->mutex);
+  OwnerLease lock(slot->owner);
   if (slot->closed) {
     return fail(EBADF, -1);
   }
@@ -1025,8 +1113,8 @@ extern "C" int orchfs_async_fsync(int fd) {
 }
 
 extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_file(adapter, fd);
   if (!slot) {
     return fail(EBADF, -1);
@@ -1035,7 +1123,7 @@ extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
     return fail(adapter.initialization_error, -1);
   }
   if (command == F_GETFD || command == F_GETFL) {
-    std::shared_lock lock(slot->mutex);
+    OwnerLease lock(slot->owner);
     if (slot->closed) {
       return fail(EBADF, -1);
     }
@@ -1047,7 +1135,7 @@ extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
   }
 
   if (command == F_SETFD || command == F_SETFL) {
-    std::unique_lock lock(slot->mutex);
+    OwnerLease lock(slot->owner);
     if (slot->closed) {
       return fail(EBADF, -1);
     }
@@ -1064,8 +1152,7 @@ extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
     va_end(arguments);
     auto result = run(adapter, slot->file.set_flags(flags));
     if (result) {
-      slot->open_flags =
-          (slot->open_flags & (O_ACCMODE | O_DIRECTORY)) | flags;
+      slot->open_flags = (slot->open_flags & (O_ACCMODE | O_DIRECTORY)) | flags;
       return 0;
     }
     return fail(result.error(), -1);
@@ -1079,7 +1166,7 @@ extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
   return fail(EOPNOTSUPP, -1);
 }
 
-extern "C" int orchfs_async_access(const char* path, int mode) {
+extern "C" int orchfs_async_access(const char *path, int mode) {
   struct stat attributes {};
   if (orchfs_async_stat(path, &attributes) != 0) {
     return -1;
@@ -1111,12 +1198,12 @@ extern "C" int orchfs_async_access(const char* path, int mode) {
   return 0;
 }
 
-extern "C" int orchfs_async_mkdir(const char* path, mode_t mode) {
+extern "C" int orchfs_async_mkdir(const char *path, mode_t mode) {
   if (!valid_path(path)) {
     return fail(path ? ENOENT : EFAULT, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
@@ -1124,12 +1211,12 @@ extern "C" int orchfs_async_mkdir(const char* path, mode_t mode) {
   return result ? 0 : fail(result.error(), -1);
 }
 
-extern "C" int orchfs_async_rmdir(const char* path) {
+extern "C" int orchfs_async_rmdir(const char *path) {
   if (!valid_path(path)) {
     return fail(path ? ENOENT : EFAULT, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
@@ -1137,12 +1224,12 @@ extern "C" int orchfs_async_rmdir(const char* path) {
   return result ? 0 : fail(result.error(), -1);
 }
 
-extern "C" int orchfs_async_unlink(const char* path) {
+extern "C" int orchfs_async_unlink(const char *path) {
   if (!valid_path(path)) {
     return fail(path ? ENOENT : EFAULT, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
@@ -1150,13 +1237,12 @@ extern "C" int orchfs_async_unlink(const char* path) {
   return result ? 0 : fail(result.error(), -1);
 }
 
-extern "C" int orchfs_async_rename(const char* old_path,
-                                    const char* new_path) {
+extern "C" int orchfs_async_rename(const char *old_path, const char *new_path) {
   if (!valid_path(old_path) || !valid_path(new_path)) {
     return fail(!old_path || !new_path ? EFAULT : ENOENT, -1);
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
     return fail(adapter.initialization_error, -1);
   }
@@ -1164,37 +1250,34 @@ extern "C" int orchfs_async_rename(const char* old_path,
   return result ? 0 : fail(result.error(), -1);
 }
 
-extern "C" DIR* orchfs_async_opendir(const char* path) {
+extern "C" DIR *orchfs_async_opendir(const char *path) {
   if (!valid_path(path)) {
-    return fail(path ? ENOENT : EFAULT, static_cast<DIR*>(nullptr));
+    return fail(path ? ENOENT : EFAULT, static_cast<DIR *>(nullptr));
   }
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!ready(adapter)) {
-    return fail(adapter.initialization_error, static_cast<DIR*>(nullptr));
+    return fail(adapter.initialization_error, static_cast<DIR *>(nullptr));
   }
   auto opened = run(adapter, adapter.client->open_directory(path));
   if (!opened) {
-    return fail(opened.error(), static_cast<DIR*>(nullptr));
+    return fail(opened.error(), static_cast<DIR *>(nullptr));
   }
   try {
     auto slot = std::make_shared<DirectorySlot>(std::move(opened).value());
     auto token = std::make_unique<DirectoryToken>();
-    DIR* key = reinterpret_cast<DIR*>(token.get());
-    {
-      std::lock_guard lock(adapter.directories_mutex);
-      adapter.directories.emplace(key, std::move(slot));
-    }
+    DIR *key = reinterpret_cast<DIR *>(token.get());
+    insert_directory(adapter, key, std::move(slot));
     (void)token.release();
     return key;
-  } catch (const std::bad_alloc&) {
-    return fail(ENOMEM, static_cast<DIR*>(nullptr));
+  } catch (const std::bad_alloc &) {
+    return fail(ENOMEM, static_cast<DIR *>(nullptr));
   } catch (...) {
-    return fail(EIO, static_cast<DIR*>(nullptr));
+    return fail(EIO, static_cast<DIR *>(nullptr));
   }
 }
 
-extern "C" int orchfs_async_is_directory(DIR* directory) {
+extern "C" int orchfs_async_is_directory(DIR *directory) {
   if (!directory) {
     return 0;
   }
@@ -1208,41 +1291,41 @@ extern "C" int orchfs_async_is_directory(DIR* directory) {
   return magic == kDirectoryTokenMagic ? 1 : 0;
 }
 
-extern "C" struct dirent* orchfs_async_readdir(DIR* directory) {
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+extern "C" struct dirent *orchfs_async_readdir(DIR *directory) {
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!find_directory(adapter, directory)) {
-    return fail(EBADF, static_cast<struct dirent*>(nullptr));
+    return fail(EBADF, static_cast<struct dirent *>(nullptr));
   }
   if (!ready(adapter)) {
     return fail(adapter.initialization_error,
-                static_cast<struct dirent*>(nullptr));
+                static_cast<struct dirent *>(nullptr));
   }
   return read_directory_entry(adapter, directory, &DirectorySlot::entry);
 }
 
-extern "C" struct dirent64* orchfs_async_readdir64(DIR* directory) {
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+extern "C" struct dirent64 *orchfs_async_readdir64(DIR *directory) {
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   if (!find_directory(adapter, directory)) {
-    return fail(EBADF, static_cast<struct dirent64*>(nullptr));
+    return fail(EBADF, static_cast<struct dirent64 *>(nullptr));
   }
   if (!ready(adapter)) {
     return fail(adapter.initialization_error,
-                static_cast<struct dirent64*>(nullptr));
+                static_cast<struct dirent64 *>(nullptr));
   }
   return read_directory_entry(adapter, directory, &DirectorySlot::entry64);
 }
 
-extern "C" int orchfs_async_closedir(DIR* directory) {
-  auto& adapter = state();
-  std::shared_lock lifecycle_lock(adapter.lifecycle_mutex);
+extern "C" int orchfs_async_closedir(DIR *directory) {
+  auto &adapter = state();
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
   auto slot = find_directory(adapter, directory);
   if (!slot) {
     return fail(EBADF, -1);
   }
   {
-    std::lock_guard lock(slot->mutex);
+    OwnerLease lock(slot->owner);
     if (slot->closed) {
       return fail(EBADF, -1);
     }
@@ -1254,14 +1337,8 @@ extern "C" int orchfs_async_closedir(DIR* directory) {
     }
     slot->closed = true;
   }
-  {
-    std::lock_guard lock(adapter.directories_mutex);
-    const auto found = adapter.directories.find(directory);
-    if (found != adapter.directories.end() && found->second == slot) {
-      adapter.directories.erase(found);
-    }
-  }
-  auto* token = reinterpret_cast<DirectoryToken*>(directory);
+  erase_directory(adapter, directory, slot);
+  auto *token = reinterpret_cast<DirectoryToken *>(directory);
   if (token->magic == kDirectoryTokenMagic) {
     token->magic = 0;
   }

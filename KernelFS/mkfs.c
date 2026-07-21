@@ -3,12 +3,9 @@
 #include "balloc.h"
 #include "device.h"
 #include "log.h"
-#include "thdpool.h"
 #include "addr_util.h"
-#include "kernel_socket.h"
 #include "kindex.h"
 #include "../config/protocol.h"
-#include "../config/socket_config.h"
 #include "../config/config.h"
 
 // #define KERNEL_FUNC_DEBUG
@@ -24,9 +21,14 @@ int64_t kernel_inode_create(int i_type)
 	int64_t new_ino_id = alloc_single_inode(PAR_BLK_ID);
 
 
-	orch_kfs_inode_pt new_ino_pt = malloc(ORCH_INODE_SIZE);
+	orch_kfs_inode_pt new_ino_pt = calloc(1, ORCH_INODE_SIZE);
+	if(new_ino_pt == NULL)
+	{
+		perror("allocate root inode");
+		exit(EXIT_FAILURE);
+	}
 
-
+	new_ino_pt->i_number = new_ino_id;
 	new_ino_pt->i_size = 0;
 	new_ino_pt->i_idxroot = -1;
 	new_ino_pt->i_nlink = 0;
@@ -34,9 +36,13 @@ int64_t kernel_inode_create(int i_type)
 	new_ino_pt->i_gid =	0;
 	new_ino_pt->i_type = i_type;
 	new_ino_pt->i_mode = S_IRWXU | S_IRWXG | S_IRWXO;
-	korch_time_stamp(&new_ino_pt->i_atim);
-	korch_time_stamp(&new_ino_pt->i_ctim);
-	korch_time_stamp(&new_ino_pt->i_mtim);
+	struct timespec now;
+	korch_time_stamp(&now);
+	new_ino_pt->i_atim.tv_sec = now.tv_sec;
+	new_ino_pt->i_atim.tv_nsec = now.tv_nsec;
+	new_ino_pt->i_ctim = new_ino_pt->i_atim;
+	new_ino_pt->i_mtim = new_ino_pt->i_atim;
+	memset(new_ino_pt->reserved, 0, sizeof(new_ino_pt->reserved));
 
 
     int64_t inode_addr = INODE_BLKID_TO_DEVADDR(new_ino_id);

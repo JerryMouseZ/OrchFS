@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <malloc.h>
 #include <inttypes.h>
-#include <pthread.h>
+#include <stdatomic.h>
 #include <assert.h>
 
 
@@ -51,9 +51,7 @@ struct cache_data_t
     int64_t seg_blknum;                                  
     int64_t unit_size;                                    
     int64_t seg_num;                                   
-    int32_t* sync_flist;                                  
-    char** meta_memsp_pt;                                
-    pthread_spinlock_t* seg_lock_pt;                 
+    _Atomic(char*)* meta_memsp_pt;
 };
 typedef struct cache_data_t cache_data_t;
 typedef cache_data_t* cache_data_pt;
@@ -62,10 +60,10 @@ cache_data_t cache_data[MAX_CACHE_ID+1];
 
 
 
-void init_metadata_cache();
+int init_metadata_cache(void);
 
 
-void close_metadata_cache();
+void close_metadata_cache(void);
 
 
 void sync_inode(int64_t inode_id);

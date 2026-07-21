@@ -228,14 +228,18 @@ void test_error_categories() {
 
 void test_write_range_and_flush_fences() {
     using orchfs::nvme::detail::WriteCoordinator;
+    using orchfs::nvme::detail::WriteTicket;
     WriteCoordinator coordinator;
+    WriteTicket first_storage;
+    WriteTicket overlapping_storage;
+    WriteTicket disjoint_storage;
     std::error_code error;
 
-    auto first = coordinator.accept(0, 512, error);
+    auto first = coordinator.accept(first_storage, 0, 512, error);
     require(first && !error, "first physical write is accepted");
-    auto overlapping = coordinator.accept(256, 1024, error);
+    auto overlapping = coordinator.accept(overlapping_storage, 256, 1024, error);
     require(overlapping && !error, "overlapping physical write is accepted");
-    auto disjoint = coordinator.accept(1024, 1536, error);
+    auto disjoint = coordinator.accept(disjoint_storage, 1024, 1536, error);
     require(disjoint && !error, "disjoint physical write is accepted");
 
     const std::uint64_t fence = coordinator.capture_fence();
@@ -258,26 +262,30 @@ void test_write_range_and_flush_fences() {
             "flush fence opens after every captured write completes");
 
     const std::uint64_t completed_fence = coordinator.capture_fence();
-    auto later = coordinator.accept(2048, 2560, error);
+    WriteTicket later_storage;
+    auto later = coordinator.accept(later_storage, 2048, 2560, error);
     require(later && !error, "later write is accepted");
     require(coordinator.fence_ready(completed_fence),
             "writes accepted after a flush fence do not delay it");
     coordinator.complete(later);
 
-    auto invalid = coordinator.accept(4096, 4096, error);
+    WriteTicket invalid_storage;
+    auto invalid = coordinator.accept(invalid_storage, 4096, 4096, error);
     require(!invalid && error == std::make_error_code(std::errc::invalid_argument),
             "empty physical reservation is rejected");
 }
 
 void test_overlapping_write_concurrency() {
     using orchfs::nvme::detail::WriteCoordinator;
+    using orchfs::nvme::detail::WriteTicket;
     WriteCoordinator coordinator;
     constexpr std::size_t request_count = 16;
+    std::array<WriteTicket, request_count> storage;
     std::vector<WriteCoordinator::Ticket> tickets;
     tickets.reserve(request_count);
     std::error_code error;
     for (std::size_t index = 0; index < request_count; ++index) {
-        auto ticket = coordinator.accept(4096, 8192, error);
+        auto ticket = coordinator.accept(storage[index], 4096, 8192, error);
         require(ticket && !error, "concurrent write ticket accepted");
         tickets.push_back(std::move(ticket));
     }

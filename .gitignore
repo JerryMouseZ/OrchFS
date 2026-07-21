@@ -3,6 +3,8 @@ NOTES.md
 RESOURCES.md
 assets/
 build/
+build-*/
+benchmark-results/
 lessons/
 reference/
 results/orchfs/all/

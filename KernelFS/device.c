@@ -10,6 +10,13 @@
 extern "C"{
 #endif
 
+static void* device_async_runtime;
+
+void device_set_async_runtime(void* runtime_handle)
+{
+	device_async_runtime = runtime_handle;
+}
+
 // #define MAX_WRITE_SIZE0               1024*1024*16
 // void* alignbuf = NULL;
 
@@ -20,7 +27,9 @@ void ssd_init()
 	fs_dev_info.ssd_write_fd = -1;
 
 #ifdef ORCHFS_USE_SPDK_DEVICE
-	int error_number = orchfs_spdk_device_start();
+	int error_number = device_async_runtime != NULL
+		? orchfs_spdk_device_start_on_runtime(device_async_runtime)
+		: orchfs_spdk_device_start();
 	if(error_number != 0)
 	{
 		fprintf(stderr, "start SPDK NVMe service error: %s (%d)\n",
@@ -91,16 +100,18 @@ void nvm_close()
 	munmap(fs_dev_info.nvm_base_addr,PMEM_LEN);
 }
 
+#ifdef ORCHFS_FORMATTER
 void ssd_read(void* dst, int64_t len, int64_t offset)
 {
 #ifdef ORCHFS_USE_SPDK_DEVICE
+#ifdef ORCHFS_FORMATTER
 	if(len < 0 || offset < 0)
 	{
 		fprintf(stderr, "invalid SPDK read range: %" PRId64 " %" PRId64 "\n",
 				len, offset);
 		exit(1);
 	}
-	int error_number = orchfs_spdk_device_read(
+	int error_number = orchfs_spdk_formatter_read(
 		(uint64_t)offset, dst, (size_t)len);
 	if(error_number != 0)
 	{
@@ -109,6 +120,11 @@ void ssd_read(void* dst, int64_t len, int64_t offset)
 				len, offset);
 		exit(1);
 	}
+#else
+	(void)dst; (void)len; (void)offset;
+	fprintf(stderr, "synchronous SSD read is not available in KFS\n");
+	abort();
+#endif
 #else
 	int64_t readnum = pread(fs_dev_info.ssd_read_fd, dst, len, offset);
 	if(readnum != len)
@@ -143,13 +159,14 @@ void shm_ssd_write(void* src, int64_t src_off, int64_t len, int64_t offset)
 {
 	assert(len % SIZE_4KiB == 0);
 #ifdef ORCHFS_USE_SPDK_DEVICE
+#ifdef ORCHFS_FORMATTER
 	if(src_off < 0 || len < 0 || offset < 0)
 	{
 		fprintf(stderr, "invalid SPDK shared write range\n");
 		exit(1);
 	}
 	const void *write_source = (const char *)src + src_off;
-	int error_number = orchfs_spdk_device_write(
+	int error_number = orchfs_spdk_formatter_write(
 		(uint64_t)offset, write_source, (size_t)len);
 	if(error_number != 0)
 	{
@@ -158,6 +175,11 @@ void shm_ssd_write(void* src, int64_t src_off, int64_t len, int64_t offset)
 				len, offset);
 		exit(1);
 	}
+#else
+	(void)src; (void)src_off; (void)len; (void)offset;
+	fprintf(stderr, "synchronous shared SSD write is not available in KFS\n");
+	abort();
+#endif
 #else
 	int64_t writenum = pwrite(fs_dev_info.ssd_write_fd, src + src_off, len, offset);
 	if(writenum != len)
@@ -172,13 +194,14 @@ void shm_ssd_write(void* src, int64_t src_off, int64_t len, int64_t offset)
 void ssd_write(void* src, int64_t len, int64_t offset)
 {
 #ifdef ORCHFS_USE_SPDK_DEVICE
+#ifdef ORCHFS_FORMATTER
 	if(len < 0 || offset < 0)
 	{
 		fprintf(stderr, "invalid SPDK write range: %" PRId64 " %" PRId64 "\n",
 				len, offset);
 		exit(1);
 	}
-	int error_number = orchfs_spdk_device_write(
+	int error_number = orchfs_spdk_formatter_write(
 		(uint64_t)offset, src, (size_t)len);
 	if(error_number != 0)
 	{
@@ -187,6 +210,11 @@ void ssd_write(void* src, int64_t len, int64_t offset)
 				len, offset);
 		exit(1);
 	}
+#else
+	(void)src; (void)len; (void)offset;
+	fprintf(stderr, "synchronous SSD write is not available in KFS\n");
+	abort();
+#endif
 #else
 	// printf("ssdw: %lld %lld\n",offset,len);
 	uint64_t end_byte = offset+len-1;
@@ -235,6 +263,7 @@ void ssd_write(void* src, int64_t len, int64_t offset)
 	free(alignbuf);
 #endif
 }
+#endif
 
 void avx_cpy(void *dest, const void *src, uint64_t size)
 {
@@ -340,24 +369,175 @@ void device_close()
 	nvm_close();
 }
 
+#ifdef ORCHFS_FORMATTER
 int device_sync()
 {
 	/* nvm_write() uses non-temporal stores. */
 	_mm_sfence();
 #ifdef ORCHFS_USE_SPDK_DEVICE
-	int error_number = orchfs_spdk_device_flush();
+#ifdef ORCHFS_FORMATTER
+	int error_number = orchfs_spdk_formatter_flush();
 	if(error_number != 0)
 	{
 		errno = error_number;
 		return -1;
 	}
 #else
+	errno = EOPNOTSUPP;
+	return -1;
+#endif
+#else
 	if(fs_dev_info.ssd_write_fd >= 0 && fsync(fs_dev_info.ssd_write_fd) != 0)
 		return -1;
 #endif
 	return 0;
 }
+#endif
 
+struct split_device_completion
+{
+	orchfs_device_completion_fn completion;
+	void* context;
+	size_t prefix_bytes;
+};
+
+static void complete_split_device(void* opaque, int error_number, size_t bytes)
+{
+	struct split_device_completion* split = opaque;
+	orchfs_device_completion_fn completion = split->completion;
+	void* context = split->context;
+	size_t prefix_bytes = split->prefix_bytes;
+	free(split);
+	completion(context, error_number,
+			error_number == 0 ? prefix_bytes + bytes : 0);
+}
+
+static int submit_split_completion(size_t prefix_bytes,
+		orchfs_device_completion_fn completion, void* context,
+		uint64_t ssd_offset, void* buffer, size_t length, int write_op)
+{
+	struct split_device_completion* split = malloc(sizeof(*split));
+	if(split == NULL)
+		return ENOMEM;
+	split->completion = completion;
+	split->context = context;
+	split->prefix_bytes = prefix_bytes;
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	int error_number = write_op
+		? orchfs_spdk_device_submit_write(ssd_offset, buffer, length,
+				&complete_split_device, split)
+		: orchfs_spdk_device_submit_read(ssd_offset, buffer, length,
+				&complete_split_device, split);
+	if(error_number != 0)
+		free(split);
+	return error_number;
+#else
+	if(write_op)
+		ssd_write(buffer, length, ssd_offset);
+	else
+		ssd_read(buffer, length, ssd_offset);
+	complete_split_device(split, 0, length);
+	return 0;
+#endif
+}
+
+int submit_read_data_from_devs(void* dst, int64_t len, int64_t offset,
+		orchfs_device_completion_fn completion, void* context)
+{
+	if((dst == NULL && len != 0) || len < 0 || offset < 0 ||
+		len > INT64_MAX - offset || completion == NULL)
+		return EINVAL;
+	if(len == 0)
+	{
+		completion(context, 0, 0);
+		return 0;
+	}
+	if(offset + len <= PMEM_LEN)
+	{
+		nvm_read(dst, len, offset);
+		completion(context, 0, len);
+		return 0;
+	}
+	if(offset < PMEM_LEN)
+	{
+		int64_t nvm_len = PMEM_LEN - offset;
+		int64_t ssd_len = len - nvm_len;
+		nvm_read(dst, nvm_len, offset);
+		return submit_split_completion(nvm_len, completion, context, 0,
+				(void*)((char*)dst + nvm_len), ssd_len, 0);
+	}
+	return submit_split_completion(0, completion, context, offset - PMEM_LEN,
+			dst, len, 0);
+}
+
+int submit_write_data_to_devs(const void* src, int64_t len, int64_t offset,
+		orchfs_device_completion_fn completion, void* context)
+{
+	if((src == NULL && len != 0) || len < 0 || offset < 0 ||
+		len > INT64_MAX - offset || completion == NULL)
+		return EINVAL;
+	if(len == 0)
+	{
+		completion(context, 0, 0);
+		return 0;
+	}
+	if(offset + len <= PMEM_LEN)
+	{
+		nvm_write((void*)src, len, offset);
+		completion(context, 0, len);
+		return 0;
+	}
+	if(offset < PMEM_LEN)
+	{
+		int64_t nvm_len = PMEM_LEN - offset;
+		int64_t ssd_len = len - nvm_len;
+		nvm_write((void*)src, nvm_len, offset);
+		return submit_split_completion(nvm_len, completion, context, 0,
+				(void*)((const char*)src + nvm_len), ssd_len, 1);
+	}
+	return submit_split_completion(0, completion, context, offset - PMEM_LEN,
+			(void*)src, len, 1);
+}
+
+int submit_device_sync(orchfs_device_completion_fn completion, void* context)
+{
+	if(completion == NULL)
+		return EINVAL;
+	_mm_sfence();
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	return orchfs_spdk_device_submit_flush(completion, context);
+#else
+	int error_number = 0;
+	if(fs_dev_info.ssd_write_fd >= 0 && fsync(fs_dev_info.ssd_write_fd) != 0)
+		error_number = errno != 0 ? errno : EIO;
+	completion(context, error_number, 0);
+	return 0;
+#endif
+}
+
+int orchfs_device_register_dma_region(void* address, size_t length)
+{
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	return orchfs_spdk_device_register_memory(address, length);
+#else
+	(void)address;
+	(void)length;
+	return ENOTSUP;
+#endif
+}
+
+int orchfs_device_unregister_dma_region(void* address, size_t length)
+{
+#ifdef ORCHFS_USE_SPDK_DEVICE
+	return orchfs_spdk_device_unregister_memory(address, length);
+#else
+	(void)address;
+	(void)length;
+	return ENOTSUP;
+#endif
+}
+
+#ifdef ORCHFS_FORMATTER
 void read_data_from_devs(void* dst, int64_t len, int64_t offset)
 {
 	if(offset + len <= PMEM_LEN)
@@ -425,12 +605,18 @@ void shm_write_data_to_devs(void* src, int64_t src_off, int64_t len, int64_t off
 void write_data_to_ssds_newbaseline(void* src, int64_t len, int64_t offset)
 {
 #ifdef ORCHFS_USE_SPDK_DEVICE
-	if(len < 0 || offset < 0 || orchfs_spdk_device_write(
+#ifdef ORCHFS_FORMATTER
+	if(len < 0 || offset < 0 || orchfs_spdk_formatter_write(
 			(uint64_t)offset, src, (size_t)len) != 0)
 	{
 		fprintf(stderr, "SPDK new-baseline write failed\n");
 		exit(1);
 	}
+#else
+	(void)src; (void)len; (void)offset;
+	fprintf(stderr, "synchronous SSD write is not available in KFS\n");
+	abort();
+#endif
 #else
 	int64_t writenum = pwrite(fs_dev_info.ssd_write_fd, src, len, offset);
 	assert(writenum == len);
@@ -441,12 +627,18 @@ void write_data_to_ssds_newbaseline(void* src, int64_t len, int64_t offset)
 void read_data_from_ssds_newbaseline(void* dst, int64_t len, int64_t offset)
 {
 #ifdef ORCHFS_USE_SPDK_DEVICE
-	if(len < 0 || offset < 0 || orchfs_spdk_device_read(
+#ifdef ORCHFS_FORMATTER
+	if(len < 0 || offset < 0 || orchfs_spdk_formatter_read(
 			(uint64_t)offset, dst, (size_t)len) != 0)
 	{
 		fprintf(stderr, "SPDK new-baseline read failed\n");
 		exit(1);
 	}
+#else
+	(void)dst; (void)len; (void)offset;
+	fprintf(stderr, "synchronous SSD read is not available in KFS\n");
+	abort();
+#endif
 #else
 	int64_t readnum = pread(fs_dev_info.ssd_read_fd, dst, len, offset);
 	assert(readnum == len);
@@ -467,6 +659,7 @@ void read_data_from_nvms_newbaseline(void* dst, int64_t len, int64_t offset)
 	memcpy(dst, target_nvm_addr, len);
 	return;
 }
+#endif
 
 
 #ifdef __cplusplus
