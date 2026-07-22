@@ -1,6 +1,7 @@
 #include "orchfs/async/client.hpp"
 
 #include "orchfs/async/detail/concurrency.hpp"
+#include "orchfs/async/detail/stat_conversion.hpp"
 #include "orchfs/async/ipc_transport.hpp"
 #include "orchfs/async/runtime.hpp"
 
@@ -96,39 +97,11 @@ template <typename T>
 }
 
 FileStat from_wire(const RpcFileStat& value) noexcept {
-  return FileStat{
-      .device = value.device,
-      .inode = value.inode,
-      .mode = value.mode,
-      .link_count = value.link_count,
-      .uid = value.uid,
-      .gid = value.gid,
-      .rdev = value.rdev,
-      .size = value.size,
-      .block_size = value.block_size,
-      .blocks = value.blocks,
-      .atime_seconds = value.atime_seconds,
-      .atime_nanoseconds = value.atime_nanoseconds,
-      .mtime_seconds = value.mtime_seconds,
-      .mtime_nanoseconds = value.mtime_nanoseconds,
-      .ctime_seconds = value.ctime_seconds,
-      .ctime_nanoseconds = value.ctime_nanoseconds,
-  };
+  return detail::copy_file_stat_fields<FileStat>(value);
 }
 
 FileSystemStat from_wire(const RpcStatFs& value) noexcept {
-  return FileSystemStat{
-      .type = value.type,
-      .block_size = value.block_size,
-      .blocks = value.blocks,
-      .blocks_free = value.blocks_free,
-      .blocks_available = value.blocks_available,
-      .files = value.files,
-      .files_free = value.files_free,
-      .name_length = value.name_length,
-      .fragment_size = value.fragment_size,
-      .flags = value.flags,
-  };
+  return detail::copy_filesystem_stat_fields<FileSystemStat>(value);
 }
 
 class ConnectAwaiter {

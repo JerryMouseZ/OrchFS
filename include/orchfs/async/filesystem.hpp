@@ -24,35 +24,15 @@ struct OpenedNode {
 };
 
 struct FileStat {
-  std::uint64_t device{};
-  std::uint64_t inode{};
-  std::uint64_t mode{};
-  std::uint64_t link_count{};
-  std::uint64_t uid{};
-  std::uint64_t gid{};
-  std::uint64_t rdev{};
-  std::int64_t size{};
-  std::int64_t block_size{};
-  std::int64_t blocks{};
-  std::int64_t atime_seconds{};
-  std::int64_t atime_nanoseconds{};
-  std::int64_t mtime_seconds{};
-  std::int64_t mtime_nanoseconds{};
-  std::int64_t ctime_seconds{};
-  std::int64_t ctime_nanoseconds{};
+#define ORCHFS_ASYNC_FILE_STAT_FIELD(type, name, posix_name) type name{};
+#include "orchfs/async/detail/stat_fields.inc"
+#undef ORCHFS_ASYNC_FILE_STAT_FIELD
 };
 
 struct FileSystemStat {
-  std::uint64_t type{};
-  std::uint64_t block_size{};
-  std::uint64_t blocks{};
-  std::uint64_t blocks_free{};
-  std::uint64_t blocks_available{};
-  std::uint64_t files{};
-  std::uint64_t files_free{};
-  std::uint64_t name_length{};
-  std::uint64_t fragment_size{};
-  std::uint64_t flags{};
+#define ORCHFS_ASYNC_FILESYSTEM_STAT_FIELD(type, name, posix_name) type name{};
+#include "orchfs/async/detail/stat_fields.inc"
+#undef ORCHFS_ASYNC_FILESYSTEM_STAT_FIELD
 };
 
 struct DirEntry {

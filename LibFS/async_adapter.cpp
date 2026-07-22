@@ -609,38 +609,19 @@ acquire_directory(AdapterState &adapter, DIR *directory) noexcept {
 
 void populate_stat(const FileStat &input, struct stat &output) noexcept {
   std::memset(&output, 0, sizeof(output));
-  output.st_dev = static_cast<dev_t>(input.device);
-  output.st_ino = static_cast<ino_t>(input.inode);
-  output.st_mode = static_cast<mode_t>(input.mode);
-  output.st_nlink = static_cast<nlink_t>(input.link_count);
-  output.st_uid = static_cast<uid_t>(input.uid);
-  output.st_gid = static_cast<gid_t>(input.gid);
-  output.st_rdev = static_cast<dev_t>(input.rdev);
-  output.st_size = static_cast<off_t>(input.size);
-  output.st_blksize = static_cast<blksize_t>(input.block_size);
-  output.st_blocks = static_cast<blkcnt_t>(input.blocks);
-  output.st_atim.tv_sec = static_cast<time_t>(input.atime_seconds);
-  output.st_atim.tv_nsec = static_cast<long>(input.atime_nanoseconds);
-  output.st_mtim.tv_sec = static_cast<time_t>(input.mtime_seconds);
-  output.st_mtim.tv_nsec = static_cast<long>(input.mtime_nanoseconds);
-  output.st_ctim.tv_sec = static_cast<time_t>(input.ctime_seconds);
-  output.st_ctim.tv_nsec = static_cast<long>(input.ctime_nanoseconds);
+#define ORCHFS_ASYNC_FILE_STAT_FIELD(type, name, posix_name) \
+  output.posix_name = static_cast<decltype(output.posix_name)>(input.name);
+#include "orchfs/async/detail/stat_fields.inc"
+#undef ORCHFS_ASYNC_FILE_STAT_FIELD
 }
 
 void populate_statfs(const FileSystemStat &input,
                      struct statfs &output) noexcept {
   std::memset(&output, 0, sizeof(output));
-  output.f_type = static_cast<decltype(output.f_type)>(input.type);
-  output.f_bsize = static_cast<decltype(output.f_bsize)>(input.block_size);
-  output.f_blocks = static_cast<decltype(output.f_blocks)>(input.blocks);
-  output.f_bfree = static_cast<decltype(output.f_bfree)>(input.blocks_free);
-  output.f_bavail =
-      static_cast<decltype(output.f_bavail)>(input.blocks_available);
-  output.f_files = static_cast<decltype(output.f_files)>(input.files);
-  output.f_ffree = static_cast<decltype(output.f_ffree)>(input.files_free);
-  output.f_namelen = static_cast<decltype(output.f_namelen)>(input.name_length);
-  output.f_frsize = static_cast<decltype(output.f_frsize)>(input.fragment_size);
-  output.f_flags = static_cast<decltype(output.f_flags)>(input.flags);
+#define ORCHFS_ASYNC_FILESYSTEM_STAT_FIELD(type, name, posix_name) \
+  output.posix_name = static_cast<decltype(output.posix_name)>(input.name);
+#include "orchfs/async/detail/stat_fields.inc"
+#undef ORCHFS_ASYNC_FILESYSTEM_STAT_FIELD
 }
 
 bool valid_path(const char *path) noexcept {

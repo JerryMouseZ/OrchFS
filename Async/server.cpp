@@ -3,6 +3,7 @@
 #include "orchfs/async/block_device.hpp"
 #include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/detail/range_lock.hpp"
+#include "orchfs/async/detail/stat_conversion.hpp"
 #include "orchfs/async/filesystem.hpp"
 #include "orchfs/async/ipc_transport.hpp"
 #include "orchfs/async/range_arbiter.hpp"
@@ -191,39 +192,11 @@ int validate_io_range(std::uint64_t offset, std::uint64_t length) noexcept {
 }
 
 RpcFileStat to_wire(const FileStat& value) noexcept {
-  return RpcFileStat{
-      .device = value.device,
-      .inode = value.inode,
-      .mode = value.mode,
-      .link_count = value.link_count,
-      .uid = value.uid,
-      .gid = value.gid,
-      .rdev = value.rdev,
-      .size = value.size,
-      .block_size = value.block_size,
-      .blocks = value.blocks,
-      .atime_seconds = value.atime_seconds,
-      .atime_nanoseconds = value.atime_nanoseconds,
-      .mtime_seconds = value.mtime_seconds,
-      .mtime_nanoseconds = value.mtime_nanoseconds,
-      .ctime_seconds = value.ctime_seconds,
-      .ctime_nanoseconds = value.ctime_nanoseconds,
-  };
+  return detail::copy_file_stat_fields<RpcFileStat>(value);
 }
 
 RpcStatFs to_wire(const FileSystemStat& value) noexcept {
-  return RpcStatFs{
-      .type = value.type,
-      .block_size = value.block_size,
-      .blocks = value.blocks,
-      .blocks_free = value.blocks_free,
-      .blocks_available = value.blocks_available,
-      .files = value.files,
-      .files_free = value.files_free,
-      .name_length = value.name_length,
-      .fragment_size = value.fragment_size,
-      .flags = value.flags,
-  };
+  return detail::copy_filesystem_stat_fields<RpcStatFs>(value);
 }
 
 struct Completion {
