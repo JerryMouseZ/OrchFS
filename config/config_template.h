@@ -86,8 +86,12 @@ extern "C"{
 
 
 // device
+#ifndef ORCH_DEV_NVM_PATH
 #define ORCH_DEV_NVM_PATH               "/dev/dax"
+#endif
+#ifndef ORCH_DEV_SSD_PATH
 #define ORCH_DEV_SSD_PATH               "/dev/nvme"
+#endif
 
 #define ORCH_MAX_NAME				    231
 #define ORCH_MAGIC_NAME            	    "ComFS_v1.0"
