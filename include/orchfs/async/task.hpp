@@ -298,7 +298,7 @@ public:
     }
 
     [[nodiscard]] Result<T> join() && noexcept(
-        std::is_nothrow_move_constructible_v<T>) {
+        std::is_void_v<T> || std::is_nothrow_move_constructible_v<T>) {
         auto state = std::move(state_);
         if (!state) {
             return Result<T>::failure(Errc::invalid_handle);
@@ -334,7 +334,7 @@ public:
         }
 
         [[nodiscard]] Result<T> await_resume() noexcept(
-            std::is_nothrow_move_constructible_v<T>) {
+            std::is_void_v<T> || std::is_nothrow_move_constructible_v<T>) {
             if (error_) {
                 return Result<T>::failure(error_);
             }
@@ -357,86 +357,6 @@ private:
         : state_(std::move(state)) {}
 
     std::shared_ptr<detail::CompletionState<T>> state_;
-
-    friend class Runtime;
-};
-
-template <>
-class [[nodiscard]] JoinHandle<void> {
-public:
-    JoinHandle() = default;
-    JoinHandle(const JoinHandle&) = delete;
-    JoinHandle& operator=(const JoinHandle&) = delete;
-    JoinHandle(JoinHandle&&) noexcept = default;
-    JoinHandle& operator=(JoinHandle&&) noexcept = default;
-    ~JoinHandle() = default;
-
-    [[nodiscard]] bool valid() const noexcept {
-        return static_cast<bool>(state_);
-    }
-
-    [[nodiscard]] bool ready() const noexcept {
-        return state_ && state_->ready();
-    }
-
-    [[nodiscard]] Result<void> join() && noexcept {
-        auto state = std::move(state_);
-        if (!state) {
-            return Result<void>::failure(Errc::invalid_handle);
-        }
-        if (detail::current_resume_target().runtime != nullptr) {
-            return Result<void>::failure(Errc::join_from_worker);
-        }
-        if (!state->begin_consume()) {
-            return Result<void>::failure(Errc::already_consumed);
-        }
-        state->wait();
-        return state->take();
-    }
-
-    class Awaiter {
-    public:
-        explicit Awaiter(std::shared_ptr<detail::CompletionState<void>> state) noexcept
-            : state_(std::move(state)) {
-            if (!state_) {
-                error_ = make_error_code(Errc::invalid_handle);
-            } else if (!state_->begin_consume()) {
-                error_ = make_error_code(Errc::already_consumed);
-            }
-        }
-
-        [[nodiscard]] bool await_ready() const noexcept {
-            return error_ || state_->ready();
-        }
-
-        [[nodiscard]] bool await_suspend(std::coroutine_handle<> waiter) noexcept {
-            return state_->register_waiter(waiter,
-                                           detail::current_resume_target());
-        }
-
-        [[nodiscard]] Result<void> await_resume() noexcept {
-            if (error_) {
-                return Result<void>::failure(error_);
-            }
-            return state_->take();
-        }
-
-    private:
-        std::shared_ptr<detail::CompletionState<void>> state_;
-        std::error_code error_;
-    };
-
-    [[nodiscard]] Awaiter operator co_await() && noexcept {
-        return Awaiter(std::move(state_));
-    }
-
-    Awaiter operator co_await() & = delete;
-
-private:
-    explicit JoinHandle(std::shared_ptr<detail::CompletionState<void>> state) noexcept
-        : state_(std::move(state)) {}
-
-    std::shared_ptr<detail::CompletionState<void>> state_;
 
     friend class Runtime;
 };
