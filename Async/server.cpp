@@ -375,7 +375,7 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
     std::uint32_t lane;
     std::size_t owner;
     Runtime::PollRegistration registration;
-    std::atomic<CompletionNode*> completion_inbox{nullptr};
+    detail::MpscInbox<CompletionNode> completion_inbox;
     CompletionQueue completions;
     std::atomic<std::size_t> inflight{0};
     std::atomic<bool> drained{false};
@@ -681,29 +681,16 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
     if (node == nullptr) {
       std::terminate();
     }
-    CompletionNode* head =
-        lane.completion_inbox.load(std::memory_order_relaxed);
-    do {
-      node->next = head;
-    } while (!lane.completion_inbox.compare_exchange_weak(
-        head, node, std::memory_order_release, std::memory_order_relaxed));
+    lane.completion_inbox.push(*node);
     (void)runtime_->notify(lane.owner);
   }
 
   bool drain_completion_inbox(LaneState& lane) noexcept {
-    if (lane.completion_inbox.load(std::memory_order_acquire) == nullptr) {
+    if (lane.completion_inbox.empty()) {
       return false;
     }
-    CompletionNode* stack =
-        lane.completion_inbox.exchange(nullptr, std::memory_order_acquire);
-    const bool progress = stack != nullptr;
-    CompletionNode* fifo = nullptr;
-    while (stack != nullptr) {
-      CompletionNode* next = stack->next;
-      stack->next = fifo;
-      fifo = stack;
-      stack = next;
-    }
+    CompletionNode* fifo = lane.completion_inbox.drain();
+    const bool progress = fifo != nullptr;
     while (fifo != nullptr) {
       CompletionNode* next = fifo->next;
       lane.completions.push_back(std::move(fifo->completion));
@@ -1683,7 +1670,7 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
   bool completions_empty(LaneState& lane) noexcept {
     (void)drain_completion_inbox(lane);
     return lane.completions.empty() &&
-           lane.completion_inbox.load(std::memory_order_acquire) == nullptr;
+           lane.completion_inbox.empty();
   }
 
   bool discard_completions(LaneState& lane) noexcept {
@@ -1869,6 +1856,18 @@ Task<void> run_session_cleanup(std::shared_ptr<ServerSession> session) {
 class Server::Impl {
   using SessionList = std::vector<std::shared_ptr<ServerSession>>;
 
+  struct RetirementLink {
+    [[nodiscard, gnu::always_inline]] static ServerSession* next(
+        const ServerSession& session) noexcept {
+      return session.retirement_next();
+    }
+
+    [[gnu::always_inline]] static void set_next(
+        ServerSession& session, ServerSession* next) noexcept {
+      session.set_retirement_next(next);
+    }
+  };
+
  public:
   Impl(Runtime& runtime, ServerOptions options, ControlServer listener)
       : runtime_(&runtime),
@@ -1919,7 +1918,7 @@ class Server::Impl {
     }
     // Completion callbacks may publish while join() drains the stable owner
     // snapshot. No accept poller remains to consume those intrusive links.
-    retired_sessions_.store(nullptr, std::memory_order_release);
+    retired_sessions_.clear();
     const int cleanup_error = cleanup_error_.load(std::memory_order_acquire);
     if (cleanup_error != 0) {
       return Result<void>::failure(
@@ -1953,28 +1952,14 @@ class Server::Impl {
   static void publish_retirement_entry(void* context,
                                        ServerSession* session) noexcept {
     auto& self = *static_cast<Impl*>(context);
-    ServerSession* head =
-        self.retired_sessions_.load(std::memory_order_relaxed);
-    do {
-      session->set_retirement_next(head);
-    } while (!self.retired_sessions_.compare_exchange_weak(
-        head, session, std::memory_order_release, std::memory_order_relaxed));
+    self.retired_sessions_.push(*session);
     (void)self.runtime_->notify(0);
   }
 
   bool drain_retired_sessions() noexcept {
-    ServerSession* retired =
-        retired_sessions_.exchange(nullptr, std::memory_order_acquire);
-    if (retired == nullptr) {
+    ServerSession* ordered = retired_sessions_.drain();
+    if (ordered == nullptr) {
       return false;
-    }
-
-    ServerSession* ordered = nullptr;
-    while (retired != nullptr) {
-      ServerSession* next = retired->retirement_next();
-      retired->set_retirement_next(ordered);
-      ordered = retired;
-      retired = next;
     }
 
     while (ordered != nullptr) {
@@ -2072,7 +2057,7 @@ class Server::Impl {
   bool session_stop_propagated_{false};
   Runtime::PollRegistration accept_poll_registration_;
   SessionList sessions_;
-  std::atomic<ServerSession*> retired_sessions_{nullptr};
+  detail::MpscInbox<ServerSession, RetirementLink> retired_sessions_;
   std::atomic<std::size_t> active_sessions_{0};
   std::atomic<std::size_t> retired_sessions_count_{0};
   std::atomic<std::size_t> active_dma_regions_{0};

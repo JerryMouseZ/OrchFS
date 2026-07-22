@@ -63,7 +63,7 @@ struct RangeState {
 
     ~RangeState() {
         registration.reset();
-        if (inbox.load(std::memory_order_acquire) != nullptr ||
+        if (!inbox.empty() ||
             !active.empty() || !waiting.empty()) {
             std::terminate();
         }
@@ -104,12 +104,7 @@ struct RangeState {
 
     void enqueue(RangeRequest& request, RangeOperation operation) noexcept {
         request.operation = operation;
-        RangeRequest* head = inbox.load(std::memory_order_relaxed);
-        do {
-            request.next = head;
-        } while (!inbox.compare_exchange_weak(
-            head, &request, std::memory_order_release,
-            std::memory_order_relaxed));
+        inbox.push(request);
         if (!owner_runtime->notify(owner_worker)) {
             std::terminate();
         }
@@ -165,16 +160,9 @@ private:
     }
 
     Runtime::PollState poll_once() noexcept {
-        RangeRequest* stack = inbox.exchange(nullptr, std::memory_order_acquire);
-        if (stack == nullptr) {
+        RangeRequest* fifo = inbox.drain();
+        if (fifo == nullptr) {
             return Runtime::PollState::idle;
-        }
-        RangeRequest* fifo = nullptr;
-        while (stack != nullptr) {
-            RangeRequest* next = stack->next;
-            stack->next = fifo;
-            fifo = stack;
-            stack = next;
         }
         while (fifo != nullptr) {
             RangeRequest* request = fifo;
@@ -311,7 +299,7 @@ private:
     std::size_t owner_worker{no_worker};
     Runtime::PollRegistration registration;
 
-    std::atomic<RangeRequest*> inbox{nullptr};
+    MpscInbox<RangeRequest> inbox;
     std::vector<std::shared_ptr<RangeRequest>> active;
     std::deque<std::shared_ptr<RangeRequest>> waiting;
 };

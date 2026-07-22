@@ -362,7 +362,7 @@ struct Runtime::Impl {
         static_assert((kRemoteWorkNodePoolSize &
                        (kRemoteWorkNodePoolSize - 1U)) == 0U);
 
-        std::atomic<WorkNode*> inbox{nullptr};
+        detail::MpscInbox<WorkNode> inbox;
         WorkNode* local_head{};
         WorkNode* local_tail{};
 
@@ -453,7 +453,7 @@ struct Runtime::Impl {
         }
 
         ~Worker() {
-            WorkNode* node = inbox.exchange(nullptr, std::memory_order_acquire);
+            WorkNode* node = inbox.take_all();
             while (node != nullptr) {
                 WorkNode* next = node->next;
                 if (!node->pooled) {
@@ -522,22 +522,14 @@ struct Runtime::Impl {
         // Avoid an unconditional atomic exchange (and cache-line ownership)
         // on every empty iteration.  wake_epoch still closes the load/park
         // race when a producer publishes immediately after this check.
-        if (worker.inbox.load(std::memory_order_acquire) == nullptr) {
+        if (worker.inbox.empty()) {
             return;
         }
-        WorkNode* stack =
-            worker.inbox.exchange(nullptr, std::memory_order_acquire);
-        if (stack == nullptr) {
+        WorkNode* fifo = worker.inbox.drain();
+        if (fifo == nullptr) {
             return;
         }
 
-        WorkNode* fifo = nullptr;
-        while (stack != nullptr) {
-            WorkNode* next = stack->next;
-            stack->next = fifo;
-            fifo = stack;
-            stack = next;
-        }
         WorkNode* tail = fifo;
         while (tail->next != nullptr) {
             tail = tail->next;
@@ -1189,12 +1181,7 @@ bool Runtime::schedule_internal(std::coroutine_handle<> coroutine,
         }
         target.local_tail = node;
     } else {
-        WorkNode* head = target.inbox.load(std::memory_order_relaxed);
-        do {
-            node->next = head;
-        } while (!target.inbox.compare_exchange_weak(
-            head, node, std::memory_order_release,
-            std::memory_order_relaxed));
+        target.inbox.push(*node);
     }
     impl_->wake_worker(worker);
     return true;

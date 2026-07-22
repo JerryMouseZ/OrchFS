@@ -1,5 +1,6 @@
 #include "orchfs/async/client.hpp"
 
+#include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/ipc_transport.hpp"
 #include "orchfs/async/runtime.hpp"
 
@@ -279,7 +280,7 @@ class Session final : public std::enable_shared_from_this<Session> {
     std::uint32_t lane;
     std::size_t owner;
     Runtime::PollRegistration registration;
-    std::atomic<InboxNode*> inbox{nullptr};
+    detail::MpscInbox<InboxNode> inbox;
     std::atomic<std::size_t> active_submitters{0};
     std::atomic<bool> peer_failure_checked{false};
     std::atomic<bool> drained{false};
@@ -320,8 +321,7 @@ class Session final : public std::enable_shared_from_this<Session> {
     control_registration_.reset();
     for (auto& lane : lanes_) {
       lane->registration.reset();
-      InboxNode* node =
-          lane->inbox.exchange(nullptr, std::memory_order_acquire);
+      InboxNode* node = lane->inbox.take_all();
       while (node != nullptr) {
         InboxNode* next = node->next;
         delete node;
@@ -671,11 +671,7 @@ class Session final : public std::enable_shared_from_this<Session> {
       return false;
     }
     outstanding_.fetch_add(1, std::memory_order_acq_rel);
-    InboxNode* head = lane.inbox.load(std::memory_order_relaxed);
-    do {
-      node->next = head;
-    } while (!lane.inbox.compare_exchange_weak(
-        head, node, std::memory_order_release, std::memory_order_relaxed));
+    lane.inbox.push(*node);
     finish_submit();
     if (!runtime_->notify(lane.owner)) {
       request_stop();
@@ -794,19 +790,11 @@ class Session final : public std::enable_shared_from_this<Session> {
   }
 
   bool drain_inbox(LaneState& lane) noexcept {
-    if (lane.inbox.load(std::memory_order_acquire) == nullptr) {
+    if (lane.inbox.empty()) {
       return false;
     }
-    InboxNode* stack =
-        lane.inbox.exchange(nullptr, std::memory_order_acquire);
-    const bool progress = stack != nullptr;
-    InboxNode* fifo = nullptr;
-    while (stack != nullptr) {
-      InboxNode* next = stack->next;
-      stack->next = fifo;
-      fifo = stack;
-      stack = next;
-    }
+    InboxNode* fifo = lane.inbox.drain();
+    const bool progress = fifo != nullptr;
     while (fifo != nullptr) {
       InboxNode* next = fifo->next;
       auto pending = std::move(fifo->pending);
@@ -927,7 +915,7 @@ class Session final : public std::enable_shared_from_this<Session> {
 
   static bool lane_empty(const LaneState& lane) noexcept {
     return lane.pending.empty() && lane.outbound.empty() &&
-           lane.inbox.load(std::memory_order_acquire) == nullptr &&
+           lane.inbox.empty() &&
            lane.active_submitters.load(std::memory_order_acquire) == 0;
   }
 

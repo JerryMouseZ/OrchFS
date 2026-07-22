@@ -10,6 +10,63 @@
 
 namespace orchfs::async::detail {
 
+template <typename Node>
+struct MemberNextLink {
+    [[nodiscard, gnu::always_inline]] static Node* next(
+        const Node& node) noexcept {
+        return node.next;
+    }
+
+    [[gnu::always_inline]] static void set_next(Node& node,
+                                                Node* next) noexcept {
+        node.next = next;
+    }
+};
+
+template <typename Node, typename Link = MemberNextLink<Node>>
+class MpscInbox final {
+public:
+    MpscInbox() = default;
+    MpscInbox(const MpscInbox&) = delete;
+    MpscInbox& operator=(const MpscInbox&) = delete;
+
+    [[nodiscard, gnu::always_inline]] bool empty() const noexcept {
+        return head_.load(std::memory_order_acquire) == nullptr;
+    }
+
+    [[gnu::always_inline]] void push(Node& node) noexcept {
+        Node* head = head_.load(std::memory_order_relaxed);
+        do {
+            Link::set_next(node, head);
+        } while (!head_.compare_exchange_weak(
+            head, &node, std::memory_order_release,
+            std::memory_order_relaxed));
+    }
+
+    [[nodiscard, gnu::always_inline]] Node* take_all() noexcept {
+        return head_.exchange(nullptr, std::memory_order_acquire);
+    }
+
+    [[nodiscard, gnu::always_inline]] Node* drain() noexcept {
+        Node* stack = take_all();
+        Node* fifo = nullptr;
+        while (stack != nullptr) {
+            Node* next = Link::next(*stack);
+            Link::set_next(*stack, fifo);
+            fifo = stack;
+            stack = next;
+        }
+        return fifo;
+    }
+
+    [[gnu::always_inline]] void clear() noexcept {
+        head_.store(nullptr, std::memory_order_release);
+    }
+
+private:
+    std::atomic<Node*> head_{nullptr};
+};
+
 template <bool kNormalize = true>
 [[nodiscard, gnu::always_inline]] inline std::error_code
 errno_error(int error) noexcept {

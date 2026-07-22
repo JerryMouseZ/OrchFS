@@ -1,6 +1,8 @@
+#include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/range_arbiter.hpp"
 #include "orchfs/async/runtime.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <coroutine>
@@ -38,6 +40,72 @@ void check(bool condition, std::string_view message) {
     if (!condition) {
         fail(message);
     }
+}
+
+struct InboxTestNode {
+    std::size_t producer{};
+    std::size_t sequence{};
+    InboxTestNode* next{};
+};
+
+void test_mpsc_inbox() {
+    constexpr std::size_t kProducers = 4;
+    constexpr std::size_t kNodesPerProducer = 128;
+
+    orchfs::async::detail::MpscInbox<InboxTestNode> inbox;
+    InboxTestNode first{.sequence = 0};
+    InboxTestNode second{.sequence = 1};
+    InboxTestNode third{.sequence = 2};
+    inbox.push(first);
+    inbox.push(second);
+    inbox.push(third);
+    InboxTestNode* ordered = inbox.drain();
+    check(ordered == &first && ordered->next == &second &&
+              ordered->next->next == &third && third.next == nullptr,
+          "MPSC inbox FIFO drain");
+    check(inbox.empty(), "MPSC inbox empty after drain");
+
+    std::array<std::array<InboxTestNode, kNodesPerProducer>, kProducers>
+        nodes{};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> producers;
+    producers.reserve(kProducers);
+    for (std::size_t producer = 0; producer < kProducers; ++producer) {
+        producers.emplace_back([&, producer] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (std::size_t sequence = 0; sequence < kNodesPerProducer;
+                 ++sequence) {
+                auto& node = nodes[producer][sequence];
+                node.producer = producer;
+                node.sequence = sequence;
+                inbox.push(node);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& producer : producers) {
+        producer.join();
+    }
+
+    std::array<std::size_t, kProducers> next_sequence{};
+    std::size_t count = 0;
+    for (InboxTestNode* node = inbox.drain(); node != nullptr;
+         node = node->next) {
+        check(node->producer < kProducers, "MPSC inbox producer index");
+        check(node->sequence == next_sequence[node->producer],
+              "MPSC inbox per-producer FIFO order");
+        ++next_sequence[node->producer];
+        ++count;
+    }
+    check(count == kProducers * kNodesPerProducer,
+          "MPSC inbox concurrent node count");
+    for (const std::size_t sequence : next_sequence) {
+        check(sequence == kNodesPerProducer,
+              "MPSC inbox concurrent producer count");
+    }
+    check(inbox.empty(), "MPSC inbox empty after concurrent drain");
 }
 
 [[nodiscard]] std::chrono::nanoseconds thread_cpu_time(pthread_t thread) {
@@ -359,6 +427,8 @@ void require_ok(Result<Result<void>> outer, std::string_view message) {
 int main() {
     static_assert(!std::is_copy_constructible_v<Task<int>>);
     static_assert(!std::is_copy_constructible_v<JoinHandle<int>>);
+
+    test_mpsc_inbox();
 
     std::atomic<unsigned> unobserved_errors{0};
     RuntimeOptions options;
