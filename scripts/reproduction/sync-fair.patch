@@ -1,0 +1,70 @@
+diff --git a/KernelFS/device.c b/KernelFS/device.c
+--- a/KernelFS/device.c
++++ b/KernelFS/device.c
+@@ -12,7 +12,9 @@ void ssd_init()
+ {
+ 	// alignbuf = valloc(MAX_WRITE_SIZE0);
+ 
+-	fs_dev_info.ssd_read_fd = open(ORCH_DEV_SSD_PATH,  O_RDWR | O_SYNC); //
++	/* Fair-comparison instrumentation: bypass the Linux block page cache,
++	 * matching the SPDK data path used by the coroutine implementation. */
++	fs_dev_info.ssd_read_fd = open(ORCH_DEV_SSD_PATH, O_RDWR | __O_DIRECT); //
+ 	// fs_dev_info.ssd_read_fd = open("/dev/nvme0n1",  O_RDWR | __O_DIRECT); //
+     if (fs_dev_info.ssd_read_fd < 0) 
+ 	{
+@@ -256,6 +258,12 @@ void device_close()
+ 	nvm_close();
+ }
+ 
++int device_sync()
++{
++	_mm_sfence();
++	return fsync(fs_dev_info.ssd_write_fd);
++}
++
+ void read_data_from_devs(void* dst, int64_t len, int64_t offset)
+ {
+ 	if(offset + len <= PMEM_LEN)
+diff --git a/KernelFS/device.h b/KernelFS/device.h
+--- a/KernelFS/device.h
++++ b/KernelFS/device.h
+@@ -101,6 +101,8 @@ void device_init();
+ 
+ void device_close();
+ 
++int device_sync();
++
+ void read_data_from_devs(void* dst, int64_t len, int64_t offset);
+ 
+ void write_data_to_devs(void* src, int64_t len, int64_t offset);
+diff --git a/LibFS/orchfs_wrapper.c b/LibFS/orchfs_wrapper.c
+--- a/LibFS/orchfs_wrapper.c
++++ b/LibFS/orchfs_wrapper.c
+@@ -16,3 +16,5 @@
+ #include "../config/config.h"
+ #include "ffile.h"
++
++int device_sync(void);
+ // #define WRAPPER_DEBUG
+@@ -950,8 +952,7 @@ OP_DEFINE(FSYNC){
+ 	// printf("fsync fd=%d\n",file);
+ 	// fflush(stdout);
+ 	if(file >= ORCH_FD_OFFSET){
+-		// printf("my fsync\n");
+-		return 0;
++		return device_sync();
+ 	}
+ 	else{
+ 		return real_ops.FSYNC(file);
+diff --git a/config/config.h b/config/config.h
+--- a/config/config.h
++++ b/config/config.h
+@@ -87,7 +87,7 @@ extern "C"{
+ 
+ // device
+ #define ORCH_DEV_NVM_PATH     "/dev/dax0.1"
+-#define ORCH_DEV_SSD_PATH     "/dev/nvme1n1"
++#define ORCH_DEV_SSD_PATH     "/dev/disk/by-id/nvme-SAMSUNG_MZPLJ3T2HBJR-00007_S55HNC0W100205_1"
+ 
+ // threads
+ #define ORCH_CONFIG_NVMTHD     4

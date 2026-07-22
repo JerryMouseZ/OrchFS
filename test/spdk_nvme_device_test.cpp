@@ -266,12 +266,17 @@ public:
     ~Device() { (void)close(); }
 
     bool read(std::uint64_t offset, std::vector<std::byte> &buffer) noexcept {
-        return run("read", buffer.size(), [&](Completion &completion) {
+        return read_bytes(offset, buffer.data(), buffer.size());
+    }
+
+    bool read_bytes(std::uint64_t offset, void *buffer,
+                    std::size_t length) noexcept {
+        return run("read", length, [&](Completion &completion) {
             return orchfs_spdk_submit_read(backend_,
                                            kPollerId,
                                            offset,
-                                           buffer.data(),
-                                           buffer.size(),
+                                           buffer,
+                                           length,
                                            complete,
                                            &completion);
         });
@@ -279,12 +284,17 @@ public:
 
     bool write(std::uint64_t offset,
                const std::vector<std::byte> &buffer) noexcept {
-        return run("write", buffer.size(), [&](Completion &completion) {
+        return write_bytes(offset, buffer.data(), buffer.size());
+    }
+
+    bool write_bytes(std::uint64_t offset, const void *buffer,
+                     std::size_t length) noexcept {
+        return run("write", length, [&](Completion &completion) {
             return orchfs_spdk_submit_write(backend_,
                                             kPollerId,
                                             offset,
-                                            buffer.data(),
-                                            buffer.size(),
+                                            buffer,
+                                            length,
                                             complete,
                                             &completion);
         });
@@ -376,6 +386,48 @@ private:
 
     orchfs_spdk_backend *backend_{};
     bool reported_shutdown_error_{};
+};
+
+class RegisteredBuffer {
+public:
+    RegisteredBuffer(orchfs_spdk_backend *backend, std::size_t length)
+        : backend_(backend), length_(length) {
+        if (::posix_memalign(&memory_, 4096, length_) != 0) {
+            memory_ = nullptr;
+            return;
+        }
+        const int error = orchfs_spdk_register_memory(
+            backend_, memory_, length_);
+        if (error != 0) {
+            std::cerr << "SPDK memory registration failed: " << error << " ("
+                      << errno_message(error) << ")\n";
+            std::free(memory_);
+            memory_ = nullptr;
+        }
+    }
+
+    ~RegisteredBuffer() {
+        if (memory_ != nullptr) {
+            const int error = orchfs_spdk_unregister_memory(
+                backend_, memory_, length_);
+            if (error != 0) {
+                std::cerr << "SPDK memory unregister failed: " << error
+                          << " (" << errno_message(error) << ")\n";
+            }
+            std::free(memory_);
+        }
+    }
+
+    RegisteredBuffer(const RegisteredBuffer &) = delete;
+    RegisteredBuffer &operator=(const RegisteredBuffer &) = delete;
+
+    explicit operator bool() const noexcept { return memory_ != nullptr; }
+    std::byte *data() noexcept { return static_cast<std::byte *>(memory_); }
+
+private:
+    orchfs_spdk_backend *backend_{};
+    std::size_t length_{};
+    void *memory_{};
 };
 
 class RestoreGuard {
@@ -624,6 +676,40 @@ int main() {
         return 1;
     }
     std::cout << "unaligned write/read verification: PASS\n";
+
+    {
+    const std::size_t registered_length =
+        (std::max(save_length, write_length) + 4099U) & ~std::size_t{4095U};
+    RegisteredBuffer registered(raw_backend, registered_length);
+    if (!registered) {
+        std::cerr << "cannot allocate the registered odd-address fixture\n";
+        return 1;
+    }
+    for (std::size_t shift = 1; shift <= 3; ++shift) {
+        std::byte *odd = registered.data() + shift;
+        for (std::size_t index = 0; index < write_length; ++index) {
+            odd[index] = payload[index] ^ static_cast<std::byte>(shift * 0x11U);
+        }
+        std::copy(odd, odd + write_length,
+                  expected.begin() +
+                      static_cast<std::ptrdiff_t>(payload_in_save));
+        if (!device.write_bytes(write_offset, odd, write_length) ||
+            !device.flush() || !device.read(save_begin, observed) ||
+            observed != expected) {
+            std::cerr << "registered source +" << shift
+                      << " write verification failed\n";
+            return 1;
+        }
+        std::memset(odd, 0, save_length);
+        if (!device.read_bytes(save_begin, odd, save_length) ||
+            !std::equal(expected.begin(), expected.end(), odd)) {
+            std::cerr << "registered destination +" << shift
+                      << " read verification failed\n";
+            return 1;
+        }
+    }
+    std::cout << "registered odd-address +1/+2/+3 verification: PASS\n";
+    }
 
     if (!device.write(save_begin, saved) || !device.flush()) {
         std::cerr << "explicit restore/flush failed\n";

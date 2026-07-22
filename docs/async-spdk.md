@@ -90,8 +90,10 @@ the layer it actually changes:
 
 All four use 64 KiB requests, total QD 64, the same four KFS CPUs, 64
 coroutines where the layer has coroutines, 16,384 timed operations, and five
-runs. The direct and E2E write samples overwrite fully allocated extents and
-include the final sync. The runner records every sample plus the five-run
+runs. The direct and E2E write samples overwrite fully allocated extents; each
+successful write already satisfies the configured durability policy, and the
+final filesystem sync is therefore only a barrier/API check. The runner records
+every sample plus the five-run
 median for throughput, IOPS, and p99:
 
 ```bash
@@ -114,11 +116,10 @@ it is 64 KiB aligned, lies entirely above OrchFS's 1 TiB on-media format, and
 fits in the selected namespace. Override it only with an explicitly reserved
 range through `ORCHFS_LAYERED_BENCHMARK_DEVICE_OFFSET`.
 
-The official raw tool reports completed writes but does not issue the
-filesystem-level sync used by the three OrchFS write samples. Its raw write
-phase is therefore labeled `write`, while the other layers are labeled
-`write+sync`; this keeps the peak-device denominator explicit rather than
-silently presenting unlike durability semantics as identical.
+The official raw tool reports completed writes but does not inspect VWC or set
+OrchFS's FUA/flush policy. Its raw phase remains labeled `write`, while the
+other layers are labeled `durable-write`; on a controller with VWC the raw
+number is a peak-device denominator, not a durability-equivalent baseline.
 
 `spdk_nvme_device_test` is deliberately not a CTest. It refuses to read the
 namespace unless all of the following are supplied: the destructive opt-in,
@@ -242,6 +243,20 @@ caller until the operation completes. `File::close()` and `Directory::close()`
 report close errors; destructors schedule best-effort background close, and a
 clean runtime shutdown drains those operations.
 
+The adapter preserves the original synchronous OrchFS operations that had a
+real backing implementation: descriptor and positioned I/O, `openat`, seek,
+truncate, metadata/statfs queries, directory iteration, namespace mutation,
+stdio cookies, `fsync`/`fdatasync`, and `sync_file_range`. Every successful
+write response now includes SSD persistence under the selected policy, the
+inode-owner PMEM fence, and the metadata journal commit. Consequently
+`fsync`/`fdatasync` validate the descriptor and return locally without a second
+SHM RPC; `O_SYNC` and `O_DSYNC` do not add another flush. The legacy
+wrapper's `link()` success-without-a-namespace-change and generic `fcntl()`
+success-without-a-lock were stubs rather than supported semantics, so the
+async adapter reports `EOPNOTSUPP` instead of reproducing those false
+successes. The original wrapper's application-facing `mmap` hook was commented
+out and remains outside this compatibility surface.
+
 `RangePermit` may move through structured nested `Task` calls, but every permit
 must be explicitly released before its submitted root completes. Letting a
 permit escape as a `JoinHandle` result is a contract violation and terminates
@@ -266,6 +281,14 @@ concurrent. Flush captures a global write fence and waits for every logical
 write accepted through that fence on every worker before issuing the namespace
 flush.
 
+SSD write durability is selected once at startup. `auto` uses ordinary NVMe
+write completion only when Identify Controller reports that no volatile write
+cache is present; otherwise it uses FUA on every write command. Explicit
+`completion` is rejected with `ENOTSUP` when a volatile cache is reported,
+`fua` always sets the NVMe FUA flag, and `flush` issues one namespace flush
+after all SSD children in a filesystem write batch complete. The effective
+policy and controller VWC bit are printed in the KFS startup log.
+
 SPDK completion callbacks execute on their qpair's owning Runtime worker. They may
 submit more asynchronous work, but must not invoke blocking device entry points,
 stop the device service, or recursively poll the same qpair; these cases return
@@ -286,16 +309,19 @@ fence but does not replay an error that its caller already received.
 | Variable | Meaning |
 | --- | --- |
 | `ORCHFS_ASYNC_ENDPOINT` | Unix-domain control socket shared by LibFS and KFS |
-| `ORCHFS_CLIENT_WORKERS` | workers in each LibFS runtime (also bounds its IPC lanes) |
+| `ORCHFS_CLIENT_WORKERS` | workers in each LibFS runtime; IPC lanes map to them modulo this count |
+| `ORCHFS_CLIENT_CPU_LIST` | ordered, comma-separated LibFS Runtime CPUs; defaults to the high end of process affinity |
 | `ORCHFS_KFS_WORKERS` | authoritative KFS coroutine workers |
+| `ORCHFS_KFS_CPU_LIST` | ordered, comma-separated KFS Runtime CPUs; defaults to the low end of process affinity |
 | `ORCHFS_IPC_RING_CAPACITY` | descriptors per SQ/CQ lane |
 | `ORCHFS_IPC_DATA_SLOT_SIZE` | maximum payload bytes per descriptor; larger I/O is chunked |
 | `ORCHFS_SPDK_PCI_BDF` | required exact domain-qualified controller BDF; there is no device default |
 | `ORCHFS_SPDK_NSID` | required namespace ID on that controller; there is no namespace default |
-| `ORCHFS_SPDK_POLLER_COUNT` | standalone caller-polled formatter qpair count; production KFS uses `ORCHFS_KFS_WORKERS` |
+| `ORCHFS_SPDK_POLLER_COUNT` | qpair count (default 4), capped by KFS Runtime workers in production and by formatter CPUs offline |
 | `ORCHFS_SPDK_QUEUE_DEPTH` | NVMe qpair depth; default 32, leaving headroom above the measured 16 requests per worker |
 | `ORCHFS_SPDK_BOUNCE_BUFFERS` | DMA bounce buffers per poller; default 32 (registered shared slots bypass them) |
 | `ORCHFS_SPDK_MAX_TRANSFER_SIZE` | maximum bytes in one NVMe command; default 1 MiB |
+| `ORCHFS_SPDK_WRITE_DURABILITY` | `auto` (default), `completion`, `fua`, or `flush`; explicit unsafe completion is rejected |
 | `ORCHFS_SPDK_CPU_LIST` | standalone formatter qpair CPUs; production KFS uses its Runtime worker CPUs |
 | `ORCHFS_SPDK_HUGEPAGE_DIR` | hugetlbfs mount used by SPDK/DPDK |
 | `ORCHFS_SPDK_SHM_ID` | SPDK shared-memory ID; `-1` selects private mode |
@@ -304,6 +330,14 @@ fence but does not replay an error that its caller already received.
 | `ORCHFS_SPDK_TEST_BACKUP_FILE` | new `O_EXCL` backup file on independent storage |
 | `ORCHFS_SPDK_TEST_CONFIRM_RANGE` | exact BDF/NSID/write/save token printed by the first manual test run |
 
-CPU affinity should be explicit in production. Pin the KFS process to CPUs local
-to the NVMe controller; Runtime maps workers across that affinity set and each
-worker directly polls its own qpair, without a second SPDK service-thread set.
+CPU affinity should be explicit in production. `ORCHFS_CLIENT_CPU_LIST` and
+`ORCHFS_KFS_CPU_LIST` accept individual CPU IDs such as `1,3,5,7` (not ranges),
+reject duplicates, and use the first `*_WORKERS` entries. Keep the two lists
+mutually disjoint: both sides busy-poll an active shared-memory lane, so placing
+client worker 0 and KFS worker 0 on one logical CPU turns a tens-of-microseconds
+RPC into a CFS-timeslice-scale wait. Without explicit lists, KFS selects CPUs
+from the low end and a single LibFS process selects from the high end of their
+inherited affinity masks; multi-client deployments still need an explicit
+allocation. Prefer KFS CPUs local to the NVMe controller. Each qpair is
+directly polled by its owner KFS worker, without a second SPDK service-thread
+set.

@@ -5,7 +5,9 @@
 #include "async_adapter.h"
 
 #include "orchfs/async/client.hpp"
+#include "orchfs/async/detail/cpu_list.hpp"
 #include "orchfs/async/runtime.hpp"
+#include "orchfs/repro_trace.h"
 
 #include <algorithm>
 #include <array>
@@ -51,6 +53,11 @@ using orchfs::async::Task;
 constexpr int kMaximumLocalFd = 1048575;
 constexpr std::size_t kDirectoryBatchSize = 32;
 constexpr std::uint64_t kDirectoryTokenMagic = 0x4f52434844495231ULL;
+
+bool repro_leveldb_lock_noop_enabled() noexcept {
+  const char *value = std::getenv("ORCHFS_REPRO_LEVELDB_LOCK_NOOP");
+  return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+}
 
 // Application threads may wait for a POSIX call, but they must never create
 // or depend on a service thread.  This gate is used only at the synchronous
@@ -422,6 +429,39 @@ std::size_t configured_worker_count() noexcept {
   return static_cast<std::size_t>(parsed);
 }
 
+std::error_code configured_client_cpu_set(
+    std::size_t worker_count, std::vector<unsigned> &cpus) noexcept {
+  if (const char *text = std::getenv("ORCHFS_CLIENT_CPU_LIST");
+      text != nullptr && *text != '\0') {
+    return orchfs::async::detail::parse_cpu_list(text, cpus);
+  }
+
+  // KFS maps its workers from the low end of the inherited affinity mask.
+  // Put the single-process client default at the high end so its busy SHM
+  // poller cannot share a CFS runqueue with KFS worker 0.  Multi-client
+  // deployments should provide explicit, mutually disjoint CPU lists.
+  cpu_set_t affinity;
+  CPU_ZERO(&affinity);
+  if (::sched_getaffinity(0, sizeof(affinity), &affinity) != 0) {
+    return {errno, std::generic_category()};
+  }
+  try {
+    cpus.reserve(worker_count);
+    for (int cpu = CPU_SETSIZE - 1;
+         cpu >= 0 && cpus.size() < worker_count; --cpu) {
+      if (CPU_ISSET(cpu, &affinity)) {
+        cpus.push_back(static_cast<unsigned>(cpu));
+      }
+    }
+  } catch (const std::bad_alloc &) {
+    return std::make_error_code(std::errc::not_enough_memory);
+  }
+  if (cpus.size() != worker_count) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+  return {};
+}
+
 std::size_t configured_size(const char *name, std::size_t fallback) noexcept {
   const char *text = std::getenv(name);
   if (!text || !*text) {
@@ -762,6 +802,11 @@ extern "C" int orchfs_async_adapter_init(void) {
     if (!adapter.runtime) {
       RuntimeOptions runtime_options;
       runtime_options.worker_count = configured_worker_count();
+      if (const std::error_code cpu_error = configured_client_cpu_set(
+              runtime_options.worker_count, runtime_options.cpu_set)) {
+        adapter.initialization_error = cpu_error;
+        return fail(cpu_error, -1);
+      }
       runtime_options.blocking_spin_count =
           configured_size("ORCHFS_CLIENT_BLOCKING_SPINS", 1024);
       runtime_options.blocking_spin_limit =
@@ -866,6 +911,7 @@ extern "C" void orchfs_async_adapter_shutdown(void) {
   wait_for_active_calls(adapter);
   if (!adapter.runtime) {
     adapter.current_epoch.reset();
+    orchfs_repro_trace_flush();
     return;
   }
 
@@ -918,6 +964,7 @@ extern "C" void orchfs_async_adapter_shutdown(void) {
   adapter.runtime->request_stop();
   (void)adapter.runtime->join();
   adapter.runtime.reset();
+  orchfs_repro_trace_flush();
 }
 
 extern "C" int orchfs_async_open(const char *path, int flags, ...) {
@@ -1244,12 +1291,14 @@ extern "C" int orchfs_async_ftruncate(int fd, off_t length) {
 }
 
 extern "C" int orchfs_async_fsync(int fd) {
-  return with_file(
-      fd, -1,
-      [](FileLease &lease) {
-        return run(lease.epoch(), lease.slot().file.sync());
-      },
-      [] { return 0; });
+  auto lease = acquire_file(state(), fd);
+  if (!lease) {
+    return -1;
+  }
+  // Every successful write response already includes its selected SSD
+  // durability action and the inode-owner PMEM fence.  Keeping fsync local
+  // avoids a second SHM round trip while still validating the descriptor.
+  return 0;
 }
 
 extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
@@ -1291,6 +1340,20 @@ extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
 #ifdef F_SET_RW_HINT
   if (command == F_SET_RW_HINT) {
     // The legacy wrapper accepted this advisory hint without persisting it.
+    return 0;
+  }
+#endif
+#ifdef F_SETLK
+  if (command == F_SETLK && repro_leveldb_lock_noop_enabled()) {
+    // The synchronous LibFS treats advisory record locks as successful
+    // no-ops.  Preserve that compatibility for single-process databases
+    // such as the paper's LevelDB workload.  This does not provide
+    // inter-process exclusion.
+    return 0;
+  }
+#endif
+#ifdef F_SETLKW
+  if (command == F_SETLKW && repro_leveldb_lock_noop_enabled()) {
     return 0;
   }
 #endif

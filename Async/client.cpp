@@ -4,6 +4,7 @@
 #include "orchfs/async/detail/range_lock.hpp"
 #include "orchfs/async/detail/stat_conversion.hpp"
 #include "orchfs/async/ipc_transport.hpp"
+#include "orchfs/async/repro_trace.hpp"
 #include "orchfs/async/runtime.hpp"
 
 #include <algorithm>
@@ -231,6 +232,7 @@ class Session final : public std::enable_shared_from_this<Session> {
     bool direct_response{};
     bool stop_after_completion{};
     bool uses_inline_request{};
+    std::uint64_t trace_started_ns{};
 
     std::span<const std::byte> request_head() const noexcept {
       return uses_inline_request
@@ -256,6 +258,8 @@ class Session final : public std::enable_shared_from_this<Session> {
     Runtime::PollRegistration registration;
     detail::MpscInbox<InboxNode> inbox;
     std::atomic<std::size_t> active_submitters{0};
+    std::atomic<std::size_t> direct_waiters{0};
+    std::atomic_flag transport_gate = ATOMIC_FLAG_INIT;
     std::atomic<bool> peer_failure_checked{false};
     std::atomic<bool> drained{false};
     std::pmr::unsynchronized_pool_resource pending_pool;
@@ -392,6 +396,10 @@ class Session final : public std::enable_shared_from_this<Session> {
                                       : Errc::wrong_runtime);
     }
 
+    if (lanes_.size() > 1) {
+      return rpc_header_direct_blocking(opcode, request, request_tail);
+    }
+
     auto created = make_header_pending(opcode, request, request_tail, {});
     if (!created) {
       return Result<ReceivedIpcSlot>::failure(created.error());
@@ -459,7 +467,132 @@ class Session final : public std::enable_shared_from_this<Session> {
     }
   }
 
- private:
+  private:
+  Result<ReceivedIpcSlot> rpc_header_direct_blocking(
+      Opcode opcode, RpcRequest request,
+      std::span<const std::byte> request_tail) noexcept {
+    if (sizeof(RpcRequest) > config_.data_slot_size ||
+        request_tail.size() > config_.data_slot_size - sizeof(RpcRequest)) {
+      return Result<ReceivedIpcSlot>::failure(
+          std::make_error_code(std::errc::message_size));
+    }
+
+    // Give each blocking caller a stable SHM lane.  Using one process-wide
+    // blocking lane serialized otherwise independent POSIX pwrite/pread calls
+    // at the transport gate and prevented KFS/SPDK from seeing concurrency.
+    static thread_local const Session* direct_session = nullptr;
+    static thread_local std::uint32_t direct_lane = 0;
+    if (direct_session != this) {
+      direct_lane = next_direct_lane_.fetch_add(1, std::memory_order_relaxed) %
+                    static_cast<std::uint32_t>(lanes_.size());
+      direct_session = this;
+    }
+    auto& lane = *lanes_[direct_lane];
+    lane.direct_waiters.fetch_add(1, std::memory_order_acq_rel);
+    while (lane.transport_gate.test_and_set(std::memory_order_acquire)) {
+      if (!accepting_.load(std::memory_order_acquire)) {
+        lane.direct_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        return Result<ReceivedIpcSlot>::failure(
+            std::make_error_code(std::errc::not_connected));
+      }
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#else
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    }
+    lane.direct_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    struct GateGuard final {
+      std::atomic_flag* gate;
+      ~GateGuard() { gate->clear(std::memory_order_release); }
+    } gate_guard{&lane.transport_gate};
+
+    if (!accepting_.load(std::memory_order_acquire)) {
+      return Result<ReceivedIpcSlot>::failure(
+          std::make_error_code(std::errc::not_connected));
+    }
+    lane.active_submitters.fetch_add(1, std::memory_order_acq_rel);
+    outstanding_.fetch_add(1, std::memory_order_acq_rel);
+    struct CounterGuard final {
+      Session* session;
+      LaneState* lane;
+      ~CounterGuard() {
+        session->outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+        if (lane->active_submitters.fetch_sub(
+                1, std::memory_order_acq_rel) == 1) {
+          lane->active_submitters.notify_all();
+        }
+      }
+    } counter_guard{this, &lane};
+
+    request.schema_version = kRpcSchemaVersion;
+    request.path1_length = 0;
+    request.path2_length = 0;
+    request.data_length = static_cast<std::uint32_t>(request_tail.size());
+    IpcDescriptor descriptor;
+    descriptor.opcode = opcode;
+    descriptor.flags = DescriptorFlag::request | DescriptorFlag::has_payload;
+    descriptor.payload_length = static_cast<std::uint32_t>(
+        sizeof(RpcRequest) + request_tail.size());
+    descriptor.resume_worker = static_cast<std::uint32_t>(lane.owner);
+    const auto request_head = std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(&request), sizeof(request));
+    std::uint64_t request_id = 0;
+    const std::uint64_t trace_started_ns = orchfs_repro_trace_begin();
+    std::error_code error;
+    do {
+      error = transport_.try_submit_scattered(
+          lane.lane, descriptor, request_head, request_tail, &request_id);
+      if (error == make_error_code(TransportErrc::would_block)) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+      }
+    } while (error == make_error_code(TransportErrc::would_block) &&
+             accepting_.load(std::memory_order_acquire));
+    if (error) {
+      return Result<ReceivedIpcSlot>::failure(error);
+    }
+
+    std::uint32_t health_ticks = 0;
+    for (;;) {
+      ReceivedIpcSlot completion;
+      error = transport_.try_acquire_completion(lane.lane, completion);
+      if (!error) {
+        const auto& incoming = completion.descriptor();
+        if (incoming.request_id != request_id) {
+          return Result<ReceivedIpcSlot>::failure(
+              std::make_error_code(std::errc::protocol_error));
+        }
+        if (trace_started_ns != 0) {
+          const int trace_error = incoming.status < 0
+              ? -incoming.status : incoming.status;
+          orchfs_repro_trace_end(
+              ORCHFS_TRACE_CLIENT_ROUND_TRIP, request_id, trace_started_ns,
+              incoming.result_length, 1, trace_error);
+        }
+        std::uint64_t notifications = 0;
+        (void)transport_.drain_completion_notifications(
+            lane.lane, notifications);
+        return Result<ReceivedIpcSlot>::success(std::move(completion));
+      }
+      if (error != make_error_code(TransportErrc::would_block)) {
+        return Result<ReceivedIpcSlot>::failure(error);
+      }
+      if ((++health_ticks & 1023U) == 0 && !transport_.peer_alive()) {
+        return Result<ReceivedIpcSlot>::failure(
+            std::make_error_code(std::errc::connection_reset));
+      }
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#else
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    }
+  }
+
   Result<std::shared_ptr<Pending>> make_header_pending(
       Opcode opcode, RpcRequest request,
       std::span<const std::byte> request_tail,
@@ -520,11 +653,13 @@ class Session final : public std::enable_shared_from_this<Session> {
   }
 
   std::uint32_t select_lane(std::size_t resume_worker) noexcept {
-    if (config_.lane_count <= runtime_->worker_count()) {
-      return static_cast<std::uint32_t>(resume_worker % config_.lane_count);
+    const std::uint32_t asynchronous_lanes = config_.lane_count > 1
+        ? config_.lane_count - 1 : config_.lane_count;
+    if (asynchronous_lanes <= runtime_->worker_count()) {
+      return static_cast<std::uint32_t>(resume_worker % asynchronous_lanes);
     }
     return next_lane_.fetch_add(1, std::memory_order_relaxed) %
-           config_.lane_count;
+           asynchronous_lanes;
   }
 
   std::error_code start() noexcept {
@@ -592,6 +727,7 @@ class Session final : public std::enable_shared_from_this<Session> {
       pending->descriptor.request_id =
           next_request_id_.fetch_add(1, std::memory_order_relaxed);
     }
+    pending->trace_started_ns = orchfs_repro_trace_begin();
     pending->descriptor.resume_worker =
         static_cast<std::uint32_t>(pending->resume_worker);
 
@@ -707,6 +843,18 @@ class Session final : public std::enable_shared_from_this<Session> {
       finish_blocking_pending(pending, error, {});
       return;
     }
+    if (pending->trace_started_ns != 0) {
+      int trace_error = error ? error.value() : 0;
+      if (trace_error == 0 && descriptor.status != 0) {
+        trace_error = descriptor.status < 0 ? -descriptor.status
+                                             : descriptor.status;
+      }
+      orchfs_repro_trace_end(
+          ORCHFS_TRACE_CLIENT_ROUND_TRIP,
+          pending->descriptor.request_id, pending->trace_started_ns,
+          descriptor.result_length, 1, trace_error);
+      pending->trace_started_ns = 0;
+    }
     pending->error = error;
     pending->reply.descriptor = descriptor;
     pending->reply.payload = std::move(payload);
@@ -731,6 +879,19 @@ class Session final : public std::enable_shared_from_this<Session> {
     BlockingCall* call = std::exchange(pending->blocking_call, nullptr);
     if (call == nullptr) {
       std::terminate();
+    }
+    if (pending->trace_started_ns != 0) {
+      const auto descriptor = completion.descriptor();
+      int trace_error = error ? error.value() : 0;
+      if (trace_error == 0 && descriptor.status != 0) {
+        trace_error = descriptor.status < 0 ? -descriptor.status
+                                             : descriptor.status;
+      }
+      orchfs_repro_trace_end(
+          ORCHFS_TRACE_CLIENT_ROUND_TRIP,
+          pending->descriptor.request_id, pending->trace_started_ns,
+          descriptor.result_length, 1, trace_error);
+      pending->trace_started_ns = 0;
     }
     call->error = error;
     call->completion = std::move(completion);
@@ -902,6 +1063,14 @@ class Session final : public std::enable_shared_from_this<Session> {
     if (lane.drained.load(std::memory_order_acquire)) {
       return Runtime::PollState::idle;
     }
+    if (lane.direct_waiters.load(std::memory_order_acquire) != 0 ||
+        lane.transport_gate.test_and_set(std::memory_order_acquire)) {
+      return Runtime::PollState::busy;
+    }
+    struct GateGuard final {
+      std::atomic_flag* gate;
+      ~GateGuard() { gate->clear(std::memory_order_release); }
+    } gate_guard{&lane.transport_gate};
     bool progress = drain_inbox(lane);
     progress |= pump_submissions(lane);
     progress |= pump_completions(lane);
@@ -1017,6 +1186,7 @@ class Session final : public std::enable_shared_from_this<Session> {
   std::atomic<std::size_t> outstanding_{0};
   std::atomic<std::uint64_t> next_request_id_{1};
   std::atomic<std::uint32_t> next_lane_{0};
+  std::atomic<std::uint32_t> next_direct_lane_{0};
   std::uint32_t health_poll_ticks_{};
 };
 

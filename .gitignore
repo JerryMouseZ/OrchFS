@@ -9,3 +9,6 @@ lessons/
 reference/
 results/orchfs/all/
 scripts/micro/microtest
+.codex
+__pycache__/
+*.py[cod]

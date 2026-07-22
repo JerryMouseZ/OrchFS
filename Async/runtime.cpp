@@ -756,9 +756,13 @@ Result<std::unique_ptr<Runtime::Impl>> Runtime::make_impl(
         if (options.cpu_set.empty()) {
             options.cpu_set = available;
         } else {
-            for (unsigned cpu : options.cpu_set) {
+            for (auto position = options.cpu_set.begin();
+                 position != options.cpu_set.end(); ++position) {
+                const unsigned cpu = *position;
                 if (std::find(available.begin(), available.end(), cpu) ==
-                    available.end()) {
+                            available.end() ||
+                    std::find(options.cpu_set.begin(), position, cpu) !=
+                        position) {
                     return Result<std::unique_ptr<Impl>>::failure(
                         std::make_error_code(std::errc::invalid_argument));
                 }

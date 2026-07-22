@@ -1,6 +1,10 @@
 #include "orchfs/async/block_device.hpp"
 #include "orchfs/async/runtime.hpp"
 
+extern "C" {
+#include "../KernelFS/async_device.h"
+}
+
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -150,6 +154,10 @@ extern "C" int submit_write_data_to_devs(
 
 extern "C" int submit_device_sync(Completion completion, void* context) {
   return submit(0, completion, context);
+}
+
+extern "C" int orchfs_device_effective_write_durability() {
+  return ORCHFS_DEVICE_DURABILITY_COMPLETION;
 }
 
 int main() {

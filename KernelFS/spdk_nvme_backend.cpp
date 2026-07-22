@@ -21,6 +21,12 @@
 #endif
 
 namespace orchfs::nvme {
+
+bool detail::dword_aligned(const void *buffer) noexcept {
+    return buffer != nullptr &&
+           (reinterpret_cast<std::uintptr_t>(buffer) & 0x3U) == 0;
+}
+
 namespace {
 
 class BackendErrorCategory final : public std::error_category {
@@ -517,6 +523,12 @@ bool dma_addressable(const void *buffer, std::size_t length) noexcept {
     if (buffer == nullptr || length == 0) {
         return false;
     }
+    // NVMe PRP payload addresses are expressed in dwords.  A registered SHM
+    // range may still expose an odd request payload address, so registration
+    // alone is not sufficient for the direct path.
+    if (!detail::dword_aligned(buffer)) {
+        return false;
+    }
     std::uint64_t contiguous = length;
     if (spdk_vtophys(buffer, &contiguous) == SPDK_VTOPHYS_ERROR) {
         return false;
@@ -592,6 +604,8 @@ struct SpdkNvmeBackend::Impl {
     std::uint32_t lba{};
     std::uint32_t max_transfer{};
     std::uint64_t capacity{};
+    WriteDurability effective_write_durability{WriteDurability::completion};
+    bool volatile_write_cache_present{};
     std::vector<std::unique_ptr<PollerState>> pollers;
     std::atomic<bool> accepting{true};
     std::atomic<bool> stopping{false};
@@ -794,6 +808,10 @@ struct SpdkNvmeBackend::Impl {
         const std::uint64_t lba_offset = segment.device_offset / lba;
         const std::uint32_t lba_count =
             static_cast<std::uint32_t>(segment.device_length / lba);
+        const std::uint32_t write_flags =
+            effective_write_durability == WriteDurability::fua
+                ? SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS
+                : 0;
         if (direct_buffer != nullptr) {
             const int result = submit_with_retry(
                 poller,
@@ -806,7 +824,8 @@ struct SpdkNvmeBackend::Impl {
                         : spdk_nvme_ns_cmd_write(namespace_handle,
                                                  poller.qpair, direct_buffer,
                                                  lba_offset, lba_count,
-                                                 command_complete, &request, 0);
+                                                 command_complete, &request,
+                                                 write_flags);
                 },
                 poll_error);
             if (result == 0) {
@@ -885,7 +904,7 @@ struct SpdkNvmeBackend::Impl {
                                               lba_count,
                                               command_complete,
                                               &request,
-                                              0);
+                                              write_flags);
             },
             poll_error);
         if (result == 0) {
@@ -1067,7 +1086,14 @@ SpdkNvmeBackend::open(const Config &config, std::error_code &error) {
                   "%s",
                   config.pci_bdf.c_str());
 
-    struct spdk_nvme_ctrlr *controller = spdk_nvme_connect(&transport, nullptr, 0);
+    struct spdk_nvme_ctrlr_opts controller_options {};
+    spdk_nvme_ctrlr_get_default_ctrlr_opts(&controller_options,
+                                           sizeof(controller_options));
+    controller_options.num_io_queues = static_cast<std::uint32_t>(
+        std::min<std::size_t>(config.poller_count,
+                              std::numeric_limits<std::uint32_t>::max()));
+    struct spdk_nvme_ctrlr *controller = spdk_nvme_connect(
+        &transport, &controller_options, sizeof(controller_options));
     if (controller == nullptr) {
         spdk_env_fini();
         release_global_claim();
@@ -1106,17 +1132,54 @@ SpdkNvmeBackend::open(const Config &config, std::error_code &error) {
         return nullptr;
     }
 
+    const auto *negotiated_options = spdk_nvme_ctrlr_get_opts(controller);
+    const std::size_t negotiated_pollers = negotiated_options == nullptr
+        ? 0
+        : std::min<std::size_t>(config.poller_count,
+                                negotiated_options->num_io_queues);
+    if (negotiated_pollers == 0) {
+        spdk_nvme_detach(controller);
+        spdk_env_fini();
+        release_global_claim();
+        error = make_error_code(BackendErrc::controller_init_failed);
+        return nullptr;
+    }
+
+    const auto *controller_data = spdk_nvme_ctrlr_get_data(controller);
+    const bool volatile_write_cache_present =
+        controller_data != nullptr && controller_data->vwc.present != 0;
+    WriteDurability effective_write_durability = config.write_durability;
+    if (effective_write_durability == WriteDurability::auto_detect) {
+        effective_write_durability = volatile_write_cache_present
+            ? WriteDurability::fua
+            : WriteDurability::completion;
+    }
+    // Explicit completion is a valid persistent-write strategy only when the
+    // controller has no volatile cache.  Refuse an unsafe configuration rather
+    // than silently weakening pwrite's durability contract.
+    if (effective_write_durability == WriteDurability::completion &&
+        volatile_write_cache_present) {
+        spdk_nvme_detach(controller);
+        spdk_env_fini();
+        release_global_claim();
+        error = std::make_error_code(std::errc::operation_not_supported);
+        return nullptr;
+    }
+
     try {
         auto impl = std::make_unique<Impl>();
         impl->config = config;
+        impl->config.poller_count = negotiated_pollers;
         impl->controller = controller;
         impl->namespace_handle = namespace_handle;
         impl->lba = lba;
         impl->max_transfer = max_transfer;
         impl->capacity = spdk_nvme_ns_get_size(namespace_handle);
+        impl->effective_write_durability = effective_write_durability;
+        impl->volatile_write_cache_present = volatile_write_cache_present;
         impl->environment_started = true;
-        impl->pollers.reserve(config.poller_count);
-        for (std::size_t index = 0; index < config.poller_count; ++index) {
+        impl->pollers.reserve(negotiated_pollers);
+        for (std::size_t index = 0; index < negotiated_pollers; ++index) {
             impl->pollers.push_back(std::make_unique<PollerState>());
         }
         return std::unique_ptr<SpdkNvmeBackend>(
@@ -1524,6 +1587,23 @@ std::uint64_t SpdkNvmeBackend::capacity_bytes() const noexcept {
     return impl_ == nullptr ? 0 : impl_->capacity;
 #else
     return 0;
+#endif
+}
+
+WriteDurability SpdkNvmeBackend::write_durability() const noexcept {
+#ifdef ORCHFS_HAS_SPDK
+    return impl_ == nullptr ? WriteDurability::auto_detect
+                            : impl_->effective_write_durability;
+#else
+    return WriteDurability::auto_detect;
+#endif
+}
+
+bool SpdkNvmeBackend::volatile_write_cache_present() const noexcept {
+#ifdef ORCHFS_HAS_SPDK
+    return impl_ != nullptr && impl_->volatile_write_cache_present;
+#else
+    return false;
 #endif
 }
 

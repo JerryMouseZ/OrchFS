@@ -1,0 +1,105 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Usage:
+ *   sudo -E bpftrace -f json -c '<sync benchmark command>' \
+ *     scripts/reproduction/sync_profile.bt <encoded-dev_t>
+ *
+ * encoded-dev_t is (major << 20) | minor, matching the block tracepoint ABI.
+ * The benchmark command should contain only the measured phase: prepare the
+ * file in a separate invocation so prefill is not charged to the profile.
+ */
+
+BEGIN
+{
+  printf("orchfs_sync_profile cpid=%d encoded_dev=%d\n", cpid, $1);
+}
+
+tracepoint:syscalls:sys_enter_pwrite64
+/pid == cpid/
+{
+  @pwrite_started[tid] = nsecs;
+  @tracked[tid] = 1;
+  @pwrite_requested_bytes = sum(args->count);
+}
+
+tracepoint:syscalls:sys_exit_pwrite64
+/pid == cpid && @pwrite_started[tid]/
+{
+  @pwrite_ns = sum(nsecs - @pwrite_started[tid]);
+  @pwrite_count = count();
+  delete(@pwrite_started[tid]);
+}
+
+tracepoint:syscalls:sys_enter_pread64
+/pid == cpid && args->count >= 4096/
+{
+  @pread_started[tid] = nsecs;
+  @tracked[tid] = 1;
+  @pread_requested_bytes = sum(args->count);
+}
+
+tracepoint:syscalls:sys_exit_pread64
+/pid == cpid && @pread_started[tid]/
+{
+  @pread_ns = sum(nsecs - @pread_started[tid]);
+  @pread_count = count();
+  delete(@pread_started[tid]);
+}
+
+tracepoint:syscalls:sys_enter_fsync
+/pid == cpid/
+{
+  @fsync_started[tid] = nsecs;
+  @tracked[tid] = 1;
+}
+
+tracepoint:syscalls:sys_exit_fsync
+/pid == cpid && @fsync_started[tid]/
+{
+  @fsync_ns = sum(nsecs - @fsync_started[tid]);
+  @fsync_count = count();
+  delete(@fsync_started[tid]);
+}
+
+tracepoint:sched:sched_switch
+/@tracked[args->prev_pid]/
+{
+  @offcpu_started[args->prev_pid] = nsecs;
+}
+
+tracepoint:sched:sched_switch
+/@offcpu_started[args->next_pid]/
+{
+  @offcpu_ns = sum(nsecs - @offcpu_started[args->next_pid]);
+  @offcpu_count = count();
+  delete(@offcpu_started[args->next_pid]);
+}
+
+tracepoint:block:block_rq_issue
+/args->dev == $1/
+{
+  @block_started[args->sector, args->nr_sector] = nsecs;
+  @block_issue_bytes = sum(args->bytes);
+  @block_issue_count = count();
+}
+
+tracepoint:block:block_rq_complete
+/args->dev == $1 && @block_started[args->sector, args->nr_sector]/
+{
+  @block_complete_ns = sum(
+      nsecs - @block_started[args->sector, args->nr_sector]);
+  @block_complete_count = count();
+  @block_error_count = sum(args->error != 0);
+  delete(@block_started[args->sector, args->nr_sector]);
+}
+
+END
+{
+  clear(@tracked);
+  clear(@pwrite_started);
+  clear(@pread_started);
+  clear(@fsync_started);
+  clear(@offcpu_started);
+  clear(@block_started);
+}

@@ -150,6 +150,7 @@ env \
 
 common_server_env=(
   "ORCHFS_KFS_WORKERS=${worker_count}"
+  "ORCHFS_KFS_CPU_LIST=${server_cpus}"
   "ORCHFS_IPC_HUGEPAGES=1"
   "ORCHFS_IPC_RING_CAPACITY=64"
   "ORCHFS_IPC_DATA_SLOT_SIZE=$((block_size + 128))"

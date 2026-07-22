@@ -1,5 +1,6 @@
 #include "../config/config.h"
 #include "device.h"
+#include "orchfs/repro_trace.h"
 
 #if defined(ORCHFS_ENABLE_SPDK) && defined(ORCHFS_KFS_SERVER)
 #include "spdk_device_service.h"
@@ -305,7 +306,9 @@ void avx_cpy(void *dest, const void *src, uint64_t size)
 			src ++;
 			dest ++;
 		}
-		cache_wb_one(dest);
+			/* dest now points at the next cache line; flush the line that
+			 * received the byte-wise unaligned prefix. */
+			cache_wb_one(dest - 1);
 		// }
 		if(size == 0){
 			return;
@@ -338,14 +341,20 @@ void avx_cpy(void *dest, const void *src, uint64_t size)
 
 void nvm_read(void* dst, int64_t len, int64_t offset)
 {
+	uint64_t trace_started = orchfs_repro_trace_begin();
 	void* target_nvm_addr = (void*)(offset + (int64_t)fs_dev_info.nvm_base_addr);
 	memcpy(dst, target_nvm_addr, len);
+	orchfs_repro_trace_end(ORCHFS_TRACE_NVM_READ, 0, trace_started,
+			(uint64_t)len, 1, 0);
 }
 
 void nvm_write(void* src, int64_t len, int64_t offset)
 {
+	uint64_t trace_started = orchfs_repro_trace_begin();
 	void* target_nvm_addr = (void*)(offset + (int64_t)fs_dev_info.nvm_base_addr);
 	avx_cpy(target_nvm_addr, src, len);
+	orchfs_repro_trace_end(ORCHFS_TRACE_NVM_WRITE, 0, trace_started,
+			(uint64_t)len, 1, 0);
 }
 
 void device_init()
@@ -399,6 +408,8 @@ struct split_device_completion
 	orchfs_device_completion_fn completion;
 	void* context;
 	size_t prefix_bytes;
+	uint64_t trace_started;
+	enum orchfs_repro_trace_stage trace_stage;
 };
 
 static void complete_split_device(void* opaque, int error_number, size_t bytes)
@@ -407,6 +418,8 @@ static void complete_split_device(void* opaque, int error_number, size_t bytes)
 	orchfs_device_completion_fn completion = split->completion;
 	void* context = split->context;
 	size_t prefix_bytes = split->prefix_bytes;
+	orchfs_repro_trace_end(split->trace_stage, 0, split->trace_started,
+			bytes, 1, error_number);
 	free(split);
 	completion(context, error_number,
 			error_number == 0 ? prefix_bytes + bytes : 0);
@@ -422,6 +435,9 @@ static int submit_split_completion(size_t prefix_bytes,
 	split->completion = completion;
 	split->context = context;
 	split->prefix_bytes = prefix_bytes;
+	split->trace_started = orchfs_repro_trace_begin();
+	split->trace_stage = write_op ? ORCHFS_TRACE_SPDK_WRITE
+					   : ORCHFS_TRACE_SPDK_READ;
 #ifdef ORCHFS_USE_SPDK_DEVICE
 	int error_number = write_op
 		? orchfs_spdk_device_submit_write(ssd_offset, buffer, length,
@@ -534,6 +550,15 @@ int orchfs_device_unregister_dma_region(void* address, size_t length)
 	(void)address;
 	(void)length;
 	return ENOTSUP;
+#endif
+}
+
+int orchfs_device_effective_write_durability(void)
+{
+#ifdef ORCHFS_USE_SPDK_DEVICE
+    return orchfs_spdk_device_effective_write_durability();
+#else
+    return ORCHFS_DEVICE_DURABILITY_FLUSH;
 #endif
 }
 

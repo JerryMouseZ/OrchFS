@@ -9,10 +9,16 @@
 export ORCHFS_ASYNC_ENDPOINT="/tmp/orchfs-kfs.sock"
 export ORCHFS_CLIENT_WORKERS="1"
 export ORCHFS_CLIENT_LANES="4"
+# Ordered Runtime CPU IDs, not taskset range syntax. Empty makes a single
+# LibFS process use CPUs from the high end of its inherited affinity mask.
+export ORCHFS_CLIENT_CPU_LIST=""
 export ORCHFS_CLIENT_BLOCKING_SPINS="1024"
 export ORCHFS_CLIENT_BLOCKING_SPIN_LIMIT="4"
 export ORCHFS_CLIENT_BLOCKING_SPIN_WARMUP="64"
 export ORCHFS_KFS_WORKERS="16"
+# Keep this list disjoint from every colocated client list. Empty makes KFS
+# use CPUs from the low end of its inherited affinity mask.
+export ORCHFS_KFS_CPU_LIST=""
 export ORCHFS_IPC_RING_CAPACITY="64"
 export ORCHFS_IPC_DATA_SLOT_SIZE="1048576"
 
@@ -20,12 +26,16 @@ export ORCHFS_IPC_DATA_SLOT_SIZE="1048576"
 # the placeholder in place until nvme-cli/sysfs confirms the BDF-to-NSID map.
 export ORCHFS_SPDK_PCI_BDF="0000:BB:DD.F"
 export ORCHFS_SPDK_NSID="1"
-# KFS creates one qpair per ORCHFS_KFS_WORKERS Runtime worker. This standalone
-# poller count and CPU list apply only to the caller-polled mkfs formatter.
+# KFS creates this many qpairs, capped by ORCHFS_KFS_WORKERS; the default is 4.
+# ORCHFS_SPDK_CPU_LIST applies only to the caller-polled mkfs formatter.
 export ORCHFS_SPDK_POLLER_COUNT="4"
 export ORCHFS_SPDK_QUEUE_DEPTH="32"
 export ORCHFS_SPDK_BOUNCE_BUFFERS="32"
 export ORCHFS_SPDK_MAX_TRANSFER_SIZE="1048576"
+# auto uses completion when Identify Controller reports no volatile write
+# cache, otherwise FUA. Explicit completion is rejected when such a cache is
+# present; flush issues one namespace flush per filesystem write batch.
+export ORCHFS_SPDK_WRITE_DURABILITY="auto"
 # Empty selects the first CPUs in the formatter's process affinity mask.
 export ORCHFS_SPDK_CPU_LIST=""
 

@@ -1,6 +1,7 @@
 #include "orchfs/async/block_device.hpp"
 
 #include "orchfs/async/detail/concurrency.hpp"
+#include "orchfs/async/repro_trace.hpp"
 #include "../KernelFS/async_device.h"
 
 #include <cerrno>
@@ -396,39 +397,84 @@ Task<Result<std::size_t>> submit_batch(
 
 Task<Result<std::size_t>> AsyncBlockDevice::read(
     std::uint64_t offset, std::span<std::byte> destination) const {
-    co_return co_await BatchDeviceAwaiter<false>(
+    repro_trace::Span trace(ORCHFS_TRACE_DEVICE_READ, 0,
+                            destination.size());
+    auto result = co_await BatchDeviceAwaiter<false>(
         *runtime_, Operation::read,
         BatchRequest{.offset = offset,
                      .buffer = destination.data(),
                      .length = destination.size()});
+    trace.finish(result ? result.value() : 0,
+                 result ? std::error_code{} : result.error());
+    co_return result;
 }
 
 Task<Result<std::size_t>> AsyncBlockDevice::write(
     std::uint64_t offset, std::span<const std::byte> source) const {
-    co_return co_await BatchDeviceAwaiter<false>(
+    repro_trace::Span trace(ORCHFS_TRACE_DEVICE_WRITE, 0, source.size());
+    auto result = co_await BatchDeviceAwaiter<false>(
         *runtime_, Operation::write,
         BatchRequest{.offset = offset,
                      .buffer = const_cast<std::byte*>(source.data()),
                      .length = source.size()});
+    trace.finish(result ? result.value() : 0,
+                 result ? std::error_code{} : result.error());
+    co_return result;
 }
 
 Task<Result<std::size_t>> AsyncBlockDevice::read_batch(
     std::span<const BlockRead> requests) const {
-    return submit_batch<Operation::read>(*runtime_, requests);
+    std::uint64_t bytes = 0;
+    for (const auto& request : requests) {
+        bytes += request.destination.size();
+    }
+    repro_trace::Span trace(ORCHFS_TRACE_DEVICE_READ, 0, bytes,
+                            static_cast<std::uint32_t>(requests.size()));
+    auto result = co_await submit_batch<Operation::read>(*runtime_, requests);
+    trace.finish(result ? result.value() : 0,
+                 result ? std::error_code{} : result.error());
+    co_return result;
 }
 
 Task<Result<std::size_t>> AsyncBlockDevice::write_batch(
     std::span<const BlockWrite> requests) const {
-    return submit_batch<Operation::write>(*runtime_, requests);
+    std::uint64_t bytes = 0;
+    for (const auto& request : requests) {
+        bytes += request.source.size();
+    }
+    repro_trace::Span trace(ORCHFS_TRACE_DEVICE_WRITE, 0, bytes,
+                            static_cast<std::uint32_t>(requests.size()));
+    auto result = co_await submit_batch<Operation::write>(*runtime_, requests);
+    trace.finish(result ? result.value() : 0,
+                 result ? std::error_code{} : result.error());
+    co_return result;
 }
 
 Task<Result<void>> AsyncBlockDevice::flush() const {
+    repro_trace::Span trace(ORCHFS_TRACE_DEVICE_FLUSH);
     auto flushed = co_await BatchDeviceAwaiter<false>(
         *runtime_, Operation::flush, BatchRequest{});
     if (!flushed) {
+        trace.finish(0, flushed.error());
         co_return Result<void>::failure(flushed.error());
     }
+    trace.finish(0, 0);
     co_return Result<void>::success();
+}
+
+DeviceWriteDurability AsyncBlockDevice::write_durability() const noexcept {
+    switch (orchfs_device_effective_write_durability()) {
+    case ORCHFS_DEVICE_DURABILITY_COMPLETION:
+        return DeviceWriteDurability::completion;
+    case ORCHFS_DEVICE_DURABILITY_FUA:
+        return DeviceWriteDurability::fua;
+    case ORCHFS_DEVICE_DURABILITY_FLUSH:
+        return DeviceWriteDurability::flush;
+    default:
+        // A running production KFS always has a resolved SPDK policy.  Keep an
+        // unknown test/detached backend conservative.
+        return DeviceWriteDurability::flush;
+    }
 }
 
 } // namespace orchfs::async

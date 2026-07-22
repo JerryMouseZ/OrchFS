@@ -26,6 +26,18 @@ static void init_kernelFS_impl(int start_server)
 	device_init();
 	// printf("dev init!\n");
 	// fflush(stdout);
+	int format_error = orchfs_core_validate_format();
+	if(format_error != 0)
+	{
+		fprintf(stderr, "unsupported or corrupt OrchFS format: %s (%d); "
+				"run mkfs to create format v%" PRIu64 "\n",
+				strerror(format_error), format_error,
+				(uint64_t)ORCHFS_DISK_FORMAT_VERSION);
+		device_close();
+		device_set_async_runtime(NULL);
+		(void)orchfs_async_runtime_stop();
+		exit(1);
+	}
 
 	init_mem_bmp();
 	// printf("bitmap init!\n");
@@ -34,6 +46,18 @@ static void init_kernelFS_impl(int start_server)
 	init_kernel_log();
 	// printf("log init!\n");
 	// fflush(stdout);
+	int recovery_error = orchfs_core_recover();
+	if(recovery_error != 0)
+	{
+		fprintf(stderr, "recover OrchFS journal error: %s (%d)\n",
+				strerror(recovery_error), recovery_error);
+		close_kernel_log();
+		delete_mem_bmp();
+		device_close();
+		device_set_async_runtime(NULL);
+		(void)orchfs_async_runtime_stop();
+		exit(1);
+	}
 
 	/* The authoritative coroutine core uses the KFS-owned device, bitmap
 	 * allocator, and journal directly. No socket, SHM, or worker-pool service

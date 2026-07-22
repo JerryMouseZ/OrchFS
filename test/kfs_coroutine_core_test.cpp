@@ -59,6 +59,7 @@ std::atomic<int> device_error{0};
 std::atomic<bool> fail_allocation{false};
 std::atomic<bool> migration_candidate{false};
 std::atomic<std::size_t> block_query_count{0};
+std::atomic<std::size_t> strata_ensure_count{0};
 thread_local orchfs_log_transaction* bound_transaction{};
 
 struct PendingPmem {
@@ -113,6 +114,7 @@ void reset_ssd(std::size_t size) {
   }
   device_error.store(0, std::memory_order_release);
   fail_allocation.store(false, std::memory_order_release);
+  strata_ensure_count.store(0, std::memory_order_release);
 }
 
 void reset_virtual(std::size_t size) {
@@ -126,6 +128,7 @@ void reset_virtual(std::size_t size) {
   }
   device_error.store(0, std::memory_order_release);
   fail_allocation.store(false, std::memory_order_release);
+  strata_ensure_count.store(0, std::memory_order_release);
 }
 
 void copy_mapping(std::size_t block, orchfs_core_block* output) {
@@ -357,19 +360,28 @@ extern "C" int orchfs_core_prepare_write_blocks(
 }
 
 extern "C" int orchfs_core_ensure_strata(
-    std::int64_t inode, std::int64_t block, std::int64_t,
-    std::int64_t, orchfs_core_block* output) {
+    std::int64_t inode, std::int64_t block, std::int64_t start,
+    std::int64_t length, orchfs_core_block* output) {
   if (inode != kInode || block < 0 || output == nullptr ||
+      start < 0 || length <= 0 || start >= kBlockSize ||
+      length > static_cast<std::int64_t>(kBlockSize) - start ||
       static_cast<std::size_t>(block) >= file_state.blocks.size()) {
     return EINVAL;
   }
+  strata_ensure_count.fetch_add(1, std::memory_order_relaxed);
   auto& state = file_state.blocks[static_cast<std::size_t>(block)];
   if (state.type != ORCHFS_CORE_SSD_BLOCK &&
       state.type != ORCHFS_CORE_STRATA_BLOCK) {
     return EINVAL;
   }
   state.type = ORCHFS_CORE_STRATA_BLOCK;
-  for (std::size_t page = 0; page < kPageCount; ++page) {
+  const std::size_t first_page = static_cast<std::size_t>(start) / kPageSize;
+  const std::size_t last_page =
+      static_cast<std::size_t>(start + length - 1) / kPageSize;
+  for (std::size_t page = first_page; page <= last_page; ++page) {
+    if (state.nvm[page] >= 0) {
+      continue;
+    }
     state.nvm[page] = block * static_cast<std::int64_t>(kBlockSize) +
                       static_cast<std::int64_t>(page * kPageSize);
     state.metadata[page] = static_cast<std::int64_t>(
@@ -413,6 +425,8 @@ extern "C" int orchfs_core_sync_inode(std::int64_t inode) {
   return inode == kInode ? 0 : ENOENT;
 }
 
+extern "C" int orchfs_core_persist_pmem() { return 0; }
+
 extern "C" std::int64_t orchfs_core_root_inode(void) { return kInode; }
 
 extern "C" int orchfs_core_create_inode(
@@ -421,6 +435,7 @@ extern "C" int orchfs_core_create_inode(
 }
 
 extern "C" int orchfs_core_delete_inode(std::int64_t) { return ENOTSUP; }
+extern "C" int orchfs_core_set_orphan(std::int64_t, int) { return ENOTSUP; }
 
 extern "C" int submit_read_data_from_devs(
     void* destination, std::int64_t length, std::int64_t offset,
@@ -468,6 +483,10 @@ extern "C" int submit_device_sync(
   }
   completion(context, 0, 0);
   return 0;
+}
+
+extern "C" int orchfs_device_effective_write_durability() {
+  return ORCHFS_DEVICE_DURABILITY_COMPLETION;
 }
 
 extern "C" int orchfs_prepare_migration(orchfs_migration_plan** output) {
@@ -560,6 +579,63 @@ int main() {
     require(read_file(*runtime, core, file_size) == expected,
             "unaligned RMW changed protected bytes");
   }
+
+  for (const std::size_t length : {std::size_t{1024}, kPageSize}) {
+    constexpr std::size_t exact_offset = 2854777;
+    reset_ssd(4 * 1024 * 1024);
+    std::vector<std::byte> source(length);
+    for (std::size_t index = 0; index < source.size(); ++index) {
+      source[index] = static_cast<std::byte>((index * 47 + length) % 251);
+    }
+    auto written = run(
+        *runtime, core->write(kInode, exact_offset, source, false));
+    require(written && written.value().bytes == source.size(),
+            "Fig.19 exact-offset write failed");
+    std::vector<std::byte> readback(source.size());
+    auto read = run(*runtime, core->read(kInode, exact_offset, readback));
+    require(read && read.value() == source.size() && readback == source,
+            "Fig.19 exact-offset readback mismatch");
+  }
+
+  reset_ssd(kBlockSize);
+  std::array<std::byte, 1> first_strata_byte{std::byte{0x31}};
+  auto first_strata = run(
+      *runtime, core->write(kInode, 1, first_strata_byte, false));
+  require(first_strata && strata_ensure_count.load(std::memory_order_acquire) == 1,
+          "initial SSD-to-STRATA conversion failed");
+  std::array<std::byte, 1> later_strata_byte{std::byte{0x72}};
+  auto later_strata = run(
+      *runtime,
+      core->write(kInode, 2 * kPageSize + 7, later_strata_byte, false));
+  require(later_strata &&
+              strata_ensure_count.load(std::memory_order_acquire) == 2 &&
+              file_state.blocks.front().nvm[2] >= 0,
+          "existing STRATA block did not allocate a newly touched page");
+
+  reset_ssd(kBlockSize);
+  std::vector<std::byte> five_pages(5 * kPageSize, std::byte{0x45});
+  const std::vector<std::byte> device_before_five = device;
+  auto five_written = run(
+      *runtime, core->write(kInode, kPageSize, five_pages, false));
+  require(five_written &&
+              std::equal(device.begin() + kPageSize,
+                         device.begin() + 6 * kPageSize,
+                         device_before_five.begin() + kPageSize),
+          "five complete STRATA pages bypassed the NVM threshold");
+  std::vector<std::byte> five_readback(five_pages.size());
+  auto five_read = run(
+      *runtime, core->read(kInode, kPageSize, five_readback));
+  require(five_read && five_readback == five_pages,
+          "five-page NVM STRATA write was not readable");
+
+  reset_ssd(kBlockSize);
+  std::vector<std::byte> six_pages(6 * kPageSize, std::byte{0x6a});
+  auto six_written = run(
+      *runtime, core->write(kInode, kPageSize, six_pages, false));
+  require(six_written &&
+              std::equal(six_pages.begin(), six_pages.end(),
+                         device.begin() + kPageSize),
+          "six complete STRATA pages did not use the SSD threshold");
 
   reset_virtual(16);
   std::array<std::byte, 3> beyond{std::byte{'x'}, std::byte{'y'},

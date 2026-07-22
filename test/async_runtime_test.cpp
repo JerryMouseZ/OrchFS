@@ -1,5 +1,6 @@
 #include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/detail/range_lock.hpp"
+#include "orchfs/async/detail/cpu_list.hpp"
 #include "orchfs/async/range_arbiter.hpp"
 #include "orchfs/async/runtime.hpp"
 
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include <pthread.h>
+#include <sched.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -442,6 +444,34 @@ void require_ok(Result<Result<void>> outer, std::string_view message) {
 } // namespace
 
 int main() {
+    std::vector<unsigned> parsed_cpus;
+    check(!orchfs::async::detail::parse_cpu_list("3,7", parsed_cpus) &&
+              parsed_cpus == std::vector<unsigned>{3, 7},
+          "CPU list parse");
+    check(orchfs::async::detail::parse_cpu_list("3,3", parsed_cpus) ==
+              std::make_error_code(std::errc::invalid_argument) &&
+              parsed_cpus == std::vector<unsigned>{3, 7},
+          "duplicate CPU list rejection");
+
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    check(::sched_getaffinity(0, sizeof(affinity), &affinity) == 0,
+          "read process affinity");
+    unsigned first_cpu = 0;
+    while (first_cpu < CPU_SETSIZE && !CPU_ISSET(first_cpu, &affinity)) {
+        ++first_cpu;
+    }
+    check(first_cpu < CPU_SETSIZE, "non-empty process affinity");
+    RuntimeOptions duplicate_cpu_options;
+    duplicate_cpu_options.worker_count = 2;
+    duplicate_cpu_options.cpu_set = {first_cpu, first_cpu};
+    auto duplicate_cpu_runtime =
+        Runtime::create(std::move(duplicate_cpu_options));
+    check(!duplicate_cpu_runtime &&
+              duplicate_cpu_runtime.error() ==
+                  std::make_error_code(std::errc::invalid_argument),
+          "duplicate Runtime CPU rejection");
+
     static_assert(!std::is_copy_constructible_v<Task<int>>);
     static_assert(!std::is_copy_constructible_v<JoinHandle<int>>);
 

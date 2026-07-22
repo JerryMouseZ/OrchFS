@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
 
 #ifdef __cplusplus       
 extern "C"{
@@ -123,6 +124,7 @@ uint32_t sync_all_mem_bmp()
 			&bmp_info->bmp_used_num, __ATOMIC_ACQUIRE);
 	}
 	nvm_write(sb_addr, ORCH_SUPER_BLK_SIZE, OFFSET_SUPER_BLK);
+	_mm_sfence();
 	free(sb_addr);
 	return 0;
 }
@@ -139,6 +141,87 @@ uint32_t sync_mem_bmp(int32_t bmp_type, int64_t bit_off, int64_t bit_len)
 	uint64_t cpy_bytes = byte_end-byte_start+1;
 	nvm_write(bmp_info->bmp_start_pt+byte_start, cpy_bytes, bmp_info->dev_start_addr+byte_start);
 	return 0;
+}
+
+static int bitmap_change_location(int32_t bmp_type, int64_t block,
+		mem_bmp_pt* bitmap, uint64_t* byte_offset, uint8_t* mask)
+{
+	if(bmp_type < START_BMP_ID || bmp_type > END_BMP_ID || bitmap == NULL ||
+	   byte_offset == NULL || mask == NULL)
+		return EINVAL;
+	mem_bmp_pt selected = mem_bmp_arr + bmp_type;
+	if(block < 0 || (uint64_t)block >= selected->bmp_capacity * 8)
+		return EINVAL;
+	*bitmap = selected;
+	*byte_offset = (uint64_t)block / 8;
+	*mask = (uint8_t)(1U << (7U - (uint64_t)block % 8U));
+	return 0;
+}
+
+int orchfs_bitmap_persist_change(int32_t bmp_type, int64_t block,
+		int allocated)
+{
+	mem_bmp_pt bitmap = NULL;
+	uint64_t byte_offset = 0;
+	uint8_t mask = 0;
+	int error = bitmap_change_location(bmp_type, block, &bitmap,
+			&byte_offset, &mask);
+	if(error != 0 || (allocated != 0 && allocated != 1))
+		return error != 0 ? error : EINVAL;
+	uint8_t durable = 0;
+	nvm_read(&durable, sizeof(durable), bitmap->dev_start_addr + byte_offset);
+	durable = allocated ? (uint8_t)(durable | mask)
+				: (uint8_t)(durable & (uint8_t)~mask);
+	nvm_write(&durable, sizeof(durable), bitmap->dev_start_addr + byte_offset);
+	return 0;
+}
+
+int orchfs_bitmap_replay_change(int32_t bmp_type, int64_t block,
+		int allocated)
+{
+	mem_bmp_pt bitmap = NULL;
+	uint64_t byte_offset = 0;
+	uint8_t mask = 0;
+	int error = bitmap_change_location(bmp_type, block, &bitmap,
+			&byte_offset, &mask);
+	if(error != 0 || (allocated != 0 && allocated != 1))
+		return error != 0 ? error : EINVAL;
+	uint8_t* memory = (uint8_t*)bitmap->bmp_start_pt + byte_offset;
+	if(allocated)
+		(void)__atomic_fetch_or(memory, mask, __ATOMIC_ACQ_REL);
+	else
+		(void)__atomic_fetch_and(memory, (uint8_t)~mask, __ATOMIC_ACQ_REL);
+	return orchfs_bitmap_persist_change(bmp_type, block, allocated);
+}
+
+void orchfs_bitmap_recompute_counts(void)
+{
+	for(int type = START_BMP_ID; type <= END_BMP_ID; ++type)
+	{
+		mem_bmp_pt bitmap = mem_bmp_arr + type;
+		uint64_t used = 0;
+		const uint8_t* bytes = bitmap->bmp_start_pt;
+		for(uint64_t offset = 0; offset < bitmap->bmp_capacity; ++offset)
+			used += (uint64_t)__builtin_popcount((unsigned int)bytes[offset]);
+		__atomic_store_n(&bitmap->bmp_used_num, used, __ATOMIC_RELEASE);
+	}
+}
+
+int64_t orchfs_bitmap_next_allocated(int32_t bmp_type, int64_t after)
+{
+	if(bmp_type < START_BMP_ID || bmp_type > END_BMP_ID || after < -1)
+		return -1;
+	mem_bmp_pt bitmap = mem_bmp_arr + bmp_type;
+	const uint64_t total = bitmap->bmp_capacity * 8;
+	for(uint64_t bit = (uint64_t)(after + 1); bit < total; ++bit)
+	{
+		const uint8_t byte = __atomic_load_n(
+				(uint8_t*)bitmap->bmp_start_pt + bit / 8,
+				__ATOMIC_ACQUIRE);
+		if((byte & (uint8_t)(1U << (7U - bit % 8U))) != 0)
+			return (int64_t)bit;
+	}
+	return -1;
 }
 
 void delete_mem_bmp()
@@ -158,6 +241,47 @@ void delete_mem_bmp()
 			exit(0);
 		}
 	}
+}
+
+int orchfs_repro_space_snapshot(const char* label)
+{
+	const char* path = getenv("ORCHFS_REPRO_SPACE_FILE");
+	if(path == NULL || *path == '\0')
+		return 0;
+	FILE* output = fopen(path, "a+");
+	if(output == NULL)
+		return errno != 0 ? errno : EIO;
+	if(fseek(output, 0, SEEK_END) != 0)
+	{
+		int error_number = errno != 0 ? errno : EIO;
+		fclose(output);
+		return error_number;
+	}
+	long offset = ftell(output);
+	if(offset == 0)
+		fprintf(output,
+			"label,monotonic_ns,nvm_page_count,nvm_upage_proxy_count,"
+			"ssd_block_count,buffer_metadata_count\n");
+	struct timespec now = {0};
+	clock_gettime(CLOCK_MONOTONIC_RAW, &now);
+	uint64_t timestamp = (uint64_t)now.tv_sec * 1000000000ULL +
+			(uint64_t)now.tv_nsec;
+	uint64_t page_count = __atomic_load_n(
+			&mem_bmp_arr[PAGE_BMP].bmp_used_num, __ATOMIC_ACQUIRE);
+	uint64_t buffer_count = __atomic_load_n(
+			&mem_bmp_arr[BUFMETA_BMP].bmp_used_num, __ATOMIC_ACQUIRE);
+	uint64_t block_count = __atomic_load_n(
+			&mem_bmp_arr[BLOCK_BMP].bmp_used_num, __ATOMIC_ACQUIRE);
+	fprintf(output, "%s,%" PRIu64 ",%" PRIu64 ",%" PRIu64
+			",%" PRIu64 ",%" PRIu64 "\n",
+			label != NULL ? label : "snapshot", timestamp, page_count,
+			buffer_count, block_count, buffer_count);
+	int error_number = 0;
+	if(fflush(output) != 0 || fsync(fileno(output)) != 0)
+		error_number = errno != 0 ? errno : EIO;
+	if(fclose(output) != 0 && error_number == 0)
+		error_number = errno != 0 ? errno : EIO;
+	return error_number;
 }
 
 static int claim_bit(mem_bmp_pt bmp_info, uint64_t bit)

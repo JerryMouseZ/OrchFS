@@ -5,6 +5,10 @@
 #include "orchfs/async/runtime.hpp"
 #include "orchfs/async/server.hpp"
 
+extern "C" {
+#include "../KernelFS/async_device.h"
+}
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -73,6 +77,8 @@ std::atomic<std::size_t> lifecycle_call_count{0};
 std::atomic<bool> lifecycle_called_off_owner{false};
 std::atomic<std::size_t> inode_owner_call_count{0};
 std::atomic<bool> inode_called_off_owner{false};
+std::atomic<std::size_t> synchronous_write_sync_count{0};
+std::atomic<std::size_t> data_synchronous_write_sync_count{0};
 std::mutex file_handle_mutex;
 std::unordered_map<int, std::string> file_handle_paths;
 std::unordered_set<int> close_failed_once;
@@ -480,6 +486,15 @@ class HostAsyncFilesystem final : public orchfs::async::AsyncFilesystem {
     const int fd = find_fd_locked(inode);
     if (fd < 0) {
       co_return failure_void(EBADF);
+    }
+    if (file_path_is(fd, "/synchronous-write-failure")) {
+      co_return failure_void(EIO);
+    }
+    if (file_path_is(fd, "/synchronous-write")) {
+      synchronous_write_sync_count.fetch_add(1, std::memory_order_relaxed);
+    } else if (file_path_is(fd, "/data-synchronous-write")) {
+      data_synchronous_write_sync_count.fetch_add(1,
+                                                   std::memory_order_relaxed);
     }
     if (orchfs_fsync(fd) != 0) {
       co_return failure_void(current_error(EIO));
@@ -2292,11 +2307,36 @@ int run_client(const std::string& endpoint) {
                       client.open("/bad-access-mode", O_ACCMODE, 0644)) ==
                 std::errc::invalid_argument,
             "access mode 3 was accepted");
-    require(run_error(*runtime,
-                      client.open("/unsupported-sync", O_RDWR | O_SYNC,
-                                  0644))
-                    .value() == EOPNOTSUPP,
-            "O_SYNC was accepted without synchronous-write semantics");
+    auto synchronous_file = run(
+        *runtime,
+        client.open("/synchronous-write", O_CREAT | O_RDWR | O_TRUNC | O_SYNC,
+                    0644));
+    require(run(*runtime, synchronous_file.write(message)) == message.size(),
+            "O_SYNC write failed");
+    require((run(*runtime, synchronous_file.get_flags()) & O_SYNC) == O_SYNC,
+            "F_GETFL lost O_SYNC");
+    run(*runtime, synchronous_file.close());
+    auto failed_synchronous_file = run(
+        *runtime,
+        client.open("/synchronous-write-failure",
+                    O_CREAT | O_RDWR | O_TRUNC | O_SYNC, 0644));
+    require(run(*runtime, failed_synchronous_file.write(message)) ==
+                message.size(),
+            "O_SYNC write added a redundant durability fence");
+    run(*runtime, failed_synchronous_file.close());
+#ifdef O_DSYNC
+    auto data_synchronous_file = run(
+        *runtime,
+        client.open("/data-synchronous-write",
+                    O_CREAT | O_RDWR | O_TRUNC | O_DSYNC, 0644));
+    require(run(*runtime, data_synchronous_file.write_at(0, message)) ==
+                message.size(),
+            "O_DSYNC positioned write failed");
+    require((run(*runtime, data_synchronous_file.get_flags()) & O_DSYNC) ==
+                O_DSYNC,
+            "F_GETFL lost O_DSYNC");
+    run(*runtime, data_synchronous_file.close());
+#endif
     require(run_error(*runtime,
                       client.open("/unknown-open-flag",
                                   O_RDWR | static_cast<int>(0x40000000U),
@@ -2601,6 +2641,10 @@ int orchfs_device_register_dma_region(void* address, size_t length) {
 int orchfs_device_unregister_dma_region(void* address, size_t length) {
   return address != nullptr && length != 0 ? 0 : EINVAL;
 }
+
+int orchfs_device_effective_write_durability(void) {
+  return ORCHFS_DEVICE_DURABILITY_COMPLETION;
+}
 }  // extern "C"
 
 int main(int argc, char* argv[]) {
@@ -2688,6 +2732,13 @@ int main(int argc, char* argv[]) {
     require(::waitpid(child, &status, 0) == child, "waitpid failed");
     require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
             "client process failed");
+    require(synchronous_write_sync_count.load(std::memory_order_relaxed) == 0,
+            "O_SYNC write executed a redundant durability fence");
+#ifdef O_DSYNC
+    require(data_synchronous_write_sync_count.load(
+                std::memory_order_relaxed) == 0,
+            "O_DSYNC write executed a redundant durability fence");
+#endif
     orchfs::async::ServerSessionStats prior_session_stats;
     if (!skip_wrapper) {
       const std::string reconnect_ready =

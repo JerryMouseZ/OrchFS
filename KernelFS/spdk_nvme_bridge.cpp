@@ -144,6 +144,20 @@ orchfs::nvme::Config make_cpp_config(const orchfs_spdk_config &config) {
     result.queue_depth = config.queue_depth;
     result.bounce_buffers_per_poller = config.bounce_buffers_per_poller;
     result.max_transfer_size = config.max_transfer_size;
+    switch (config.write_durability) {
+    case ORCHFS_SPDK_DURABILITY_AUTO:
+        result.write_durability = orchfs::nvme::WriteDurability::auto_detect;
+        break;
+    case ORCHFS_SPDK_DURABILITY_COMPLETION:
+        result.write_durability = orchfs::nvme::WriteDurability::completion;
+        break;
+    case ORCHFS_SPDK_DURABILITY_FUA:
+        result.write_durability = orchfs::nvme::WriteDurability::fua;
+        break;
+    case ORCHFS_SPDK_DURABILITY_FLUSH:
+        result.write_durability = orchfs::nvme::WriteDurability::flush;
+        break;
+    }
     if (config.application_name != nullptr) {
         result.application_name = config.application_name;
     }
@@ -202,6 +216,7 @@ void orchfs_spdk_config_init(orchfs_spdk_config *config) {
         .queue_depth = 32,
         .bounce_buffers_per_poller = 32,
         .max_transfer_size = 1024U * 1024U,
+        .write_durability = ORCHFS_SPDK_DURABILITY_AUTO,
         .application_name = "orchfs_kfs",
         .reactor_mask = "0x1",
         .hugepage_directory = nullptr,
@@ -233,10 +248,11 @@ int orchfs_spdk_open(const orchfs_spdk_config *config,
 
         std::vector<std::unique_ptr<BridgeCompletionPool>> completion_pools;
         try {
-            completion_pools.reserve(config->poller_count);
+            const std::size_t poller_count = implementation->poller_count();
+            completion_pools.reserve(poller_count);
             const std::size_t completion_count =
                 static_cast<std::size_t>(config->queue_depth) * 2U + 16U;
-            for (std::size_t index = 0; index < config->poller_count; ++index) {
+            for (std::size_t index = 0; index < poller_count; ++index) {
                 completion_pools.push_back(
                     std::make_unique<BridgeCompletionPool>(completion_count));
             }
@@ -428,6 +444,30 @@ uint64_t orchfs_spdk_capacity_bytes(const orchfs_spdk_backend *backend) {
     return backend == nullptr || backend->implementation == nullptr
                ? 0
                : backend->implementation->capacity_bytes();
+}
+
+orchfs_spdk_write_durability orchfs_spdk_effective_write_durability(
+    const orchfs_spdk_backend *backend) {
+    if (backend == nullptr || backend->implementation == nullptr) {
+        return ORCHFS_SPDK_DURABILITY_AUTO;
+    }
+    switch (backend->implementation->write_durability()) {
+    case orchfs::nvme::WriteDurability::completion:
+        return ORCHFS_SPDK_DURABILITY_COMPLETION;
+    case orchfs::nvme::WriteDurability::fua:
+        return ORCHFS_SPDK_DURABILITY_FUA;
+    case orchfs::nvme::WriteDurability::flush:
+        return ORCHFS_SPDK_DURABILITY_FLUSH;
+    case orchfs::nvme::WriteDurability::auto_detect:
+        return ORCHFS_SPDK_DURABILITY_AUTO;
+    }
+    return ORCHFS_SPDK_DURABILITY_AUTO;
+}
+
+int orchfs_spdk_volatile_write_cache_present(
+    const orchfs_spdk_backend *backend) {
+    return backend != nullptr && backend->implementation != nullptr &&
+           backend->implementation->volatile_write_cache_present();
 }
 
 } // extern "C"

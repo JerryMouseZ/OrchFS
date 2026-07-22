@@ -1658,8 +1658,37 @@ ControlServer ControlServer::listen(std::string_view socket_path,
     }
     if (::bind(listener.get(), reinterpret_cast<sockaddr*>(&address),
                address_length) != 0) {
-        error = errno_error();
-        return {};
+        const int bind_error = errno;
+        if (bind_error != EADDRINUSE) {
+            error = {bind_error, std::generic_category()};
+            return {};
+        }
+
+        // A killed server cannot unlink its pathname. Never remove an active
+        // listener: only ECONNREFUSED on a socket inode proves that the name
+        // has no listening endpoint.
+        struct stat stale_status {};
+        if (::lstat(address.sun_path, &stale_status) != 0 ||
+            !S_ISSOCK(stale_status.st_mode)) {
+            error = {bind_error, std::generic_category()};
+            return {};
+        }
+        UniqueFd probe(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+        if (!probe) {
+            error = errno_error();
+            return {};
+        }
+        if (::connect(probe.get(), reinterpret_cast<sockaddr*>(&address),
+                      address_length) == 0 || errno != ECONNREFUSED) {
+            error = {bind_error, std::generic_category()};
+            return {};
+        }
+        if (::unlink(address.sun_path) != 0 ||
+            ::bind(listener.get(), reinterpret_cast<sockaddr*>(&address),
+                   address_length) != 0) {
+            error = errno_error();
+            return {};
+        }
     }
     const std::string path(socket_path);
     if (::listen(listener.get(), 128) != 0) {

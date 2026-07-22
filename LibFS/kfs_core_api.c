@@ -8,6 +8,7 @@
 #include "migrate.h"
 
 #include "../KernelFS/device.h"
+#include "../KernelFS/balloc.h"
 #include "../KernelFS/type.h"
 #include "../config/config.h"
 #include "../config/log_config.h"
@@ -19,6 +20,49 @@
 
 static int core_initialized;
 static int64_t core_root_inode = -1;
+
+static int reap_persistent_orphans(void)
+{
+    int64_t inode_id = -1;
+    while((inode_id = orchfs_bitmap_next_allocated(
+               INODE_BMP, inode_id)) >= 0)
+    {
+        if(inode_id == core_root_inode)
+            continue;
+        orch_inode_pt inode = inodeid_to_memaddr(inode_id);
+        if(inode == NULL)
+            return errno != 0 ? errno : EIO;
+        if(inode->i_number != inode_id ||
+           (inode->reserved[0] & ORCHFS_INODE_FLAG_ORPHAN) == 0)
+            continue;
+        struct orchfs_log_transaction* transaction = NULL;
+        int error = orchfs_log_transaction_create(&transaction);
+        if(error != 0)
+            return error;
+        orchfs_log_transaction_bind(transaction);
+        error = delete_inode(inode_id);
+        orchfs_log_transaction_unbind(transaction);
+        if(error != 0)
+        {
+            orchfs_log_transaction_abort(transaction);
+            return error;
+        }
+        error = orchfs_log_transaction_commit(transaction);
+        if(error != 0)
+            return error;
+    }
+    return 0;
+}
+
+int orchfs_core_validate_format(void)
+{
+    return orchfs_log_validate_format();
+}
+
+int orchfs_core_recover(void)
+{
+    return orchfs_log_recover();
+}
 
 int orchfs_core_initialize(void)
 {
@@ -57,6 +101,16 @@ int orchfs_core_initialize(void)
         return migration_error;
     }
     core_initialized = 1;
+    const int orphan_error = reap_persistent_orphans();
+    if(orphan_error != 0)
+    {
+        core_initialized = 0;
+        orchfs_migration_shutdown();
+        free_mem_log();
+        close_metadata_cache();
+        core_root_inode = -1;
+        return orphan_error;
+    }
     return 0;
 }
 
@@ -65,8 +119,8 @@ void orchfs_core_shutdown(void)
     if(!core_initialized)
         return;
     orchfs_migration_shutdown();
-    free_mem_log();
     close_metadata_cache();
+    free_mem_log();
     return_all_ext();
     core_root_inode = -1;
     core_initialized = 0;
@@ -131,6 +185,22 @@ int orchfs_core_delete_inode(int64_t inode)
     if(!core_initialized || inode < 0 || inode == core_root_inode)
         return EINVAL;
     return delete_inode(inode);
+}
+
+int orchfs_core_set_orphan(int64_t inode_id, int orphaned)
+{
+    if(!core_initialized || inode_id < 0 ||
+       (orphaned != 0 && orphaned != 1))
+        return EINVAL;
+    orch_inode_pt inode = inodeid_to_memaddr(inode_id);
+    if(inode == NULL || inode->i_number != inode_id)
+        return ENOENT;
+    if(orphaned)
+        inode->reserved[0] |= ORCHFS_INODE_FLAG_ORPHAN;
+    else
+        inode->reserved[0] &= (uint8_t)~ORCHFS_INODE_FLAG_ORPHAN;
+    write_change_log(inode_id, INODE_OP, inode, 0, ORCH_INODE_SIZE);
+    return 0;
 }
 
 int orchfs_core_snapshot(int64_t inode, struct orchfs_core_inode* result)
@@ -254,6 +324,11 @@ int orchfs_core_write_pmem(int64_t offset, const void* source, size_t length)
     return 0;
 }
 
+int orchfs_core_persist_pmem(void)
+{
+    return orchfs_log_sync();
+}
+
 int orchfs_core_set_size(int64_t inode_id, uint64_t size)
 {
     if(inode_id < 0 || size > INT64_MAX ||
@@ -273,5 +348,5 @@ int orchfs_core_sync_inode(int64_t inode)
     if(inode < 0)
         return EINVAL;
     sync_inode_and_index(inode);
-    return 0;
+    return orchfs_log_sync();
 }

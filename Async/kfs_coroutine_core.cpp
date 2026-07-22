@@ -4,6 +4,7 @@
 #include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/detail/range_lock.hpp"
 #include "orchfs/async/range_arbiter.hpp"
+#include "orchfs/async/repro_trace.hpp"
 #include "orchfs/async/runtime.hpp"
 
 #include <boost/container/small_vector.hpp>
@@ -44,6 +45,7 @@ constexpr std::size_t kBufferMetadataSize = 128;
 constexpr std::size_t kBufferMetadataEntries =
     kBufferMetadataSize / sizeof(std::int16_t);
 constexpr std::int16_t kMaximumBufferSegments = 12;
+constexpr std::size_t kStrataSsdPageThreshold = 6;
 constexpr std::uint64_t kMaximumFileSize =
     std::uint64_t{1} << (42U + 15U);
 constexpr std::uint64_t kWholeFile =
@@ -1231,6 +1233,13 @@ class KfsCoroutineCore::Impl {
       } catch (const std::bad_alloc&) {
         co_return errno_failure<void>(ENOMEM);
       }
+      const int orphan_error = transaction->invoke([&] {
+        return orchfs_core_set_orphan(child.inode.inode, 1);
+      });
+      if (orphan_error != 0) {
+        orphaned_.erase(child.inode.inode);
+        co_return errno_failure<void>(orphan_error);
+      }
     }
     auto removed = co_await write_directory_entry(
         child.parent, child.offset, child.entry,
@@ -1266,33 +1275,188 @@ class KfsCoroutineCore::Impl {
     co_return Result<void>::success();
   }
 
+  Task<Result<bool>> parent_is_below(InodeNumber parent,
+                                     InodeNumber possible_ancestor) {
+    std::unordered_set<InodeNumber> visited;
+    InodeNumber current = parent;
+    while (true) {
+      if (current == possible_ancestor) {
+        co_return Result<bool>::success(true);
+      }
+      if (current == orchfs_core_root_inode()) {
+        co_return Result<bool>::success(false);
+      }
+      try {
+        if (!visited.insert(current).second) {
+          co_return errno_failure<bool>(EIO);
+        }
+      } catch (const std::bad_alloc&) {
+        co_return errno_failure<bool>(ENOMEM);
+      }
+      ORCHFS_TRY(parent_entry, co_await find_child(current, ".."));
+      if (parent_entry.inode.type != ORCHFS_CORE_DIRECTORY ||
+          parent_entry.inode.inode == current) {
+        co_return errno_failure<bool>(EIO);
+      }
+      current = parent_entry.inode.inode;
+    }
+  }
+
   Task<Result<void>> rename_path(std::string_view old_path,
                                  std::string_view new_path) {
     ORCHFS_TRY(old_parent, co_await resolve_parent(old_path));
     ORCHFS_TRY(new_parent, co_await resolve_parent(new_path));
-    if (old_parent.parent != new_parent.parent) {
-      co_return errno_failure<void>(EXDEV);
-    }
     ORCHFS_TRY(source,
                co_await find_child(old_parent.parent, old_parent.name));
-    if (old_parent.name == new_parent.name) {
+    if (source.inode.inode == orchfs_core_root_inode()) {
+      co_return errno_failure<void>(EBUSY);
+    }
+    if (old_parent.parent == new_parent.parent &&
+        old_parent.name == new_parent.name) {
       co_return Result<void>::success();
     }
-    auto destination = co_await find_child(new_parent.parent,
-                                           new_parent.name);
+
+    std::optional<NamespaceEntry> destination;
+    auto found_destination = co_await find_child(new_parent.parent,
+                                                  new_parent.name);
+    if (found_destination) {
+      destination.emplace(std::move(found_destination).value());
+    } else if (found_destination.error().value() != ENOENT) {
+      co_return Result<void>::failure(found_destination.error());
+    }
+    if (destination && destination->inode.inode == source.inode.inode) {
+      co_return Result<void>::success();
+    }
     if (destination) {
-      co_return errno_failure<void>(EEXIST);
+      if (source.inode.type == ORCHFS_CORE_DIRECTORY &&
+          destination->inode.type != ORCHFS_CORE_DIRECTORY) {
+        co_return errno_failure<void>(ENOTDIR);
+      }
+      if (source.inode.type != ORCHFS_CORE_DIRECTORY &&
+          destination->inode.type == ORCHFS_CORE_DIRECTORY) {
+        co_return errno_failure<void>(EISDIR);
+      }
+      if (destination->inode.type == ORCHFS_CORE_DIRECTORY) {
+        ORCHFS_TRY(empty,
+                   co_await directory_empty(destination->inode.inode));
+        if (!empty) {
+          co_return errno_failure<void>(ENOTEMPTY);
+        }
+      }
     }
-    if (destination.error().value() != ENOENT) {
-      co_return Result<void>::failure(destination.error());
+
+    std::optional<NamespaceEntry> dotdot;
+    if (source.inode.type == ORCHFS_CORE_DIRECTORY &&
+        source.parent != new_parent.parent) {
+      ORCHFS_TRY(cycle, co_await parent_is_below(
+                            new_parent.parent, source.inode.inode));
+      if (cycle) {
+        co_return errno_failure<void>(EINVAL);
+      }
+      ORCHFS_TRY(parent_entry,
+                 co_await find_child(source.inode.inode, ".."));
+      dotdot.emplace(std::move(parent_entry));
     }
-    auto& entry = source.entry;
-    entry.name_length =
+
+    std::uint64_t destination_slot = source.offset;
+    if (destination) {
+      destination_slot = destination->offset;
+    } else if (source.parent != new_parent.parent) {
+      ORCHFS_TRY(slot, co_await free_directory_slot(new_parent.parent));
+      destination_slot = slot;
+    }
+
+    ORCHFS_TRY(transaction, LogTransaction::create());
+    bool staged_orphan = false;
+    InodeNumber replaced_inode = -1;
+    if (destination) {
+      replaced_inode = destination->inode.inode;
+      const bool defer_delete = open_references_.contains(replaced_inode);
+      if (defer_delete) {
+        try {
+          orphaned_.insert(replaced_inode);
+          staged_orphan = true;
+        } catch (const std::bad_alloc&) {
+          co_return errno_failure<void>(ENOMEM);
+        }
+        const int error = transaction->invoke(
+            [&] { return orchfs_core_set_orphan(replaced_inode, 1); });
+        if (error != 0) {
+          orphaned_.erase(replaced_inode);
+          co_return errno_failure<void>(error);
+        }
+      } else {
+        const int error = transaction->invoke(
+            [&] { return orchfs_core_delete_inode(replaced_inode); });
+        if (error != 0) {
+          co_return errno_failure<void>(error);
+        }
+      }
+    }
+
+    orchfs_core_dirent replacement = source.entry;
+    replacement.offset = static_cast<std::int64_t>(destination_slot);
+    replacement.name_length =
         static_cast<std::uint16_t>(new_parent.name.size());
-    std::memset(entry.name, 0, sizeof(entry.name));
-    std::memcpy(entry.name, new_parent.name.data(), new_parent.name.size());
-    co_return co_await write_directory_entry(
-        source.parent, source.offset, entry);
+    std::memset(replacement.name, 0, sizeof(replacement.name));
+    std::memcpy(replacement.name, new_parent.name.data(),
+                new_parent.name.size());
+    auto written = co_await write_directory_entry(
+        new_parent.parent, destination_slot, replacement, transaction.get());
+    if (!written) {
+      if (staged_orphan) {
+        orphaned_.erase(replaced_inode);
+      }
+      co_return written;
+    }
+
+    if (new_parent.parent != source.parent ||
+        destination_slot != source.offset) {
+      orchfs_core_dirent removed{};
+      removed.offset = static_cast<std::int64_t>(source.offset);
+      written = co_await write_directory_entry(
+          source.parent, source.offset, removed, transaction.get());
+      if (!written) {
+        if (staged_orphan) {
+          orphaned_.erase(replaced_inode);
+        }
+        co_return written;
+      }
+    }
+    if (dotdot) {
+      dotdot->entry.inode = new_parent.parent;
+      written = co_await write_directory_entry(
+          source.inode.inode, dotdot->offset, dotdot->entry,
+          transaction.get());
+      if (!written) {
+        if (staged_orphan) {
+          orphaned_.erase(replaced_inode);
+        }
+        co_return written;
+      }
+    }
+
+    auto committed = co_await journal_.commit(transaction->release());
+    if (!committed) {
+      if (staged_orphan) {
+        orphaned_.erase(replaced_inode);
+      }
+      co_return committed;
+    }
+    if (destination && !staged_orphan) {
+      erase_snapshot(replaced_inode);
+      erase_extents(replaced_inode);
+    }
+    publish(source.inode);
+    orchfs_core_inode parent_snapshot{};
+    if (orchfs_core_snapshot(source.parent, &parent_snapshot) == 0) {
+      publish(parent_snapshot);
+    }
+    if (new_parent.parent != source.parent &&
+        orchfs_core_snapshot(new_parent.parent, &parent_snapshot) == 0) {
+      publish(parent_snapshot);
+    }
+    co_return Result<void>::success();
   }
 
   Task<Result<std::size_t>> read_unlocked(
@@ -1555,7 +1719,8 @@ class KfsCoroutineCore::Impl {
           source.size() - consumed, kBlockSize - inside);
       const std::byte* input = source.data() + consumed;
 
-      if (block.type == ORCHFS_CORE_SSD_BLOCK &&
+      if ((block.type == ORCHFS_CORE_SSD_BLOCK ||
+           block.type == ORCHFS_CORE_STRATA_BLOCK) &&
           (inside != 0 || chunk != kBlockSize)) {
         error = transaction->invoke([&] {
           return orchfs_core_ensure_strata(
@@ -1614,6 +1779,16 @@ class KfsCoroutineCore::Impl {
             }
           }
         } else {
+          const std::size_t first_full_page =
+              (inside + kPageSize - 1U) / kPageSize;
+          const std::size_t full_page_end =
+              (inside + chunk) / kPageSize;
+          const std::size_t full_page_count =
+              full_page_end > first_full_page
+                  ? full_page_end - first_full_page
+                  : 0;
+          const bool write_full_pages_to_ssd =
+              full_page_count >= kStrataSsdPageThreshold;
           std::size_t page_consumed = 0;
           while (page_consumed < chunk) {
             const std::size_t position = inside + page_consumed;
@@ -1632,7 +1807,8 @@ class KfsCoroutineCore::Impl {
             if (error != 0) {
               co_return errno_failure<WriteResult>(error);
             }
-            if (in_page == 0 && part == kPageSize) {
+            if (write_full_pages_to_ssd && in_page == 0 &&
+                part == kPageSize) {
               writes.push_back(BlockWrite{
                   .offset = static_cast<std::uint64_t>(
                       block.ssd_device_offset +
@@ -1714,6 +1890,9 @@ class KfsCoroutineCore::Impl {
       if (bytes_written != expected) {
         co_return errno_failure<WriteResult>(EIO);
       }
+      if (device_.write_durability() == DeviceWriteDurability::flush) {
+        ORCHFS_TRYV(co_await device_.flush());
+      }
     }
 
     std::size_t copied_since_yield = 0;
@@ -1738,6 +1917,15 @@ class KfsCoroutineCore::Impl {
       if (error != 0) {
         co_return errno_failure<WriteResult>(error);
       }
+    }
+
+    // nvm_write() uses non-temporal stores.  This must execute on the inode
+    // owner that issued them; a later journal fence on worker 0 cannot order
+    // stores from another core.  SSD completion/FUA/flush has already made the
+    // data durable before metadata can be committed below.
+    error = orchfs_core_persist_pmem();
+    if (error != 0) {
+      co_return errno_failure<WriteResult>(error);
     }
 
     if (end > current_size) {
@@ -1848,12 +2036,16 @@ Task<Result<void>> KfsCoroutineCore::close(OpenedNode node) {
   if (node.inode < 0 || node.type == NodeType::unknown) {
     co_return errno_failure<void>(EBADF);
   }
-  co_return co_await impl_->release(node);
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_WITH_RANGE_LOCK(result, impl_->namespace_gate_, 0, 1,
+                         RangeMode::write, impl_->release(node));
+  co_return result;
 }
 
 Task<Result<std::size_t>> KfsCoroutineCore::read(
     InodeNumber inode, std::uint64_t offset,
     std::span<std::byte> destination) {
+  repro_trace::Span trace(ORCHFS_TRACE_CORE_READ, 0, destination.size());
   if (offset > static_cast<std::uint64_t>(
                    std::numeric_limits<std::int64_t>::max()) ||
       destination.size() >
@@ -1866,12 +2058,15 @@ Task<Result<std::size_t>> KfsCoroutineCore::read(
   ORCHFS_WITH_RANGE_LOCK(
       result, *range, offset, range_length(offset, destination.size()),
       RangeMode::read, impl_->read_unlocked(inode, offset, destination));
+  trace.finish(result ? result.value() : 0,
+               result ? std::error_code{} : result.error());
   co_return result;
 }
 
 Task<Result<WriteResult>> KfsCoroutineCore::write(
     InodeNumber inode, std::uint64_t offset,
     std::span<const std::byte> source, bool append) {
+  repro_trace::Span trace(ORCHFS_TRACE_CORE_WRITE, 0, source.size());
   ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
   ORCHFS_TRY(range, impl_->range_for(inode));
   const std::uint64_t range_start = append ? 0 : offset;
@@ -1880,6 +2075,8 @@ Task<Result<WriteResult>> KfsCoroutineCore::write(
   ORCHFS_WITH_RANGE_LOCK(
       result, *range, range_start, length, RangeMode::write,
       impl_->write_unlocked(inode, offset, source, append));
+  trace.finish(result ? result.value().bytes : 0,
+               result ? std::error_code{} : result.error());
   co_return result;
 }
 
@@ -2060,18 +2257,18 @@ Task<Result<void>> KfsCoroutineCore::truncate(InodeNumber inode,
 }
 
 Task<Result<void>> KfsCoroutineCore::sync(InodeNumber inode) {
+  repro_trace::Span trace(ORCHFS_TRACE_CORE_SYNC);
   ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
   ORCHFS_TRY(range, impl_->range_for(inode));
   ORCHFS_TRY(permit, co_await range->acquire(
       0, kWholeFile, RangeMode::write));
-  const int metadata_error = orchfs_core_sync_inode(inode);
+  const int metadata_error = orchfs_core_persist_pmem();
   Result<void> result = metadata_error == 0
-      ? co_await impl_->device_.flush()
+      ? Result<void>::success()
       : errno_failure<void>(metadata_error);
   auto released = co_await permit.release();
-  if (!released && result) {
-    co_return Result<void>::failure(released.error());
-  }
+  detail::fold_range_lock_release(result, released);
+  trace.finish(0, result ? std::error_code{} : result.error());
   co_return result;
 }
 
@@ -2342,7 +2539,10 @@ Task<Result<void>> KfsCoroutineCore::close_directory(OpenedNode node) {
   if (node.type != NodeType::directory) {
     co_return errno_failure<void>(EBADF);
   }
-  co_return co_await impl_->release(node);
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_WITH_RANGE_LOCK(result, impl_->namespace_gate_, 0, 1,
+                         RangeMode::write, impl_->release(node));
+  co_return result;
 }
 
 }  // namespace orchfs::async

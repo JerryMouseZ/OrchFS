@@ -12,6 +12,13 @@
 
 namespace orchfs::nvme {
 
+enum class WriteDurability : std::uint8_t {
+    auto_detect,
+    completion,
+    fua,
+    flush,
+};
+
 enum class Operation {
     read,
     write,
@@ -68,6 +75,10 @@ bool is_nvme_status_error(const std::error_code &error) noexcept;
 
 namespace detail {
 
+// SPDK's NVMe command path requires payload virtual addresses to be dword
+// aligned even when the containing shared-memory region is registered.
+bool dword_aligned(const void *buffer) noexcept;
+
 // A write ticket linearizes acceptance and keeps the complete physical LBA
 // envelope reserved until every command of the logical write has completed.
 // Keeping this hardware-independent also lets the ordering rules be unit
@@ -121,6 +132,11 @@ struct Config {
     // Zero uses the namespace maximum.  A non-zero value is capped by the
     // namespace maximum and rounded down to an LBA multiple.
     std::uint32_t max_transfer_size{1024U * 1024U};
+
+    // auto_detect uses ordinary completion only when Identify Controller says
+    // no volatile write cache is present; otherwise it uses FUA.  flush leaves
+    // writes ordinary so the filesystem can issue one fence after a batch.
+    WriteDurability write_durability{WriteDurability::auto_detect};
 
     std::string application_name{"orchfs_kfs"};
     std::string reactor_mask{"0x1"};
@@ -197,6 +213,8 @@ public:
     std::uint32_t lba_size() const noexcept;
     std::uint32_t max_transfer_size() const noexcept;
     std::uint64_t capacity_bytes() const noexcept;
+    WriteDurability write_durability() const noexcept;
+    bool volatile_write_cache_present() const noexcept;
 
     static constexpr bool compiled_with_spdk() noexcept {
 #ifdef ORCHFS_HAS_SPDK

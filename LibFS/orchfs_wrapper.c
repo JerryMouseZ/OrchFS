@@ -884,6 +884,54 @@ OP_DEFINE(OPENAT){
 	}
 }
 
+int openat64(int dirfd, const char *path, int oflag, ...)
+{
+	if(open_needs_mode(oflag)){
+		va_list ap;
+		va_start(ap, oflag);
+		mode_t mode = va_arg(ap, mode_t);
+		va_end(ap);
+		return openat(dirfd, path, oflag, mode);
+	}
+	return openat(dirfd, path, oflag);
+}
+
+extern void __fortify_fail(const char *message)
+	__attribute__((noreturn));
+
+static void fortified_open_missing_mode(void)
+{
+	__fortify_fail("invalid open call: O_CREAT or O_TMPFILE without mode");
+}
+
+int __open_2(const char *path, int oflag)
+{
+	if(open_needs_mode(oflag))
+		fortified_open_missing_mode();
+	return open(path, oflag);
+}
+
+int __open64_2(const char *path, int oflag)
+{
+	if(open_needs_mode(oflag))
+		fortified_open_missing_mode();
+	return open64(path, oflag);
+}
+
+int __openat_2(int dirfd, const char *path, int oflag)
+{
+	if(open_needs_mode(oflag))
+		fortified_open_missing_mode();
+	return openat(dirfd, path, oflag);
+}
+
+int __openat64_2(int dirfd, const char *path, int oflag)
+{
+	if(open_needs_mode(oflag))
+		fortified_open_missing_mode();
+	return openat64(dirfd, path, oflag);
+}
+
 OP_DEFINE(CREAT){
 	// printf("creat call\n");
 	// fflush(stdout);

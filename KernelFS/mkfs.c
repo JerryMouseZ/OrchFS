@@ -10,6 +10,20 @@
 
 // #define KERNEL_FUNC_DEBUG
 
+static uint32_t checkpoint_crc32c(const void* bytes, size_t length)
+{
+    const uint8_t* input = bytes;
+    uint32_t crc = UINT32_MAX;
+    while(length-- != 0)
+    {
+        crc ^= *input++;
+        for(int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (UINT32_C(0x82f63b78) &
+                    (uint32_t)-(int32_t)(crc & 1U));
+    }
+    return ~crc;
+}
+
 void korch_time_stamp(struct timespec * time)
 {
     clock_gettime(CLOCK_REALTIME, time);
@@ -109,6 +123,11 @@ void init_super_block()
     orch_super_blk_pt sb_pt = init_buf;
     for(int i = 0; i < 3; i++)
         sb_pt->magic_num[i] = ORCH_MAGIC_NUM;
+    sb_pt->format_version = ORCHFS_DISK_FORMAT_VERSION;
+    sb_pt->feature_flags = ORCHFS_DISK_FEATURE_WAL;
+    sb_pt->checkpoints[0].generation = 1;
+    sb_pt->checkpoints[0].checksum = checkpoint_crc32c(
+        &sb_pt->checkpoints[0], sizeof(sb_pt->checkpoints[0]));
     for(int i = START_BMP_ID; i <= END_BMP_ID; i++)
     {
         if(i == INODE_BMP)
@@ -125,6 +144,9 @@ void init_super_block()
             sb_pt->bmp_dev_addr_list[i] = OFFSET_BUFMETA_BMP;
     }
     write_data_to_devs(init_buf, ORCH_SUPER_BLK_SIZE, OFFSET_SUPER_BLK);
+
+    unsigned char empty_journal[64] = {0};
+    write_data_to_devs(empty_journal, sizeof(empty_journal), OFFSET_LOG);
 
 
     init_mem_bmp();

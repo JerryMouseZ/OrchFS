@@ -8,6 +8,60 @@
 extern "C" {
 #endif
 
+#define ORCHFS_DISK_FORMAT_VERSION UINT64_C(2)
+#define ORCHFS_DISK_FEATURE_WAL UINT64_C(1)
+
+#define ORCHFS_JOURNAL_MAGIC UINT64_C(0x4f52434857414c32)
+#define ORCHFS_JOURNAL_COMMIT_MAGIC UINT64_C(0x434f4d4d49543221)
+#define ORCHFS_JOURNAL_VERSION UINT32_C(1)
+#define ORCHFS_JOURNAL_BYTES (UINT64_C(64) << 20)
+#define ORCHFS_INODE_FLAG_ORPHAN UINT8_C(1)
+
+enum orchfs_journal_record_kind {
+    ORCHFS_JOURNAL_WRITE = 1,
+    ORCHFS_JOURNAL_ALLOCATE = 2,
+    ORCHFS_JOURNAL_FREE = 3,
+};
+
+struct orchfs_disk_checkpoint {
+    uint64_t generation;
+    uint64_t durable_txid;
+    uint64_t journal_tail;
+    uint32_t checksum;
+    uint32_t reserved;
+};
+
+struct orchfs_journal_frame_header {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t header_bytes;
+    uint64_t txid;
+    uint64_t frame_bytes;
+    uint32_t record_count;
+    uint32_t payload_checksum;
+    uint32_t header_checksum;
+    uint8_t reserved[20];
+};
+
+struct orchfs_journal_record_header {
+    uint32_t kind;
+    uint32_t type;
+    int64_t target;
+    int32_t offset;
+    uint32_t length;
+    uint32_t record_bytes;
+    uint32_t data_checksum;
+};
+
+struct orchfs_journal_commit {
+    uint64_t magic;
+    uint64_t txid;
+    uint64_t frame_bytes;
+    uint32_t frame_checksum;
+    uint32_t reserved32;
+    uint8_t reserved[32];
+};
+
 /*
  * Persistent inode format.
  *
@@ -45,6 +99,10 @@ struct orchfs_inode_disk {
 
 static_assert(sizeof(orchfs_disk_timestamp) == 16);
 static_assert(sizeof(orchfs_inode_disk) == 512);
+static_assert(sizeof(orchfs_disk_checkpoint) == 32);
+static_assert(sizeof(orchfs_journal_frame_header) == 64);
+static_assert(sizeof(orchfs_journal_record_header) == 32);
+static_assert(sizeof(orchfs_journal_commit) == 64);
 static_assert(offsetof(orchfs_inode_disk, i_number) == 0);
 static_assert(offsetof(orchfs_inode_disk, i_size) == 8);
 static_assert(offsetof(orchfs_inode_disk, i_idxroot) == 16);
@@ -62,6 +120,14 @@ _Static_assert(sizeof(struct orchfs_disk_timestamp) == 16,
                "disk timestamp must be 16 bytes");
 _Static_assert(sizeof(struct orchfs_inode_disk) == 512,
                "disk inode must be 512 bytes");
+_Static_assert(sizeof(struct orchfs_disk_checkpoint) == 32,
+               "checkpoint slot must be 32 bytes");
+_Static_assert(sizeof(struct orchfs_journal_frame_header) == 64,
+               "journal frame header must be 64 bytes");
+_Static_assert(sizeof(struct orchfs_journal_record_header) == 32,
+               "journal record header must be 32 bytes");
+_Static_assert(sizeof(struct orchfs_journal_commit) == 64,
+               "journal commit must be 64 bytes");
 _Static_assert(offsetof(struct orchfs_inode_disk, i_number) == 0,
                "i_number offset changed");
 _Static_assert(offsetof(struct orchfs_inode_disk, i_size) == 8,

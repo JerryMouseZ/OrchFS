@@ -51,10 +51,7 @@ typedef orch_kfs_dirent_t* orch_kfs_dirent_pt;
 typedef struct orchfs_inode_disk orch_kfs_inode_t;
 typedef orch_kfs_inode_t* orch_kfs_inode_pt;
 
-/* Super block
- * This struct is in pmm.
- * Size shall be less than 512B.
- */
+/* Super block. This structure is the complete 512-byte on-media object. */
 struct orch_super_blk{
     // 64-bit
     uint64_t    root_inode;
@@ -65,9 +62,21 @@ struct orch_super_blk{
     int64_t      bmp_alloc_cur_list[8];                      // The allocate point
     int64_t      bmp_used_num_list[8];                       // The bit used
     int64_t      bmp_alloc_range_list[8];                    // Allocate range
+
+    uint64_t     format_version;
+    uint64_t     feature_flags;
+    struct orchfs_disk_checkpoint checkpoints[2];
+    uint8_t      reserved[144];
 };
 typedef struct orch_super_blk orch_super_blk_t;
 typedef orch_super_blk_t* orch_super_blk_pt;
+
+#ifdef __cplusplus
+static_assert(sizeof(orch_super_blk_t) == ORCH_SUPER_BLK_SIZE);
+#else
+_Static_assert(sizeof(orch_super_blk_t) == ORCH_SUPER_BLK_SIZE,
+               "superblock must be exactly 512 bytes");
+#endif
 
 extern int now_registered_pid;
 

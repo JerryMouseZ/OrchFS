@@ -12,17 +12,25 @@ typedef void (*orchfs_spdk_device_completion_fn)(void *context,
                                                   int error_number,
                                                   size_t bytes);
 
+static inline size_t orchfs_spdk_worker_to_poller(size_t worker,
+                                                   size_t poller_count)
+{
+    return poller_count == 0 ? SIZE_MAX : worker % poller_count;
+}
+
 /*
  * Process-wide SPDK service owned by KFS. Configuration is read once from:
  *   ORCHFS_SPDK_PCI_BDF, ORCHFS_SPDK_NSID, ORCHFS_SPDK_POLLER_COUNT,
  *   ORCHFS_SPDK_QUEUE_DEPTH, ORCHFS_SPDK_BOUNCE_BUFFERS,
  *   ORCHFS_SPDK_MAX_TRANSFER_SIZE, ORCHFS_SPDK_REACTOR_MASK,
  *   ORCHFS_SPDK_HUGEPAGE_DIR, ORCHFS_SPDK_SHM_ID and
- *   ORCHFS_SPDK_CPU_LIST.
+ *   ORCHFS_SPDK_CPU_LIST. ORCHFS_SPDK_WRITE_DURABILITY accepts auto,
+ *   completion, fua, or flush.
  *
  * Standalone compatibility calls poll their qpairs on the calling thread and
- * create no service threads. Runtime-integrated KFS owns exactly one qpair per
- * Runtime worker: the same worker submits, polls, completes and frees it.
+ * create no service threads. Runtime-integrated KFS caps qpairs independently
+ * from Runtime workers.  Each qpair is still polled, completed and freed only
+ * by its owner worker; submissions from other workers use its MPSC inbox.
  * These functions return errno values (zero on success).
  *
  * Completion callbacks execute on the qpair owner. They may submit
@@ -33,7 +41,8 @@ typedef void (*orchfs_spdk_device_completion_fn)(void *context,
  */
 int orchfs_spdk_device_start(void);
 /* Runtime-integrated mode. runtime_handle must point to the process Runtime;
- * one qpair is polled by each Runtime worker and no poller threads are made. */
+ * up to ORCHFS_SPDK_POLLER_COUNT qpairs are polled by Runtime workers and no
+ * poller threads are made. */
 int orchfs_spdk_device_start_on_runtime(void *runtime_handle);
 int orchfs_spdk_device_stop(void);
 int orchfs_spdk_device_is_running(void);
@@ -62,6 +71,8 @@ int orchfs_spdk_formatter_flush(void);
 size_t orchfs_spdk_device_poller_count(void);
 uint32_t orchfs_spdk_device_lba_size(void);
 uint64_t orchfs_spdk_device_capacity_bytes(void);
+int orchfs_spdk_device_effective_write_durability(void);
+int orchfs_spdk_device_volatile_write_cache_present(void);
 
 #ifdef __cplusplus
 }

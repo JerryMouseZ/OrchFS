@@ -614,7 +614,7 @@ fb_lfs_closedir(DIR *dirp)
 static int
 fb_lfs_fstat(fb_fdesc_t *fd, struct stat64 *statbufp)
 {
-	return (fstat(fd->fd_num, statbufp));//fstat64
+	return (fstat64(fd->fd_num, statbufp));
 }
 
 /*
@@ -623,7 +623,7 @@ fb_lfs_fstat(fb_fdesc_t *fd, struct stat64 *statbufp)
 static int
 fb_lfs_stat(char *path, struct stat64 *statbufp)
 {
-	return (stat(path, statbufp));//stat64
+	return (stat64(path, statbufp));
 }
 
 /*

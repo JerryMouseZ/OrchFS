@@ -61,8 +61,23 @@ uint32_t sync_all_mem_bmp();
 
 uint32_t sync_mem_bmp(int32_t bmp_type, int64_t bit_off, int64_t bit_len);
 
+/* WAL home-update helpers. The persistent update is based on the media byte,
+ * not the DRAM byte, so an unrelated uncommitted allocation sharing that byte
+ * cannot become durable accidentally. */
+int orchfs_bitmap_persist_change(int32_t bmp_type, int64_t block,
+                                 int allocated);
+int orchfs_bitmap_replay_change(int32_t bmp_type, int64_t block,
+                                int allocated);
+void orchfs_bitmap_recompute_counts(void);
+int64_t orchfs_bitmap_next_allocated(int32_t bmp_type, int64_t after);
+
 
 void delete_mem_bmp();
+
+/* Reproduction-only, out-of-band allocation snapshot.  When
+ * ORCHFS_REPRO_SPACE_FILE is set, append the current bitmap counters as CSV.
+ * The caller invokes this from the KFS main thread, never from a hot path. */
+int orchfs_repro_space_snapshot(const char* label);
 
 /*---------------------------------inode----------------------------------*/
 /* alloc nvm page

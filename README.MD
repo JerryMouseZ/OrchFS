@@ -98,6 +98,17 @@ The staged 64 KiB/QD64 optimization measurements, p99 values, CPU profiles,
 and final layer-gate assessment are recorded in
 [docs/optimization-results-20260721.md](docs/optimization-results-20260721.md).
 
+The paper-workload differential reproduction compares the fair synchronous
+baseline with the current coroutine/SPDK implementation only.  Its exact
+scope, destructive-device guard, workload-to-figure mapping, random seed,
+profiling method, run commands, raw-data layout, and redraw rules are in
+[docs/paper-reproduction.md](docs/paper-reproduction.md).  This is deliberately
+separate from the paper's cross-filesystem results: no number produced by this
+runner should be relabeled as an EXT4/F2FS/NOVA/etc. comparison.
+The 2026-07-22 smoke execution, profiling evidence, functional blockers, and
+redrawn-output index are recorded separately in
+[docs/reproduction-results-20260722.md](docs/reproduction-results-20260722.md).
+
 ## Using OrchFS:
 
 **1. Example of Micro-benchmark**

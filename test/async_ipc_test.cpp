@@ -61,6 +61,26 @@ int main() {
         "/tmp/orchfs-async-ipc-" + std::to_string(::getpid()) + ".sock";
     ::unlink(socket_path.c_str());
 
+    const std::string stale_path = socket_path + "-stale";
+    ::unlink(stale_path.c_str());
+    const pid_t stale_owner = ::fork();
+    assert(stale_owner >= 0);
+    if (stale_owner == 0) {
+        std::error_code child_error;
+        auto stale = ControlServer::listen(
+            stale_path, TransportConfig{1, 2, 64}, child_error);
+        _exit(stale && !child_error ? 0 : 1);
+    }
+    int stale_status = 0;
+    assert(::waitpid(stale_owner, &stale_status, 0) == stale_owner);
+    assert(WIFEXITED(stale_status) && WEXITSTATUS(stale_status) == 0);
+    std::error_code stale_error;
+    auto recovered_listener = ControlServer::listen(
+        stale_path, TransportConfig{1, 2, 64}, stale_error);
+    assert(recovered_listener && !stale_error);
+    recovered_listener = ControlServer{};
+    assert(::access(stale_path.c_str(), F_OK) != 0 && errno == ENOENT);
+
     std::error_code error;
     auto invalid_listener =
         ControlServer::listen(socket_path + "-invalid", {1, 1, 64}, error);

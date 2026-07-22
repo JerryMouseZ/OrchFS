@@ -27,6 +27,13 @@ struct orchfs_migration_plan
 
 static migrate_info_t migration;
 static int migration_initialized;
+static int migration_disabled;
+
+static int repro_migration_disabled(void)
+{
+    const char* value = getenv("ORCHFS_REPRO_DISABLE_MIGRATION");
+    return value != NULL && *value != '\0' && strcmp(value, "0") != 0;
+}
 
 int orchfs_migration_initialize(void)
 {
@@ -40,6 +47,12 @@ int orchfs_migration_initialize(void)
     migration.mig_threshold =
         migration.can_use_page_num / 100 * MIGRATE_PERCENTAGE;
     migration.mig_state = SLEEP;
+    migration_disabled = repro_migration_disabled();
+    if(migration_disabled)
+    {
+        migration_initialized = 1;
+        return 0;
+    }
     const int error = orchfs_async_migration_start();
     if(error != 0)
         return error;
@@ -51,12 +64,14 @@ void orchfs_migration_shutdown(void)
 {
     if(!migration_initialized)
         return;
-    orchfs_async_migration_stop();
+    if(!migration_disabled)
+        orchfs_async_migration_stop();
     fprintf(stderr, "all mig num: %lld\n",
             (long long)migration.all_mig_blk);
     fprintf(stderr, "max page num: %lld\n",
             (long long)migration.max_page_use);
     migration_initialized = 0;
+    migration_disabled = 0;
 }
 
 migrate_info_pt orchfs_migration_state(void)
@@ -202,14 +217,14 @@ int orchfs_finish_migration(struct orchfs_migration_plan* plan, int error)
 
 int orchfs_migration_has_pending(void)
 {
-    return orchfs_async_migration_candidates_pending();
+    return migration_disabled ? 0 : orchfs_async_migration_candidates_pending();
 }
 
 void add_migrate_node(migrate_info_pt ignored, struct offset_info_t* info,
                       int64_t inode, int64_t new_pages)
 {
     (void)ignored;
-    if(!migration_initialized || info == NULL)
+    if(!migration_initialized || migration_disabled || info == NULL)
         return;
     LRU_node_info_t node;
     memset(&node, 0, sizeof(node));

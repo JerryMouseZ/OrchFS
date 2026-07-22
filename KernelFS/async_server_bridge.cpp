@@ -1,6 +1,7 @@
 #include "async_server_bridge.h"
 #include "async_server_bridge_internal.hpp"
 
+#include "orchfs/async/detail/cpu_list.hpp"
 #include "orchfs/async/runtime.hpp"
 #include "orchfs/async/server.hpp"
 #include "orchfs/async/ipc_protocol.hpp"
@@ -26,6 +27,7 @@ extern "C" {
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -222,6 +224,15 @@ int orchfs_async_runtime_start(void) {
 
         orchfs::async::RuntimeOptions runtime_options;
         runtime_options.worker_count = worker_count;
+        if (const char *cpu_list = std::getenv("ORCHFS_KFS_CPU_LIST");
+            cpu_list != nullptr && *cpu_list != '\0') {
+            const std::error_code cpu_error =
+                orchfs::async::detail::parse_cpu_list(
+                    cpu_list, runtime_options.cpu_set);
+            if (cpu_error) {
+                return to_errno(cpu_error);
+            }
+        }
         auto runtime_result =
             orchfs::async::Runtime::create(std::move(runtime_options));
         if (!runtime_result) {

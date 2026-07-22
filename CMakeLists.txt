@@ -17,6 +17,8 @@ option(ORCHFS_ENABLE_SPDK
        "Build the KFS NVMe backend with SPDK support" OFF)
 option(ORCHFS_BUILD_KFS
        "Build the production Runtime-owned KFS server" OFF)
+option(ORCHFS_REPRO_TRACE
+       "Compile lightweight source tracing for paper-workload profiling" OFF)
 if(ORCHFS_BUILD_KFS AND NOT ORCHFS_ENABLE_SPDK)
   set(ORCHFS_ENABLE_SPDK ON CACHE BOOL
       "Production KFS requires the SPDK backend" FORCE)
@@ -26,6 +28,15 @@ set(SPDK_ROOT "/opt/orchfs/spdk" CACHE PATH
     "Fixed SPDK source/build prefix (the supported baseline is SPDK v26.01)")
 
 set(ORCHFS_PUBLIC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+add_library(orchfs_repro_trace STATIC Async/repro_trace.cpp)
+target_compile_features(orchfs_repro_trace PUBLIC cxx_std_20)
+target_include_directories(orchfs_repro_trace PUBLIC
+  "${ORCHFS_PUBLIC_INCLUDE_DIR}")
+if(ORCHFS_REPRO_TRACE)
+  target_compile_definitions(orchfs_repro_trace PUBLIC
+    ORCHFS_REPRO_TRACE_ENABLED=1)
+endif()
 
 function(orchfs_enable_project_options target)
   target_compile_options(
@@ -67,7 +78,8 @@ target_compile_features(orchfs_async_client PUBLIC cxx_std_20)
 target_include_directories(orchfs_async_client PUBLIC
   "${ORCHFS_PUBLIC_INCLUDE_DIR}")
 target_link_libraries(orchfs_async_client
-  PUBLIC orchfs_async_runtime orchfs_async_ipc Threads::Threads)
+  PUBLIC orchfs_async_runtime orchfs_async_ipc orchfs_repro_trace
+         Threads::Threads)
 
 # KFS-side authoritative dispatcher. The injected AsyncFilesystem implementation
 # is resolved by the final KFS executable, not by this transport-only library.
@@ -79,7 +91,8 @@ target_include_directories(orchfs_async_server PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/LibFS"
   "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS")
 target_link_libraries(orchfs_async_server
-  PUBLIC orchfs_async_runtime orchfs_async_ipc Threads::Threads)
+  PUBLIC orchfs_async_runtime orchfs_async_ipc orchfs_repro_trace
+         Threads::Threads)
 
 add_library(orchfs_async_device STATIC Async/block_device.cpp)
 target_compile_features(orchfs_async_device PUBLIC cxx_std_20)
@@ -87,7 +100,8 @@ target_include_directories(orchfs_async_device PUBLIC
   "${ORCHFS_PUBLIC_INCLUDE_DIR}")
 target_include_directories(orchfs_async_device PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS")
-target_link_libraries(orchfs_async_device PUBLIC orchfs_async_runtime)
+target_link_libraries(orchfs_async_device PUBLIC
+  orchfs_async_runtime orchfs_repro_trace)
 target_link_libraries(orchfs_async_server PUBLIC orchfs_async_device)
 
 add_library(orchfs_kfs_coroutine_core STATIC
@@ -99,7 +113,7 @@ target_include_directories(orchfs_kfs_coroutine_core PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/LibFS"
   "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS")
 target_link_libraries(orchfs_kfs_coroutine_core PUBLIC
-  orchfs_async_runtime orchfs_async_device)
+  orchfs_async_runtime orchfs_async_device orchfs_repro_trace)
 
 # SPDK-backed NVMe data path. The same target remains usable with SPDK disabled;
 # open then reports ENOTSUP and the hardware-independent planning tests still run.
@@ -305,7 +319,7 @@ if(ORCHFS_BUILD_KFS)
     ORCHFS_KFS_SERVER=1 ORCHFS_ENABLE_SPDK=1)
   target_link_libraries(orchfs_kfs_service PUBLIC
     pmem orchfs_spdk_backend orchfs_async_server
-    orchfs_kfs_coroutine_core orchfs_kfs_layout_core)
+    orchfs_kfs_coroutine_core orchfs_kfs_layout_core orchfs_repro_trace)
 
   add_executable(kfs_main KernelFS/kernel_main.c)
   orchfs_enable_project_options(kfs_main)
@@ -337,7 +351,7 @@ if(ORCHFS_BUILD_KFS)
   target_compile_definitions(mkfs PRIVATE
     ORCHFS_KFS_SERVER=1 ORCHFS_ENABLE_SPDK=1 ORCHFS_FORMATTER=1)
   target_link_libraries(mkfs PRIVATE
-    pmem orchfs_spdk_backend orchfs_async_runtime)
+    pmem orchfs_spdk_backend orchfs_async_runtime orchfs_repro_trace)
   add_custom_target(run_mkfs DEPENDS mkfs COMMAND mkfs)
 endif()
 
@@ -352,6 +366,51 @@ orchfs_enable_project_options(paralleltest3-ComFS)
 target_link_libraries(paralleltest3-ComFS PRIVATE Threads::Threads)
 add_custom_target(run_paralleltest3-ComFS
   DEPENDS paralleltest3-ComFS COMMAND paralleltest3-ComFS)
+
+# One deterministic POSIX workload generator is used against both the detached
+# synchronous baseline and the current LD_PRELOAD adapter.  Keeping the
+# generator independent of either implementation prevents benchmark code from
+# silently selecting a different API or request stream for one side.
+add_executable(orchfs_repro_bench
+  scripts/reproduction/orchfs_repro_bench.c)
+target_compile_options(orchfs_repro_bench PRIVATE
+  -O3 -Wall -Wextra -Wpedantic)
+target_link_libraries(orchfs_repro_bench PRIVATE Threads::Threads)
+
+add_executable(orchfs_repro_mkdir
+  scripts/reproduction/orchfs_repro_mkdir.c)
+
+add_executable(gridgraph_edge_converter
+  scripts/reproduction/gridgraph_edge_converter.c)
+target_compile_options(gridgraph_edge_converter PRIVATE
+  -O3 -Wall -Wextra -Wpedantic)
+
+add_executable(orchfs_repro_copy
+  scripts/reproduction/orchfs_repro_copy.c)
+target_compile_options(orchfs_repro_copy PRIVATE
+  -O3 -Wall -Wextra -Wpedantic)
+
+add_executable(async_persistence_probe test/async_persistence_probe.c)
+target_compile_options(async_persistence_probe PRIVATE
+  -O2 -Wall -Wextra -Wpedantic -D_FORTIFY_SOURCE=2)
+
+add_executable(async_posix_probe test/async_posix_probe.c)
+target_compile_options(async_posix_probe PRIVATE
+  -O2 -Wall -Wextra -Wpedantic -D_FORTIFY_SOURCE=2)
+
+find_path(ORCHFS_LEVELDB_INCLUDE_DIR leveldb/db.h)
+find_library(ORCHFS_LEVELDB_LIBRARY NAMES leveldb)
+if(ORCHFS_LEVELDB_INCLUDE_DIR AND ORCHFS_LEVELDB_LIBRARY)
+  add_executable(orchfs_ycsb_leveldb
+    scripts/reproduction/orchfs_ycsb_leveldb.cpp)
+  target_include_directories(orchfs_ycsb_leveldb PRIVATE
+    "${ORCHFS_LEVELDB_INCLUDE_DIR}")
+  target_link_libraries(orchfs_ycsb_leveldb PRIVATE
+    "${ORCHFS_LEVELDB_LIBRARY}" Threads::Threads)
+  target_compile_features(orchfs_ycsb_leveldb PRIVATE cxx_std_20)
+endif()
+target_compile_options(orchfs_repro_mkdir PRIVATE
+  -O3 -Wall -Wextra -Wpedantic)
 
 # Explicit, destructive hardware validation.  It is intentionally never
 # registered with CTest and has a second runtime opt-in guard.
@@ -374,6 +433,8 @@ if(BUILD_TESTING)
   endif()
 
   add_executable(legacy_wrapper_host_test test/legacy_wrapper_host_test.c)
+  target_compile_options(legacy_wrapper_host_test PRIVATE
+    -O2 -D_FORTIFY_SOURCE=2)
   add_dependencies(legacy_wrapper_host_test OrchFS)
   add_test(NAME legacy_wrapper_host
     COMMAND "${CMAKE_COMMAND}" -E env
@@ -412,6 +473,15 @@ if(BUILD_TESTING)
   add_test(NAME kfs_coroutine_core COMMAND kfs_coroutine_core_test)
   set_tests_properties(kfs_coroutine_core PROPERTIES
     TIMEOUT 30 LABELS "async;kfs;unit")
+
+  add_executable(journal_recovery_test
+    test/journal_recovery_test.c LibFS/lib_log.c)
+  orchfs_enable_project_options(journal_recovery_test)
+  target_include_directories(journal_recovery_test PRIVATE
+    LibFS KernelFS "${ORCHFS_PUBLIC_INCLUDE_DIR}")
+  add_test(NAME journal_recovery COMMAND journal_recovery_test)
+  set_tests_properties(journal_recovery PROPERTIES
+    TIMEOUT 30 LABELS "async;kfs;journal;unit")
 
   add_executable(async_ipc_test test/async_ipc_test.cpp)
   target_link_libraries(async_ipc_test PRIVATE orchfs_async_ipc)

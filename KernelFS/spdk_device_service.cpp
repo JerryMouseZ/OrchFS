@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <charconv>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <new>
@@ -68,6 +69,22 @@ int available_cpus(std::vector<unsigned> &cpus) noexcept {
     return ENOMEM;
   }
   return cpus.empty() ? EINVAL : 0;
+}
+
+int parse_write_durability(orchfs_spdk_write_durability &value) noexcept {
+  const char *text = std::getenv("ORCHFS_SPDK_WRITE_DURABILITY");
+  if (text == nullptr || *text == '\0' || std::strcmp(text, "auto") == 0) {
+    value = ORCHFS_SPDK_DURABILITY_AUTO;
+  } else if (std::strcmp(text, "completion") == 0) {
+    value = ORCHFS_SPDK_DURABILITY_COMPLETION;
+  } else if (std::strcmp(text, "fua") == 0) {
+    value = ORCHFS_SPDK_DURABILITY_FUA;
+  } else if (std::strcmp(text, "flush") == 0) {
+    value = ORCHFS_SPDK_DURABILITY_FLUSH;
+  } else {
+    return EINVAL;
+  }
+  return 0;
 }
 
 int parse_cpu_list(std::string_view input,
@@ -140,6 +157,14 @@ int load_config(LoadedConfig &loaded,
         }
         loaded.poller_cpus.push_back(cpu.value());
       }
+      std::size_t poller_count =
+          std::min(kDefaultPollerCount, loaded.poller_cpus.size());
+      if ((error = parse_integer("ORCHFS_SPDK_POLLER_COUNT", std::size_t{1},
+                                 loaded.poller_cpus.size(), poller_count)) !=
+          0) {
+        return error;
+      }
+      loaded.poller_cpus.resize(poller_count);
     } else {
       const char *cpu_list = std::getenv("ORCHFS_SPDK_CPU_LIST");
       error = cpu_list != nullptr && *cpu_list != '\0'
@@ -164,7 +189,8 @@ int load_config(LoadedConfig &loaded,
     std::size_t bounce_buffers = 32;
     std::uint32_t max_transfer = 1024U * 1024U;
     int shared_memory_id = -1;
-    if ((error = parse_integer("ORCHFS_SPDK_NSID", std::uint32_t{1},
+    if ((error = parse_write_durability(loaded.bridge.write_durability)) != 0 ||
+        (error = parse_integer("ORCHFS_SPDK_NSID", std::uint32_t{1},
                                std::numeric_limits<std::uint32_t>::max(),
                                namespace_id)) != 0 ||
         (error = parse_integer("ORCHFS_SPDK_QUEUE_DEPTH", std::uint32_t{1},
@@ -307,6 +333,12 @@ public:
     if (error != 0) {
       return error;
     }
+    const std::size_t actual_pollers = orchfs_spdk_poller_count(backend);
+    if (actual_pollers == 0 || actual_pollers > config.poller_cpus.size()) {
+      close_unowned_backend(backend);
+      return EIO;
+    }
+    config.poller_cpus.resize(actual_pollers);
 
     try {
       DeviceService *raw =
@@ -492,6 +524,12 @@ public:
   size_t poller_count() const noexcept { return poller_cpus_.size(); }
   uint32_t lba_size() const noexcept { return lba_size_; }
   uint64_t capacity_bytes() const noexcept { return capacity_bytes_; }
+  int write_durability() const noexcept {
+    return static_cast<int>(write_durability_);
+  }
+  int volatile_write_cache_present() const noexcept {
+    return volatile_write_cache_present_;
+  }
   bool fully_stopped() const noexcept {
     return fully_stopped_.load(std::memory_order_acquire);
   }
@@ -622,6 +660,10 @@ private:
             std::make_unique<std::atomic<std::size_t>[]>(poller_cpus_.size())),
         lba_size_(orchfs_spdk_lba_size(backend)),
         capacity_bytes_(orchfs_spdk_capacity_bytes(backend)),
+        write_durability_(
+            orchfs_spdk_effective_write_durability(backend)),
+        volatile_write_cache_present_(
+            orchfs_spdk_volatile_write_cache_present(backend)),
         runtime_(runtime) {
     const std::size_t completion_count =
         static_cast<std::size_t>(queue_depth) * 2U + 16U;
@@ -750,8 +792,13 @@ private:
       if (orchfs::async::Runtime::current() != runtime_) {
         return EPERM;
       }
-      poller = orchfs::async::Runtime::current_worker();
-      return poller < poller_cpus_.size() ? 0 : EPERM;
+      const std::size_t worker = orchfs::async::Runtime::current_worker();
+      if (worker == orchfs::async::detail::no_worker ||
+          poller_cpus_.empty()) {
+        return EPERM;
+      }
+      poller = orchfs_spdk_worker_to_poller(worker, poller_cpus_.size());
+      return 0;
     }
     poller = static_cast<std::size_t>((offset / kPollerStripeBytes) %
                                       poller_cpus_.size());
@@ -765,6 +812,8 @@ private:
       completion_pools_;
   const uint32_t lba_size_{};
   const uint64_t capacity_bytes_{};
+  const orchfs_spdk_write_durability write_durability_{};
+  const int volatile_write_cache_present_{};
   std::atomic<bool> accepting_{true};
   std::atomic<std::size_t> active_submitters_{0};
   std::atomic<int> first_error_{0};
@@ -978,6 +1027,16 @@ uint32_t orchfs_spdk_device_lba_size(void) {
 uint64_t orchfs_spdk_device_capacity_bytes(void) {
   auto service = service_snapshot();
   return service ? service->capacity_bytes() : 0;
+}
+
+int orchfs_spdk_device_effective_write_durability(void) {
+  auto service = service_snapshot();
+  return service ? service->write_durability() : ORCHFS_SPDK_DURABILITY_AUTO;
+}
+
+int orchfs_spdk_device_volatile_write_cache_present(void) {
+  auto service = service_snapshot();
+  return service ? service->volatile_write_cache_present() : -1;
 }
 
 } // extern "C"

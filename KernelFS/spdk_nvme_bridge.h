@@ -10,6 +10,13 @@ extern "C" {
 
 typedef struct orchfs_spdk_backend orchfs_spdk_backend;
 
+typedef enum orchfs_spdk_write_durability {
+    ORCHFS_SPDK_DURABILITY_AUTO = 0,
+    ORCHFS_SPDK_DURABILITY_COMPLETION = 1,
+    ORCHFS_SPDK_DURABILITY_FUA = 2,
+    ORCHFS_SPDK_DURABILITY_FLUSH = 3,
+} orchfs_spdk_write_durability;
+
 typedef struct orchfs_spdk_config {
     const char *pci_bdf;
     uint32_t namespace_id;
@@ -17,6 +24,7 @@ typedef struct orchfs_spdk_config {
     uint32_t queue_depth;
     size_t bounce_buffers_per_poller;
     uint32_t max_transfer_size;
+    orchfs_spdk_write_durability write_durability;
     const char *application_name;
     const char *reactor_mask;
     const char *hugepage_directory;
@@ -78,6 +86,10 @@ size_t orchfs_spdk_poller_count(const orchfs_spdk_backend *backend);
 uint32_t orchfs_spdk_lba_size(const orchfs_spdk_backend *backend);
 uint32_t orchfs_spdk_max_transfer_size(const orchfs_spdk_backend *backend);
 uint64_t orchfs_spdk_capacity_bytes(const orchfs_spdk_backend *backend);
+orchfs_spdk_write_durability orchfs_spdk_effective_write_durability(
+    const orchfs_spdk_backend *backend);
+int orchfs_spdk_volatile_write_cache_present(
+    const orchfs_spdk_backend *backend);
 
 #ifdef __cplusplus
 }

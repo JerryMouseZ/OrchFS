@@ -6,6 +6,7 @@
 #include "orchfs/async/filesystem.hpp"
 #include "orchfs/async/ipc_transport.hpp"
 #include "orchfs/async/range_arbiter.hpp"
+#include "orchfs/async/repro_trace.hpp"
 #include "orchfs/async/rpc_protocol.hpp"
 #include "orchfs/async/runtime.hpp"
 
@@ -105,17 +106,6 @@ Result<ParsedRequest> parse_request(std::span<const std::byte> payload) {
   return Result<ParsedRequest>::success(std::move(parsed));
 }
 
-std::string_view path_parent(std::string_view path) noexcept {
-  const auto slash = path.find_last_of('/');
-  if (slash == std::string_view::npos) {
-    return ".";
-  }
-  if (slash == 0) {
-    return "/";
-  }
-  return path.substr(0, slash);
-}
-
 int validate_path(std::string_view path) noexcept {
   if (path.empty()) {
     return ENOENT;
@@ -124,6 +114,17 @@ int validate_path(std::string_view path) noexcept {
     return ENAMETOOLONG;
   }
   return 0;
+}
+
+constexpr int synchronous_write_flags() noexcept {
+  int flags = 0;
+#ifdef O_SYNC
+  flags |= O_SYNC;
+#endif
+#ifdef O_DSYNC
+  flags |= O_DSYNC;
+#endif
+  return flags;
 }
 
 int validate_open_flags(int flags) noexcept {
@@ -142,19 +143,8 @@ int validate_open_flags(int flags) noexcept {
     return EOPNOTSUPP;
   }
 #endif
-#ifdef O_SYNC
-  if ((flags & O_SYNC) != 0) {
-    return EOPNOTSUPP;
-  }
-#endif
-#ifdef O_DSYNC
-  if ((flags & O_DSYNC) != 0) {
-    return EOPNOTSUPP;
-  }
-#endif
-
   int supported = O_ACCMODE | O_CREAT | O_EXCL | O_TRUNC | O_APPEND |
-                  O_NONBLOCK;
+                  O_NONBLOCK | synchronous_write_flags();
 #ifdef O_CLOEXEC
   supported |= O_CLOEXEC;
 #endif
@@ -268,11 +258,32 @@ struct HandleState {
   std::uint64_t directory_cursor{kNotDirectoryCursor};
   std::atomic<int> open_flags{O_RDONLY};
   std::atomic<bool> closing{false};
+  std::atomic<std::size_t> active_writes{0};
   RangeArbiter lifecycle_gate;
   RangeArbiter offset_gate;
 
   [[nodiscard]] bool is_directory_cursor() const noexcept {
     return directory_cursor != kNotDirectoryCursor;
+  }
+
+  [[nodiscard]] bool acquire_write() noexcept {
+    if (closing.load(std::memory_order_acquire)) {
+      return false;
+    }
+    active_writes.fetch_add(1, std::memory_order_acq_rel);
+    if (!closing.load(std::memory_order_acquire)) {
+      return true;
+    }
+    if (active_writes.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      active_writes.notify_all();
+    }
+    return false;
+  }
+
+  void release_write() noexcept {
+    if (active_writes.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      active_writes.notify_all();
+    }
   }
 };
 
@@ -826,6 +837,16 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       co_return completion;
     }
     auto permit = std::move(acquired).value();
+    while (handle->active_writes.load(std::memory_order_acquire) != 0) {
+      auto yielded = co_await Runtime::yield();
+      if (!yielded) {
+        handle->closing.store(false, std::memory_order_release);
+        fail(completion, error_number(yielded.error()));
+        auto ignored = co_await permit.release();
+        (void)ignored;
+        co_return completion;
+      }
+    }
     const OpenedNode node{.inode = handle->inode, .type = handle->type};
     auto closed = directory_cursor
                       ? co_await filesystem_->close_directory(node)
@@ -945,21 +966,22 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       fail(completion, EPROTO);
       co_return completion;
     }
+    if (!handle->acquire_write()) {
+      fail(completion, EBADF);
+      co_return completion;
+    }
+    struct WriteGuard final {
+      HandleState* handle;
+      ~WriteGuard() { handle->release_write(); }
+    } write_guard{handle.get()};
+
     auto scheduled = co_await schedule_handle_owner(*handle);
     if (!scheduled) {
       fail(completion, error_number(scheduled.error()));
       co_return completion;
     }
-
-    auto life_result = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!life_result) {
-      fail(completion, error_number(life_result.error()));
-      co_return completion;
-    }
-    auto life = std::move(life_result).value();
-    const bool append =
-        (handle->open_flags.load(std::memory_order_acquire) & O_APPEND) != 0;
+    const int open_flags = handle->open_flags.load(std::memory_order_acquire);
+    const bool append = (open_flags & O_APPEND) != 0;
     std::optional<RangePermit> offset_permit;
     if (implicit || append) {
       auto acquired = co_await handle->offset_gate.acquire(
@@ -1007,10 +1029,6 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       if (!released && completion.descriptor.status == 0) {
         fail(completion, error_number(released.error()));
       }
-    }
-    auto life_released = co_await life.release();
-    if (!life_released && completion.descriptor.status == 0) {
-      fail(completion, error_number(life_released.error()));
     }
     co_return completion;
   }
@@ -1120,10 +1138,6 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
     if (opcode == Opcode::rename) {
       if (const int error = validate_path(parsed.path2); error != 0) {
         fail(completion, error);
-        co_return completion;
-      }
-      if (path_parent(parsed.path1) != path_parent(parsed.path2)) {
-        fail(completion, EXDEV);
         co_return completion;
       }
     }
@@ -1796,6 +1810,8 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
 
 DetachedTask run_request(std::shared_ptr<ServerSession> session,
                          Incoming incoming) {
+  const std::uint64_t trace_request_id = incoming.descriptor.request_id;
+  const std::uint64_t trace_started_ns = orchfs_repro_trace_begin();
   // Poller callbacks run outside Runtime's per-work-item resume scope.  Enter
   // that scope before dispatch can acquire a pin: otherwise a request that
   // suspends while holding a RangePermit leaves its pin depth in worker TLS
@@ -1805,6 +1821,14 @@ DetachedTask run_request(std::shared_ptr<ServerSession> session,
     std::terminate();
   }
   auto completion = co_await session->dispatch(std::move(incoming));
+  if (trace_started_ns != 0) {
+    const int trace_error = completion.descriptor.status < 0
+                                ? -completion.descriptor.status
+                                : completion.descriptor.status;
+    orchfs_repro_trace_end(
+        ORCHFS_TRACE_SERVER_DISPATCH, trace_request_id, trace_started_ns,
+        completion.descriptor.result_length, 1, trace_error);
+  }
   const auto lane = completion.lane;
   if (lane >= session->lanes_.size()) {
     std::terminate();

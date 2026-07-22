@@ -55,11 +55,14 @@ struct orchfs_core_dirent {
 };
 
 int orchfs_core_initialize(void);
+int orchfs_core_validate_format(void);
+int orchfs_core_recover(void);
 void orchfs_core_shutdown(void);
 int64_t orchfs_core_root_inode(void);
 int orchfs_core_create_inode(int32_t type, uint32_t mode,
                              struct orchfs_core_inode* result);
 int orchfs_core_delete_inode(int64_t inode);
+int orchfs_core_set_orphan(int64_t inode, int orphaned);
 
 int orchfs_core_snapshot(int64_t inode, struct orchfs_core_inode* result);
 
@@ -75,6 +78,8 @@ int orchfs_core_ensure_strata(int64_t inode, int64_t file_block,
 
 int orchfs_core_read_pmem(int64_t offset, void* destination, size_t length);
 int orchfs_core_write_pmem(int64_t offset, const void* source, size_t length);
+/* Order and persist PMEM stores issued by the calling inode-owner worker. */
+int orchfs_core_persist_pmem(void);
 int orchfs_core_set_size(int64_t inode, uint64_t size);
 int orchfs_core_sync_inode(int64_t inode);
 

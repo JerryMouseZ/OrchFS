@@ -1,8 +1,10 @@
 #include "../KernelFS/spdk_nvme_backend.hpp"
 #include "../KernelFS/spdk_nvme_bridge.h"
+#include "../KernelFS/spdk_device_service.h"
 #include "../KernelFS/thread_affinity_guard.hpp"
 
 #include <atomic>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -336,6 +338,31 @@ void test_no_spdk_fallback() {
     require(backend == nullptr, "non-SPDK build does not create a handle");
 }
 
+void test_direct_payload_alignment() {
+    alignas(4) std::array<std::byte, 8> bytes{};
+    require(orchfs::nvme::detail::dword_aligned(bytes.data()),
+            "aligned payload was rejected");
+    require(!orchfs::nvme::detail::dword_aligned(bytes.data() + 1),
+            "+1 payload should use bounce I/O");
+    require(!orchfs::nvme::detail::dword_aligned(bytes.data() + 2),
+            "+2 payload should use bounce I/O");
+    require(!orchfs::nvme::detail::dword_aligned(bytes.data() + 3),
+            "+3 payload should use bounce I/O");
+    require(orchfs::nvme::detail::dword_aligned(bytes.data() + 4),
+            "+4 payload should remain direct-I/O eligible");
+}
+
+void test_runtime_worker_poller_mapping() {
+    require(orchfs_spdk_worker_to_poller(0, 4) == 0,
+            "worker zero maps to poller zero");
+    require(orchfs_spdk_worker_to_poller(63, 4) == 3,
+            "64 runtime workers stripe across four qpairs");
+    require(orchfs_spdk_worker_to_poller(64, 4) == 0,
+            "worker mapping wraps deterministically");
+    require(orchfs_spdk_worker_to_poller(7, 0) == SIZE_MAX,
+            "zero qpair count is rejected");
+}
+
 void test_thread_affinity_restoration() {
     cpu_set_t original;
     CPU_ZERO(&original);
@@ -384,6 +411,8 @@ int main() {
     test_write_range_and_flush_fences();
     test_overlapping_write_concurrency();
     test_no_spdk_fallback();
+    test_direct_payload_alignment();
+    test_runtime_worker_poller_mapping();
     test_thread_affinity_restoration();
     std::cout << "spdk_nvme_logic_test: PASS\n";
     return 0;

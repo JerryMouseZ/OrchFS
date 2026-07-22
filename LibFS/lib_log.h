@@ -8,6 +8,9 @@ struct orchfs_log_transaction;
 
 int init_mem_log(void);
 void free_mem_log(void);
+int orchfs_log_validate_format(void);
+int orchfs_log_recover(void);
+int orchfs_log_sync(void);
 void write_create_log(int64_t block, int type);
 void write_delete_log(int64_t block, int type);
 void write_change_log(int64_t block, int type, void* data,

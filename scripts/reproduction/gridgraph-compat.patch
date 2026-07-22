@@ -1,0 +1,124 @@
+diff --git a/core/bigvector.hpp b/core/bigvector.hpp
+index 3555d70..7b97346 100644
+--- a/core/bigvector.hpp
++++ b/core/bigvector.hpp
+@@ -71,6 +71,7 @@ public:
+ 		if (file_size(path) != sizeof(T) * length) {
+ 			long file_length = sizeof(T) * length;
+ 			assert(truncate(path.c_str(), file_length)!=-1);
++#ifndef ORCHFS_GRIDGRAPH_ANON_VERTEX
+ 			int fout = open(path.c_str(), O_WRONLY);
+ 			void * buffer = memalign(PAGESIZE, PAGESIZE);
+ 			for (long offset=0;offset<file_length;) {
+@@ -84,15 +85,25 @@ public:
+ 				}
+ 			}
+ 			close(fout);
++#endif
+ 		}
++#ifdef ORCHFS_GRIDGRAPH_ANON_VERTEX
++		fd = open(path.c_str(), O_RDWR);
++#else
+ 		fd = open(path.c_str(), O_RDWR | O_DIRECT);
++#endif
+ 		assert(fd!=-1);
+ 		open_mmap();
+ 	}
+ 	void open_mmap() {
++#ifdef ORCHFS_GRIDGRAPH_ANON_VERTEX
++		data = (T *)mmap(NULL, sizeof(T) * length, PROT_READ | PROT_WRITE,
++			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++#else
+ 		int ret = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+ 		assert(ret==0);
+ 		data = (T *)mmap(NULL, sizeof(T) * length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++#endif
+ 		assert(data!=MAP_FAILED);
+ 		is_open = true;
+ 	}
+@@ -128,10 +139,20 @@ public:
+ 		assert(msync(data, sizeof(T) * length, MS_SYNC)==0);
+ 	}
+ 	void lock(size_t begin_i, size_t end_i) {
++#ifdef ORCHFS_GRIDGRAPH_ANON_VERTEX
++		(void)begin_i;
++		(void)end_i;
++#else
+ 		assert(mlock(data + begin_i, (end_i - begin_i) * sizeof(T))==0);
++#endif
+ 	}
+ 	void unlock(size_t begin_i, size_t end_i) {
++#ifdef ORCHFS_GRIDGRAPH_ANON_VERTEX
++		(void)begin_i;
++		(void)end_i;
++#else
+ 		assert(munlock(data + begin_i, (end_i - begin_i) * sizeof(T))==0);
++#endif
+ 	}
+ 	void load(size_t begin_i, size_t end_i) {
+ 		close_mmap();
+diff --git a/core/filesystem.hpp b/core/filesystem.hpp
+index 99445ef..42a690b 100644
+--- a/core/filesystem.hpp
++++ b/core/filesystem.hpp
+@@ -20,6 +20,7 @@ Copyright (c) 2014-2015 Xiaowei Zhu, Tsinghua University
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <errno.h>
++#include <string>
+ 
+ inline bool file_exists(std::string filename) {
+ 	struct stat st;
+@@ -43,4 +44,4 @@ inline void remove_directory(std::string path) {
+ 	system(command);
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/core/graph.hpp b/core/graph.hpp
+index 502d510..1ac7af5 100644
+--- a/core/graph.hpp
++++ b/core/graph.hpp
+@@ -27,6 +27,7 @@ Copyright (c) 2014-2015 Xiaowei Zhu, Tsinghua University
+ 
+ #include <thread>
+ #include <vector>
++#include <functional>
+ 
+ #include "core/constants.hpp"
+ #include "core/type.hpp"
+@@ -321,6 +322,10 @@ public:
+ 				}, ti);
+ 			}
+ 			fin = open((path+"/row").c_str(), read_mode);
++			if (fin < 0) {
++				perror("open GridGraph row");
++				abort();
++			}
+ 			posix_fadvise(fin, 0, 0, POSIX_FADV_SEQUENTIAL);
+ 			for (int i=0;i<partitions;i++) {
+ 				if (!should_access_shard[i]) continue;
+@@ -350,6 +355,10 @@ public:
+ 			break;
+ 		case 1: // target oriented update
+ 			fin = open((path+"/column").c_str(), read_mode);
++			if (fin < 0) {
++				perror("open GridGraph column");
++				abort();
++			}
+ 			posix_fadvise(fin, 0, 0, POSIX_FADV_SEQUENTIAL);
+ 
+ 			for (int cur_partition=0;cur_partition<partitions;cur_partition+=partition_batch) {
+@@ -429,6 +438,11 @@ public:
+ 
+ 		close(fin);
+ 		// printf("streamed %ld bytes of edges\n", read_bytes);
++#ifdef ORCHFS_GRIDGRAPH_RECORD_IO
++		fprintf(stderr,
++			"gridgraph_stream_edges update_mode=%d expected_bytes=%ld read_bytes=%ld\n",
++			update_mode, total_bytes, read_bytes);
++#endif
+ 		return value;
+ 	}
+ };

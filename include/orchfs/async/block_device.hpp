@@ -8,6 +8,12 @@
 
 namespace orchfs::async {
 
+enum class DeviceWriteDurability : std::uint8_t {
+    completion = 1,
+    fua = 2,
+    flush = 3,
+};
+
 struct BlockRead {
     std::uint64_t offset{};
     std::span<std::byte> destination;
@@ -36,6 +42,7 @@ public:
     [[nodiscard]] Task<Result<std::size_t>> write_batch(
         std::span<const BlockWrite> requests) const;
     [[nodiscard]] Task<Result<void>> flush() const;
+    [[nodiscard]] DeviceWriteDurability write_durability() const noexcept;
 
 private:
     Runtime* runtime_;
