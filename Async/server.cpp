@@ -2,6 +2,7 @@
 
 #include "orchfs/async/block_device.hpp"
 #include "orchfs/async/detail/concurrency.hpp"
+#include "orchfs/async/detail/range_lock.hpp"
 #include "orchfs/async/filesystem.hpp"
 #include "orchfs/async/ipc_transport.hpp"
 #include "orchfs/async/range_arbiter.hpp"
@@ -656,6 +657,58 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
     return detail::errno_error(error.value()).value();
   }
 
+  struct CompletionRangeLockPolicy {
+    [[nodiscard, gnu::always_inline]] static Completion early_failure(
+        Completion&& completion, std::error_code error) noexcept {
+      ServerSession::fail(completion, ServerSession::error_number(error));
+      return std::move(completion);
+    }
+
+    [[nodiscard, gnu::always_inline]] static bool succeeded(
+        const Completion& completion) noexcept {
+      return completion.descriptor.status == 0;
+    }
+
+    [[gnu::always_inline]] static void apply_failure(
+        Completion& completion, std::error_code error) noexcept {
+      ServerSession::fail(completion, ServerSession::error_number(error));
+    }
+  };
+
+  template <typename Schedule, typename Operation, typename Finish>
+  [[gnu::always_inline]] Task<Completion> with_completion_range_lock(
+      Completion completion, Schedule schedule, RangeArbiter& gate,
+      std::uint64_t offset, std::uint64_t length, RangeMode mode,
+      Operation operation, Finish finish) {
+    return detail::with_range_lock(
+        std::move(schedule), gate, offset, length, mode,
+        std::move(completion), std::move(operation),
+        [finish = std::move(finish)](
+            Completion&& locked_completion, auto&& result) mutable {
+          std::invoke(finish, locked_completion,
+                      std::forward<decltype(result)>(result));
+          return std::move(locked_completion);
+        },
+        CompletionRangeLockPolicy{});
+  }
+
+  template <typename Schedule, typename Operation>
+  [[gnu::always_inline]] Task<Completion> with_completion_range_lock(
+      Completion completion, Schedule schedule, RangeArbiter& gate,
+      std::uint64_t offset, std::uint64_t length, RangeMode mode,
+      Operation operation) {
+    return with_completion_range_lock(
+        std::move(completion), std::move(schedule), gate, offset, length,
+        mode, std::move(operation),
+        [](Completion& locked_completion, auto&& result) {
+          if (!result) {
+            ServerSession::fail(
+                locked_completion,
+                ServerSession::error_number(result.error()));
+          }
+        });
+  }
+
   Runtime::ScheduleOnAwaiter schedule_handle_owner(
       const HandleState& handle) noexcept {
     // schedule_on also marks a frame that is already on this worker as owned.
@@ -887,72 +940,50 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       fail(completion, EMSGSIZE);
       co_return completion;
     }
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
+    co_return co_await with_completion_range_lock(
+        std::move(completion),
+        [this, handle] { return schedule_handle_owner(*handle); },
+        handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [this, &parsed, handle, implicit](
+            Completion& locked_completion) -> Task<Result<void>> {
+          const auto read_at_offset =
+              [this, &parsed, handle, implicit, &locked_completion](
+                  std::uint64_t offset) -> Task<Result<void>> {
+            if (!implicit && parsed.request.offset < 0) {
+              co_return detail::errno_failure<void>(EINVAL);
+            }
+            if (const int error =
+                    validate_io_range(offset, parsed.request.length);
+                error != 0) {
+              co_return detail::errno_failure<void>(error);
+            }
+            auto destination = locked_completion.reservation.payload().first(
+                static_cast<std::size_t>(parsed.request.length));
+            auto read = co_await filesystem_->read(
+                handle->inode, offset, destination);
+            if (!read) {
+              co_return Result<void>::failure(read.error());
+            }
+            if (read.value() > destination.size()) {
+              co_return detail::errno_failure<void>(EIO);
+            }
+            locked_completion.filled_payload_size = read.value();
+            locked_completion.descriptor.result_length = read.value();
+            if (implicit) {
+              handle->offset = offset + read.value();
+            }
+            co_return Result<void>::success();
+          };
 
-    auto life_result = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!life_result) {
-      fail(completion, error_number(life_result.error()));
-      co_return completion;
-    }
-    auto life = std::move(life_result).value();
-    std::optional<RangePermit> offset_permit;
-    if (implicit) {
-      auto acquired = co_await handle->offset_gate.acquire(
-          0, kWholeHandleRange, RangeMode::write);
-      if (!acquired) {
-        fail(completion, error_number(acquired.error()));
-      } else {
-        offset_permit.emplace(std::move(acquired).value());
-      }
-    }
-
-    if (!implicit && parsed.request.offset < 0) {
-      fail(completion, EINVAL);
-    }
-    const std::uint64_t offset = implicit
-                                     ? handle->offset
-                                     : static_cast<std::uint64_t>(
-                                           parsed.request.offset);
-    if (completion.descriptor.status == 0) {
-      if (const int error = validate_io_range(offset, parsed.request.length);
-          error != 0) {
-        fail(completion, error);
-      }
-    }
-    if (completion.descriptor.status == 0) {
-      auto destination = completion.reservation.payload().first(
-          static_cast<std::size_t>(parsed.request.length));
-      auto read = co_await filesystem_->read(
-          handle->inode, offset, destination);
-      if (!read) {
-        fail(completion, error_number(read.error()));
-      } else if (read.value() > destination.size()) {
-        fail(completion, EIO);
-      } else {
-        completion.filled_payload_size = read.value();
-        completion.descriptor.result_length = read.value();
-        if (implicit) {
-          handle->offset = offset + read.value();
-        }
-      }
-    }
-
-    if (offset_permit) {
-      auto released = co_await offset_permit->release();
-      if (!released && completion.descriptor.status == 0) {
-        fail(completion, error_number(released.error()));
-      }
-    }
-    auto life_released = co_await life.release();
-    if (!life_released && completion.descriptor.status == 0) {
-      fail(completion, error_number(life_released.error()));
-    }
-    co_return completion;
+          if (implicit) {
+            co_return co_await detail::with_range_lock(
+                handle->offset_gate, 0, kWholeHandleRange,
+                RangeMode::write,
+                [&] { return read_at_offset(handle->offset); });
+          }
+          co_return co_await read_at_offset(
+              static_cast<std::uint64_t>(parsed.request.offset));
+        });
   }
 
   Task<Completion> do_write(Completion completion,
@@ -972,74 +1003,63 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       fail(completion, EPROTO);
       co_return completion;
     }
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
+    co_return co_await with_completion_range_lock(
+        std::move(completion),
+        [this, handle] { return schedule_handle_owner(*handle); },
+        handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [this, &parsed, handle, implicit](
+            Completion& locked_completion) -> Task<Result<void>> {
+          const bool append =
+              (handle->open_flags.load(std::memory_order_acquire) &
+               O_APPEND) != 0;
+          const auto write_at_offset =
+              [this, &parsed, handle, implicit, append,
+               &locked_completion](std::uint64_t offset)
+                  -> Task<Result<void>> {
+            if (!implicit && parsed.request.offset < 0) {
+              co_return detail::errno_failure<void>(EINVAL);
+            }
+            if (!append) {
+              if (const int error =
+                      validate_io_range(offset, parsed.request.length);
+                  error != 0) {
+                co_return detail::errno_failure<void>(error);
+              }
+            }
+            auto written = co_await filesystem_->write(
+                handle->inode, offset, parsed.data, append);
+            if (!written) {
+              co_return Result<void>::failure(written.error());
+            }
+            if (written.value().bytes > parsed.data.size() ||
+                validate_io_range(written.value().offset,
+                                  written.value().bytes) != 0) {
+              co_return detail::errno_failure<void>(EIO);
+            }
+            locked_completion.descriptor.result_length =
+                written.value().bytes;
+            locked_completion.descriptor.offset = written.value().offset;
+            if (implicit || append) {
+              handle->offset =
+                  written.value().offset + written.value().bytes;
+            }
+            co_return Result<void>::success();
+          };
 
-    auto life_result = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!life_result) {
-      fail(completion, error_number(life_result.error()));
-      co_return completion;
-    }
-    auto life = std::move(life_result).value();
-    const bool append =
-        (handle->open_flags.load(std::memory_order_acquire) & O_APPEND) != 0;
-    std::optional<RangePermit> offset_permit;
-    if (implicit || append) {
-      auto acquired = co_await handle->offset_gate.acquire(
-          0, kWholeHandleRange, RangeMode::write);
-      if (!acquired) {
-        fail(completion, error_number(acquired.error()));
-      } else {
-        offset_permit.emplace(std::move(acquired).value());
-      }
-    }
-
-    if (!implicit && parsed.request.offset < 0) {
-      fail(completion, EINVAL);
-    }
-    const std::uint64_t offset = implicit
-                                     ? handle->offset
-                                     : static_cast<std::uint64_t>(
-                                           parsed.request.offset);
-    if (completion.descriptor.status == 0 && !append) {
-      if (const int error = validate_io_range(offset, parsed.request.length);
-          error != 0) {
-        fail(completion, error);
-      }
-    }
-    if (completion.descriptor.status == 0) {
-      auto written = co_await filesystem_->write(
-          handle->inode, offset, parsed.data, append);
-      if (!written) {
-        fail(completion, error_number(written.error()));
-      } else if (written.value().bytes > parsed.data.size() ||
-                 validate_io_range(written.value().offset,
-                                   written.value().bytes) != 0) {
-        fail(completion, EIO);
-      } else {
-        completion.descriptor.result_length = written.value().bytes;
-        completion.descriptor.offset = written.value().offset;
-        if (implicit || append) {
-          handle->offset = written.value().offset + written.value().bytes;
-        }
-      }
-    }
-
-    if (offset_permit) {
-      auto released = co_await offset_permit->release();
-      if (!released && completion.descriptor.status == 0) {
-        fail(completion, error_number(released.error()));
-      }
-    }
-    auto life_released = co_await life.release();
-    if (!life_released && completion.descriptor.status == 0) {
-      fail(completion, error_number(life_released.error()));
-    }
-    co_return completion;
+          if (implicit || append) {
+            co_return co_await detail::with_range_lock(
+                handle->offset_gate, 0, kWholeHandleRange,
+                RangeMode::write,
+                [&] {
+                  const std::uint64_t offset = implicit
+                      ? handle->offset
+                      : static_cast<std::uint64_t>(parsed.request.offset);
+                  return write_at_offset(offset);
+                });
+          }
+          co_return co_await write_at_offset(
+              static_cast<std::uint64_t>(parsed.request.offset));
+        });
   }
 
   Task<Completion> do_seek(Completion completion, const ParsedRequest& parsed,
@@ -1048,43 +1068,26 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       fail(completion, ESPIPE);
       co_return completion;
     }
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
-    auto life_result = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!life_result) {
-      fail(completion, error_number(life_result.error()));
-      co_return completion;
-    }
-    auto life = std::move(life_result).value();
-    auto offset_result = co_await handle->offset_gate.acquire(
-        0, kWholeHandleRange, RangeMode::write);
-    if (!offset_result) {
-      fail(completion, error_number(offset_result.error()));
-    } else {
-      auto offset_permit = std::move(offset_result).value();
-      auto seeked = co_await filesystem_->seek(
-          handle->inode, handle->offset, parsed.request.offset,
-          parsed.request.whence);
-      if (!seeked) {
-        fail(completion, error_number(seeked.error()));
-      } else {
-        handle->offset = seeked.value();
-        completion.descriptor.result_length = seeked.value();
-      }
-      auto released = co_await offset_permit.release();
-      if (!released && completion.descriptor.status == 0) {
-        fail(completion, error_number(released.error()));
-      }
-    }
-    auto life_released = co_await life.release();
-    if (!life_released && completion.descriptor.status == 0) {
-      fail(completion, error_number(life_released.error()));
-    }
-    co_return completion;
+    co_return co_await with_completion_range_lock(
+        std::move(completion),
+        [this, handle] { return schedule_handle_owner(*handle); },
+        handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [this, &parsed, handle](Completion& locked_completion) {
+          return detail::with_range_lock(
+              handle->offset_gate, 0, kWholeHandleRange, RangeMode::write,
+              [this, &parsed, handle, &locked_completion]()
+                  -> Task<Result<void>> {
+                auto seeked = co_await filesystem_->seek(
+                    handle->inode, handle->offset, parsed.request.offset,
+                    parsed.request.whence);
+                if (!seeked) {
+                  co_return Result<void>::failure(seeked.error());
+                }
+                handle->offset = seeked.value();
+                locked_completion.descriptor.result_length = seeked.value();
+                co_return Result<void>::success();
+              });
+        });
   }
 
   Task<Completion> do_stat_path(Completion completion, std::string path) {
@@ -1105,36 +1108,35 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
   Task<Completion> do_handle_stat(
       Completion completion, const std::shared_ptr<HandleState>& handle,
       Opcode opcode) {
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
-    auto acquired = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!acquired) {
-      fail(completion, error_number(acquired.error()));
-      co_return completion;
-    }
-    auto permit = std::move(acquired).value();
-    const auto record_stat = [&](const auto& stated) {
+    const auto record_stat = [](Completion& locked_completion,
+                                auto&& stated) {
       if (!stated) {
-        fail(completion, error_number(stated.error()));
+        fail(locked_completion, error_number(stated.error()));
       } else {
-        completion.payload = detail::encode_object(to_wire(stated.value()));
-        completion.descriptor.result_length = completion.payload.size();
+        locked_completion.payload =
+            detail::encode_object(to_wire(stated.value()));
+        locked_completion.descriptor.result_length =
+            locked_completion.payload.size();
       }
     };
     if (opcode == Opcode::statfs) {
-      record_stat(co_await filesystem_->statfs(handle->inode));
-    } else {
-      record_stat(co_await filesystem_->stat(handle->inode));
+      co_return co_await with_completion_range_lock(
+          std::move(completion),
+          [this, handle] { return schedule_handle_owner(*handle); },
+          handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+          [this, handle](Completion&) {
+            return filesystem_->statfs(handle->inode);
+          },
+          record_stat);
     }
-    auto released = co_await permit.release();
-    if (!released && completion.descriptor.status == 0) {
-      fail(completion, error_number(released.error()));
-    }
-    co_return completion;
+    co_return co_await with_completion_range_lock(
+        std::move(completion),
+        [this, handle] { return schedule_handle_owner(*handle); },
+        handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [this, handle](Completion&) {
+          return filesystem_->stat(handle->inode);
+        },
+        record_stat);
   }
 
   Task<Completion> do_path_mutation(Completion completion,
@@ -1206,28 +1208,14 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       fail(completion, EBADF);
       co_return completion;
     }
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
-    auto acquired = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!acquired) {
-      fail(completion, error_number(acquired.error()));
-      co_return completion;
-    }
-    auto permit = std::move(acquired).value();
-    auto truncated = co_await filesystem_->truncate(handle->inode,
-                                                    parsed.request.length);
-    if (!truncated) {
-      fail(completion, error_number(truncated.error()));
-    }
-    auto released = co_await permit.release();
-    if (!released && completion.descriptor.status == 0) {
-      fail(completion, error_number(released.error()));
-    }
-    co_return completion;
+    co_return co_await with_completion_range_lock(
+        std::move(completion),
+        [this, handle] { return schedule_handle_owner(*handle); },
+        handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [this, &parsed, handle](Completion&) {
+          return filesystem_->truncate(handle->inode,
+                                       parsed.request.length);
+        });
   }
 
   Task<Completion> do_open_directory(Completion completion,
@@ -1255,33 +1243,23 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       fail(completion, ENOTDIR);
       co_return completion;
     }
-    auto scheduled = co_await runtime_->schedule_on(0);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
-    auto acquired = co_await source->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!acquired) {
-      fail(completion, error_number(acquired.error()));
-      co_return completion;
-    }
-    auto permit = std::move(acquired).value();
-    auto opened = co_await filesystem_->open_directory(source->inode);
-    if (!opened) {
-      fail(completion, error_number(opened.error()));
-    } else if (opened.value().type != NodeType::directory ||
-               opened.value().inode < 0) {
-      fail(completion, ENOTDIR);
-    } else {
-      completion.descriptor.result_length =
-          add_handle(opened.value(), O_RDONLY, true);
-    }
-    auto released = co_await permit.release();
-    if (!released && completion.descriptor.status == 0) {
-      fail(completion, error_number(released.error()));
-    }
-    co_return completion;
+    co_return co_await with_completion_range_lock(
+        std::move(completion), [this] { return runtime_->schedule_on(0); },
+        source->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [this, source](Completion&) {
+          return filesystem_->open_directory(source->inode);
+        },
+        [this](Completion& locked_completion, auto&& opened) {
+          if (!opened) {
+            fail(locked_completion, error_number(opened.error()));
+          } else if (opened.value().type != NodeType::directory ||
+                     opened.value().inode < 0) {
+            fail(locked_completion, ENOTDIR);
+          } else {
+            locked_completion.descriptor.result_length =
+                add_handle(opened.value(), O_RDONLY, true);
+          }
+        });
   }
 
   Task<Completion> do_read_directory(
@@ -1297,140 +1275,102 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       fail(completion, EMSGSIZE);
       co_return completion;
     }
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
-    auto life_result = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!life_result) {
-      fail(completion, error_number(life_result.error()));
-      co_return completion;
-    }
-    auto life = std::move(life_result).value();
-    auto cursor_result = co_await handle->offset_gate.acquire(
-        0, kWholeHandleRange, RangeMode::write);
-    if (!cursor_result) {
-      fail(completion, error_number(cursor_result.error()));
-    } else {
-      auto cursor_permit = std::move(cursor_result).value();
-      std::vector<DirEntry> entries;
-      try {
-        entries.resize(static_cast<std::size_t>(parsed.request.length));
-      } catch (const std::bad_alloc&) {
-        fail(completion, ENOMEM);
-      }
-      if (completion.descriptor.status == 0) {
-        auto read = co_await filesystem_->read_directory(
-            handle->inode, handle->directory_cursor, entries);
-        if (!read) {
-          fail(completion, error_number(read.error()));
-        } else if (read.value().count > entries.size()) {
-          fail(completion, EIO);
-        } else {
-          entries.resize(read.value().count);
-          try {
-            completion.payload.resize(entries.size() * sizeof(RpcDirEntry));
-            auto* output = reinterpret_cast<RpcDirEntry*>(
-                completion.payload.data());
-            for (std::size_t index = 0; index < entries.size(); ++index) {
-              if (entries[index].name.size() > kRpcNameCapacity) {
-                fail(completion, ENAMETOOLONG);
-                break;
-              }
-              RpcDirEntry wire{};
-              wire.inode = entries[index].inode;
-              wire.offset = entries[index].offset;
-              wire.record_length = sizeof(RpcDirEntry);
-              wire.type = entries[index].type;
-              wire.name_length = static_cast<std::uint8_t>(
-                  entries[index].name.size());
-              std::memcpy(wire.name.data(), entries[index].name.data(),
-                          entries[index].name.size());
-              output[index] = wire;
-            }
-          } catch (const std::bad_alloc&) {
-            fail(completion, ENOMEM);
-          }
-          if (completion.descriptor.status == 0) {
-            handle->directory_cursor = read.value().next_cursor;
-            completion.descriptor.result_length = entries.size();
-            if (entries.empty()) {
-              completion.descriptor.flags |= DescriptorFlag::end_of_stream;
-            }
-          }
-        }
-      }
-      auto released = co_await cursor_permit.release();
-      if (!released && completion.descriptor.status == 0) {
-        fail(completion, error_number(released.error()));
-      }
-    }
-    auto life_released = co_await life.release();
-    if (!life_released && completion.descriptor.status == 0) {
-      fail(completion, error_number(life_released.error()));
-    }
-    co_return completion;
+    co_return co_await with_completion_range_lock(
+        std::move(completion),
+        [this, handle] { return schedule_handle_owner(*handle); },
+        handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [this, &parsed, handle](Completion& locked_completion) {
+          return detail::with_range_lock(
+              handle->offset_gate, 0, kWholeHandleRange, RangeMode::write,
+              [this, &parsed, handle, &locked_completion]()
+                  -> Task<Result<void>> {
+                std::vector<DirEntry> entries;
+                try {
+                  entries.resize(
+                      static_cast<std::size_t>(parsed.request.length));
+                } catch (const std::bad_alloc&) {
+                  co_return detail::errno_failure<void>(ENOMEM);
+                }
+                auto read = co_await filesystem_->read_directory(
+                    handle->inode, handle->directory_cursor, entries);
+                if (!read) {
+                  co_return Result<void>::failure(read.error());
+                }
+                if (read.value().count > entries.size()) {
+                  co_return detail::errno_failure<void>(EIO);
+                }
+                entries.resize(read.value().count);
+                try {
+                  locked_completion.payload.resize(
+                      entries.size() * sizeof(RpcDirEntry));
+                  auto* output = reinterpret_cast<RpcDirEntry*>(
+                      locked_completion.payload.data());
+                  for (std::size_t index = 0; index < entries.size();
+                       ++index) {
+                    if (entries[index].name.size() > kRpcNameCapacity) {
+                      co_return detail::errno_failure<void>(ENAMETOOLONG);
+                    }
+                    RpcDirEntry wire{};
+                    wire.inode = entries[index].inode;
+                    wire.offset = entries[index].offset;
+                    wire.record_length = sizeof(RpcDirEntry);
+                    wire.type = entries[index].type;
+                    wire.name_length = static_cast<std::uint8_t>(
+                        entries[index].name.size());
+                    std::memcpy(wire.name.data(), entries[index].name.data(),
+                                entries[index].name.size());
+                    output[index] = wire;
+                  }
+                } catch (const std::bad_alloc&) {
+                  co_return detail::errno_failure<void>(ENOMEM);
+                }
+                handle->directory_cursor = read.value().next_cursor;
+                locked_completion.descriptor.result_length = entries.size();
+                if (entries.empty()) {
+                  locked_completion.descriptor.flags |=
+                      DescriptorFlag::end_of_stream;
+                }
+                co_return Result<void>::success();
+              });
+        });
   }
 
   Task<Completion> do_sync(Completion completion,
                            const std::shared_ptr<HandleState>& handle) {
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
-    auto acquired = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!acquired) {
-      fail(completion, error_number(acquired.error()));
-      co_return completion;
-    }
-    auto permit = std::move(acquired).value();
-    auto synced = co_await filesystem_->sync(handle->inode);
-    if (!synced) {
-      fail(completion, error_number(synced.error()));
-    }
-    auto released = co_await permit.release();
-    if (!released && completion.descriptor.status == 0) {
-      fail(completion, error_number(released.error()));
-    }
-    co_return completion;
+    co_return co_await with_completion_range_lock(
+        std::move(completion),
+        [this, handle] { return schedule_handle_owner(*handle); },
+        handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [this, handle](Completion&) {
+          return filesystem_->sync(handle->inode);
+        });
   }
 
   Task<Completion> do_flags(Completion completion, const ParsedRequest& parsed,
                             const std::shared_ptr<HandleState>& handle) {
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
-    auto acquired = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!acquired) {
-      fail(completion, error_number(acquired.error()));
-      co_return completion;
-    }
-    auto permit = std::move(acquired).value();
-    if (parsed.request.value == F_GETFL) {
-      completion.descriptor.result_length = static_cast<std::uint64_t>(
-          handle->open_flags.load(std::memory_order_acquire));
-    } else if (parsed.request.value == F_SETFL) {
-      constexpr int mutable_flags = O_APPEND | O_NONBLOCK;
-      const int requested = parsed.request.open_flags;
-      int current = handle->open_flags.load(std::memory_order_acquire);
-      handle->open_flags.store((current & ~mutable_flags) |
-                                   (requested & mutable_flags),
-                               std::memory_order_release);
-    } else {
-      fail(completion, EINVAL);
-    }
-    auto released = co_await permit.release();
-    if (!released && completion.descriptor.status == 0) {
-      fail(completion, error_number(released.error()));
-    }
-    co_return completion;
+    co_return co_await with_completion_range_lock(
+        std::move(completion),
+        [this, handle] { return schedule_handle_owner(*handle); },
+        handle->lifecycle_gate, 0, kWholeHandleRange, RangeMode::read,
+        [&parsed, handle](
+            Completion& locked_completion) -> Task<Result<void>> {
+          if (parsed.request.value == F_GETFL) {
+            locked_completion.descriptor.result_length =
+                static_cast<std::uint64_t>(
+                    handle->open_flags.load(std::memory_order_acquire));
+          } else if (parsed.request.value == F_SETFL) {
+            constexpr int mutable_flags = O_APPEND | O_NONBLOCK;
+            const int requested = parsed.request.open_flags;
+            int current =
+                handle->open_flags.load(std::memory_order_acquire);
+            handle->open_flags.store((current & ~mutable_flags) |
+                                         (requested & mutable_flags),
+                                     std::memory_order_release);
+          } else {
+            co_return detail::errno_failure<void>(EINVAL);
+          }
+          co_return Result<void>::success();
+        });
   }
 
   Task<Completion> do_raw_device(Completion completion,
