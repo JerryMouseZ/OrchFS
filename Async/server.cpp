@@ -37,6 +37,28 @@ constexpr std::uint64_t kNotDirectoryCursor =
 constexpr std::uint64_t kWholeHandleRange =
     std::numeric_limits<std::uint64_t>::max();
 
+constexpr std::uint64_t opcode_bit(Opcode opcode) noexcept {
+  return std::uint64_t{1} << static_cast<unsigned>(opcode);
+}
+
+constexpr std::uint64_t kHandleRequiredOpcodes =
+    opcode_bit(Opcode::read) | opcode_bit(Opcode::write) |
+    opcode_bit(Opcode::read_at) | opcode_bit(Opcode::write_at) |
+    opcode_bit(Opcode::seek) | opcode_bit(Opcode::stat_handle) |
+    opcode_bit(Opcode::statfs) | opcode_bit(Opcode::truncate_handle) |
+    opcode_bit(Opcode::open_directory_handle) |
+    opcode_bit(Opcode::read_directory_batch) | opcode_bit(Opcode::sync) |
+    opcode_bit(Opcode::set_flags);
+
+static_assert(static_cast<unsigned>(Opcode::open_directory_handle) <
+              std::numeric_limits<std::uint64_t>::digits);
+
+constexpr bool opcode_requires_handle(Opcode opcode) noexcept {
+  const auto value = static_cast<unsigned>(opcode);
+  return value < std::numeric_limits<std::uint64_t>::digits &&
+         (kHandleRequiredOpcodes & (std::uint64_t{1} << value)) != 0;
+}
+
 struct ParsedRequest {
   RpcRequest request;
   std::string path1;
@@ -531,6 +553,10 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
         co_return completion;
       }
     }
+    if (!handle && opcode_requires_handle(incoming.descriptor.opcode)) {
+      fail(completion, EBADF);
+      co_return completion;
+    }
 
     switch (incoming.descriptor.opcode) {
       case Opcode::connect:
@@ -553,42 +579,22 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
                                     parsed.request.handle, false);
       case Opcode::read:
       case Opcode::read_at:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
         co_return co_await do_read(
             std::move(completion), parsed, handle,
             incoming.descriptor.opcode == Opcode::read);
       case Opcode::write:
       case Opcode::write_at:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
         co_return co_await do_write(
             std::move(completion), parsed, handle,
             incoming.descriptor.opcode == Opcode::write);
       case Opcode::seek:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
         co_return co_await do_seek(std::move(completion), parsed, handle);
       case Opcode::stat_path:
         co_return co_await do_stat_path(std::move(completion), parsed.path1);
       case Opcode::stat_handle:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
-        co_return co_await do_stat_handle(std::move(completion), handle);
       case Opcode::statfs:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
-        co_return co_await do_statfs(std::move(completion), handle);
+        co_return co_await do_handle_stat(
+            std::move(completion), handle, incoming.descriptor.opcode);
       case Opcode::mkdir:
       case Opcode::rmdir:
       case Opcode::unlink:
@@ -598,43 +604,23 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       case Opcode::truncate_path:
         co_return co_await do_truncate_path(std::move(completion), parsed);
       case Opcode::truncate_handle:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
         co_return co_await do_truncate_handle(std::move(completion), parsed,
                                               handle);
       case Opcode::open_directory:
         co_return co_await do_open_directory(std::move(completion),
                                              parsed.path1);
       case Opcode::open_directory_handle:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
         co_return co_await do_open_directory_handle(std::move(completion),
                                                     handle);
       case Opcode::read_directory_batch:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
         co_return co_await do_read_directory(std::move(completion), parsed,
                                              handle);
       case Opcode::close_directory:
         co_return co_await do_close(std::move(completion),
                                     parsed.request.handle, true);
       case Opcode::sync:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
         co_return co_await do_sync(std::move(completion), handle);
       case Opcode::set_flags:
-        if (!handle) {
-          fail(completion, EBADF);
-          co_return completion;
-        }
         co_return co_await do_flags(std::move(completion), parsed, handle);
       case Opcode::shutdown_session:
         co_return co_await do_shutdown(std::move(completion));
@@ -1129,8 +1115,9 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
     co_return completion;
   }
 
-  Task<Completion> do_stat_handle(
-      Completion completion, const std::shared_ptr<HandleState>& handle) {
+  Task<Completion> do_handle_stat(
+      Completion completion, const std::shared_ptr<HandleState>& handle,
+      Opcode opcode) {
     auto scheduled = co_await schedule_handle_owner(*handle);
     if (!scheduled) {
       fail(completion, error_number(scheduled.error()));
@@ -1143,40 +1130,18 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       co_return completion;
     }
     auto permit = std::move(acquired).value();
-    auto stated = co_await filesystem_->stat(handle->inode);
-    if (!stated) {
-      fail(completion, error_number(stated.error()));
+    const auto record_stat = [&](const auto& stated) {
+      if (!stated) {
+        fail(completion, error_number(stated.error()));
+      } else {
+        completion.payload = detail::encode_object(to_wire(stated.value()));
+        completion.descriptor.result_length = completion.payload.size();
+      }
+    };
+    if (opcode == Opcode::statfs) {
+      record_stat(co_await filesystem_->statfs(handle->inode));
     } else {
-      completion.payload = detail::encode_object(to_wire(stated.value()));
-      completion.descriptor.result_length = completion.payload.size();
-    }
-    auto released = co_await permit.release();
-    if (!released && completion.descriptor.status == 0) {
-      fail(completion, error_number(released.error()));
-    }
-    co_return completion;
-  }
-
-  Task<Completion> do_statfs(Completion completion,
-                             const std::shared_ptr<HandleState>& handle) {
-    auto scheduled = co_await schedule_handle_owner(*handle);
-    if (!scheduled) {
-      fail(completion, error_number(scheduled.error()));
-      co_return completion;
-    }
-    auto acquired = co_await handle->lifecycle_gate.acquire(
-        0, kWholeHandleRange, RangeMode::read);
-    if (!acquired) {
-      fail(completion, error_number(acquired.error()));
-      co_return completion;
-    }
-    auto permit = std::move(acquired).value();
-    auto stated = co_await filesystem_->statfs(handle->inode);
-    if (!stated) {
-      fail(completion, error_number(stated.error()));
-    } else {
-      completion.payload = detail::encode_object(to_wire(stated.value()));
-      completion.descriptor.result_length = completion.payload.size();
+      record_stat(co_await filesystem_->stat(handle->inode));
     }
     auto released = co_await permit.release();
     if (!released && completion.descriptor.status == 0) {
