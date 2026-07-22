@@ -77,14 +77,6 @@ class Result<void>;
 
 namespace detail {
 
-template <typename T>
-[[nodiscard, gnu::always_inline]] Result<T>
-make_result_failure(std::error_code error) noexcept;
-
-template <typename T, typename... Arguments>
-[[nodiscard, gnu::always_inline]] Result<T>
-make_result_success(Arguments&&... arguments);
-
 template <typename>
 struct IsResult : std::false_type {};
 
@@ -156,47 +148,6 @@ public:
         return value_ ? std::error_code{} : error_;
     }
 
-    template <typename Function>
-        requires detail::is_result_v<std::invoke_result_t<Function, T&>>
-    [[nodiscard, gnu::always_inline]] auto and_then(Function&& function) & {
-        return and_then_impl(*this, std::forward<Function>(function));
-    }
-
-    template <typename Function>
-        requires detail::is_result_v<
-            std::invoke_result_t<Function, const T&>>
-    [[nodiscard, gnu::always_inline]] auto and_then(
-        Function&& function) const& {
-        return and_then_impl(*this, std::forward<Function>(function));
-    }
-
-    template <typename Function>
-        requires detail::is_result_v<std::invoke_result_t<Function, T&&>>
-    [[nodiscard, gnu::always_inline]] auto and_then(Function&& function) && {
-        return and_then_impl(std::move(*this),
-                             std::forward<Function>(function));
-    }
-
-    template <typename Function>
-        requires std::invocable<Function, T&>
-    [[nodiscard, gnu::always_inline]] auto transform(Function&& function) & {
-        return transform_impl(*this, std::forward<Function>(function));
-    }
-
-    template <typename Function>
-        requires std::invocable<Function, const T&>
-    [[nodiscard, gnu::always_inline]] auto transform(
-        Function&& function) const& {
-        return transform_impl(*this, std::forward<Function>(function));
-    }
-
-    template <typename Function>
-        requires std::invocable<Function, T&&>
-    [[nodiscard, gnu::always_inline]] auto transform(Function&& function) && {
-        return transform_impl(std::move(*this),
-                              std::forward<Function>(function));
-    }
-
 private:
     struct ValueTag {};
     struct ErrorTag {};
@@ -207,40 +158,6 @@ private:
 
     explicit Result(ErrorTag, std::error_code error) noexcept
         : error_(error ? error : std::make_error_code(std::errc::io_error)) {}
-
-    template <typename Self, typename Function>
-    [[nodiscard, gnu::always_inline]] static auto and_then_impl(
-        Self&& self, Function&& function) {
-        using Argument = decltype(*std::forward<Self>(self).value_);
-        using Next = std::remove_cvref_t<
-            std::invoke_result_t<Function, Argument>>;
-        if (!self.value_) {
-            return Next::failure(self.error_);
-        }
-        return std::invoke(std::forward<Function>(function),
-                           *std::forward<Self>(self).value_);
-    }
-
-    template <typename Self, typename Function>
-    [[nodiscard, gnu::always_inline]] static auto transform_impl(
-        Self&& self, Function&& function) {
-        using Argument = decltype(*std::forward<Self>(self).value_);
-        using Transformed = std::invoke_result_t<Function, Argument>;
-        using Value = std::conditional_t<std::is_void_v<Transformed>, void,
-                                         std::remove_cvref_t<Transformed>>;
-        if (!self.value_) {
-            return detail::make_result_failure<Value>(self.error_);
-        }
-        if constexpr (std::is_void_v<Transformed>) {
-            std::invoke(std::forward<Function>(function),
-                        *std::forward<Self>(self).value_);
-            return detail::make_result_success<Value>();
-        } else {
-            return detail::make_result_success<Value>(
-                std::invoke(std::forward<Function>(function),
-                            *std::forward<Self>(self).value_));
-        }
-    }
 
     std::optional<T> value_;
     std::error_code error_;
@@ -275,39 +192,6 @@ public:
         return error_;
     }
 
-    template <typename Function>
-        requires detail::is_result_v<std::invoke_result_t<Function>>
-    [[nodiscard, gnu::always_inline]] auto and_then(
-        Function&& function) const {
-        using Next = std::remove_cvref_t<std::invoke_result_t<Function>>;
-        if (error_) {
-            return Next::failure(error_);
-        }
-        return std::invoke(std::forward<Function>(function));
-    }
-
-    template <typename Function>
-        requires std::invocable<Function>
-    [[nodiscard, gnu::always_inline]] auto transform(
-        Function&& function) const {
-        using Transformed = std::invoke_result_t<Function>;
-        if (error_) {
-            if constexpr (std::is_void_v<Transformed>) {
-                return Result<void>::failure(error_);
-            } else {
-                return Result<std::remove_cvref_t<Transformed>>::failure(
-                    error_);
-            }
-        }
-        if constexpr (std::is_void_v<Transformed>) {
-            std::invoke(std::forward<Function>(function));
-            return Result<void>::success();
-        } else {
-            return Result<std::remove_cvref_t<Transformed>>::success(
-                std::invoke(std::forward<Function>(function)));
-        }
-    }
-
 private:
     explicit Result(std::error_code error) noexcept
         : error_(error) {}
@@ -316,24 +200,6 @@ private:
 };
 
 namespace detail {
-
-template <typename T>
-[[nodiscard, gnu::always_inline]] inline Result<T>
-make_result_failure(std::error_code error) noexcept {
-    return Result<T>::failure(error);
-}
-
-template <typename T, typename... Arguments>
-[[nodiscard, gnu::always_inline]] inline Result<T>
-make_result_success(Arguments&&... arguments) {
-    if constexpr (std::is_void_v<T>) {
-        static_assert(sizeof...(Arguments) == 0);
-        return Result<void>::success();
-    } else {
-        return Result<T>::success(
-            std::forward<Arguments>(arguments)...);
-    }
-}
 
 class ResultFailure final {
 public:

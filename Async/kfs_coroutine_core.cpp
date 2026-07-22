@@ -340,7 +340,7 @@ class JournalService final {
 
   ~JournalService() {
     registration_.reset();
-    if (inbox_.load(std::memory_order_acquire) != nullptr || local_ != nullptr) {
+    if (!inbox_.empty() || local_ != nullptr) {
       std::terminate();
     }
   }
@@ -351,6 +351,17 @@ class JournalService final {
   class CommitAwaiter final {
    public:
     enum class State : std::uint8_t { submitting, suspended, completed };
+
+    struct NextLink {
+      [[nodiscard, gnu::always_inline]] static CommitAwaiter* next(
+          const CommitAwaiter& node) noexcept {
+        return node.next_;
+      }
+      [[gnu::always_inline]] static void set_next(
+          CommitAwaiter& node, CommitAwaiter* value) noexcept {
+        node.next_ = value;
+      }
+    };
 
     CommitAwaiter(JournalService& service,
                   orchfs_log_transaction* transaction) noexcept
@@ -377,11 +388,7 @@ class JournalService final {
       }
       continuation_ = continuation;
       worker_ = Runtime::current_worker();
-      auto* head = service_->inbox_.load(std::memory_order_relaxed);
-      do {
-        next_ = head;
-      } while (!service_->inbox_.compare_exchange_weak(
-          head, this, std::memory_order_release, std::memory_order_relaxed));
+      service_->inbox_.push(*this);
       if (!service_->runtime_->notify(0)) {
         std::terminate();
       }
@@ -449,13 +456,7 @@ class JournalService final {
 
   Runtime::PollState poll_once() noexcept {
     if (local_ == nullptr) {
-      auto* stack = inbox_.exchange(nullptr, std::memory_order_acquire);
-      while (stack != nullptr) {
-        auto* next = stack->next_;
-        stack->next_ = local_;
-        local_ = stack;
-        stack = next;
-      }
+      local_ = inbox_.drain();
     }
     if (local_ == nullptr) {
       return Runtime::PollState::idle;
@@ -489,7 +490,7 @@ class JournalService final {
 
   Runtime* runtime_{};
   Runtime::PollRegistration registration_;
-  std::atomic<CommitAwaiter*> inbox_{nullptr};
+  detail::MpscInbox<CommitAwaiter, CommitAwaiter::NextLink> inbox_;
   CommitAwaiter* local_{};
 };
 

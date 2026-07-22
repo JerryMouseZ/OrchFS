@@ -463,29 +463,6 @@ int main() {
     check(!failed_operation && failed_operation.error() == operation_error,
           "range release preserves failed operation");
 
-    auto transformed = Result<int>::success(6).transform(
-        [](int value) { return value * 7; });
-    check(transformed && transformed.value() == 42,
-          "Result::transform success");
-    auto transform_failure = Result<int>::failure(
-        std::make_error_code(std::errc::permission_denied)).transform(
-        [](int value) { return value * 7; });
-    check(!transform_failure &&
-              transform_failure.error() ==
-                  std::make_error_code(std::errc::permission_denied),
-          "Result::transform failure");
-    auto chained = Result<int>::success(41).and_then([](int value) {
-        return Result<int>::success(value + 1);
-    });
-    check(chained && chained.value() == 42, "Result::and_then success");
-    auto void_chained = Result<void>::success()
-                            .transform([] { return 42; })
-                            .and_then([](int value) {
-                                return Result<int>::success(value);
-                            });
-    check(void_chained && void_chained.value() == 42,
-          "Result<void> combinators");
-
     std::atomic<unsigned> unobserved_errors{0};
     RuntimeOptions options;
     options.worker_count = 4;
