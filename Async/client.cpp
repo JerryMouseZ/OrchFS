@@ -94,6 +94,16 @@ std::error_code status_error(std::int32_t status) noexcept {
   return {static_cast<int>(magnitude), std::generic_category()};
 }
 
+std::error_code positioned_range_error(std::uint64_t offset,
+                                       std::size_t length) noexcept {
+  constexpr auto max_offset =
+      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+  if (offset > max_offset || length > max_offset - offset) {
+    return std::make_error_code(std::errc::value_too_large);
+  }
+  return {};
+}
+
 template <typename T>
 Result<T> decode_object(const RpcReply& reply) {
   if (auto error = status_error(reply.descriptor.status)) {
@@ -410,11 +420,11 @@ class Session final : public std::enable_shared_from_this<Session> {
   }
 
   Task<Result<RpcReply>> rpc_header(
-      Opcode opcode, RpcRequest request, std::size_t data_size = 0,
+      Opcode opcode, RpcRequest request,
       std::span<const std::byte> request_tail = {},
       std::span<std::byte> response_target = {}) {
-    auto created = make_header_pending(opcode, request, data_size, request_tail,
-                                       response_target);
+    auto created =
+        make_header_pending(opcode, request, request_tail, response_target);
     if (!created) {
       co_return Result<RpcReply>::failure(created.error());
     }
@@ -423,16 +433,15 @@ class Session final : public std::enable_shared_from_this<Session> {
   }
 
   Result<ReceivedIpcSlot> rpc_header_blocking(
-      Opcode opcode, RpcRequest request, std::size_t data_size = 0,
+      Opcode opcode, RpcRequest request,
       std::span<const std::byte> request_tail = {}) {
-    if (Runtime::current() != nullptr) {
+    if (auto* current_runtime = Runtime::current(); current_runtime != nullptr) {
       return Result<ReceivedIpcSlot>::failure(
-          Runtime::current() == runtime_ ? Errc::join_from_worker
-                                         : Errc::wrong_runtime);
+          current_runtime == runtime_ ? Errc::join_from_worker
+                                      : Errc::wrong_runtime);
     }
 
-    auto created =
-        make_header_pending(opcode, request, data_size, request_tail, {});
+    auto created = make_header_pending(opcode, request, request_tail, {});
     if (!created) {
       return Result<ReceivedIpcSlot>::failure(created.error());
     }
@@ -501,13 +510,12 @@ class Session final : public std::enable_shared_from_this<Session> {
 
  private:
   Result<std::shared_ptr<Pending>> make_header_pending(
-      Opcode opcode, RpcRequest request, std::size_t data_size,
+      Opcode opcode, RpcRequest request,
       std::span<const std::byte> request_tail,
       std::span<std::byte> response_target) {
+    const std::size_t data_size = request_tail.size();
     if (sizeof(RpcRequest) > config_.data_slot_size ||
-        data_size != request_tail.size() ||
-        data_size > config_.data_slot_size - sizeof(RpcRequest) ||
-        data_size > std::numeric_limits<std::uint32_t>::max()) {
+        data_size > config_.data_slot_size - sizeof(RpcRequest)) {
       return Result<std::shared_ptr<Pending>>::failure(
           std::make_error_code(std::errc::message_size));
     }
@@ -1391,7 +1399,7 @@ Task<Result<std::size_t>> File::read_unlocked(std::span<std::byte> buffer) {
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::implicit_offset);
     auto reply = co_await session_->rpc_header(
-        Opcode::read, request, 0, {}, buffer.subspan(completed, chunk));
+        Opcode::read, request, {}, buffer.subspan(completed, chunk));
     if (!reply) {
       co_return Result<std::size_t>::failure(reply.error());
     }
@@ -1444,7 +1452,7 @@ Task<Result<std::size_t>> File::write_unlocked(
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::implicit_offset) |
                     static_cast<std::uint32_t>(RpcRequestFlag::data_follows);
     auto reply = co_await session_->rpc_header(
-        Opcode::write, request, chunk, buffer.subspan(completed, chunk));
+        Opcode::write, request, buffer.subspan(completed, chunk));
     if (!reply) {
       co_return Result<std::size_t>::failure(reply.error());
     }
@@ -1469,11 +1477,8 @@ Task<Result<std::size_t>> File::read_at(std::uint64_t offset,
   if (!valid()) {
     co_return Result<std::size_t>::failure(Errc::invalid_handle);
   }
-  if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
-      buffer.size() > static_cast<std::uint64_t>(
-                          std::numeric_limits<std::int64_t>::max()) - offset) {
-    co_return Result<std::size_t>::failure(
-        std::make_error_code(std::errc::value_too_large));
+  if (const auto error = positioned_range_error(offset, buffer.size())) {
+    co_return Result<std::size_t>::failure(error);
   }
   std::size_t completed = 0;
   const std::size_t max_chunk = session_->max_payload() - sizeof(RpcRequest);
@@ -1484,7 +1489,7 @@ Task<Result<std::size_t>> File::read_at(std::uint64_t offset,
     request.offset = static_cast<std::int64_t>(offset + completed);
     request.length = chunk;
     auto reply = co_await session_->rpc_header(
-        Opcode::read_at, request, 0, {}, buffer.subspan(completed, chunk));
+        Opcode::read_at, request, {}, buffer.subspan(completed, chunk));
     if (!reply) {
       co_return Result<std::size_t>::failure(reply.error());
     }
@@ -1513,13 +1518,8 @@ Result<std::size_t> File::read_at_blocking(
   if (!valid()) {
     return Result<std::size_t>::failure(Errc::invalid_handle);
   }
-  if (offset >
-          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
-      buffer.size() >
-          static_cast<std::uint64_t>(
-              std::numeric_limits<std::int64_t>::max()) - offset) {
-    return Result<std::size_t>::failure(
-        std::make_error_code(std::errc::value_too_large));
+  if (const auto error = positioned_range_error(offset, buffer.size())) {
+    return Result<std::size_t>::failure(error);
   }
 
   std::size_t completed = 0;
@@ -1536,7 +1536,7 @@ Result<std::size_t> File::read_at_blocking(
       return Result<std::size_t>::failure(received.error());
     }
     auto completion = std::move(received).value();
-    const auto descriptor = completion.descriptor();
+    const auto& descriptor = completion.descriptor();
     const auto payload = completion.payload();
     if (auto error = status_error(descriptor.status)) {
       return Result<std::size_t>::failure(error);
@@ -1562,11 +1562,8 @@ Task<Result<std::size_t>> File::write_at(
   if (!valid()) {
     co_return Result<std::size_t>::failure(Errc::invalid_handle);
   }
-  if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
-      buffer.size() > static_cast<std::uint64_t>(
-                          std::numeric_limits<std::int64_t>::max()) - offset) {
-    co_return Result<std::size_t>::failure(
-        std::make_error_code(std::errc::value_too_large));
+  if (const auto error = positioned_range_error(offset, buffer.size())) {
+    co_return Result<std::size_t>::failure(error);
   }
   std::size_t completed = 0;
   const std::size_t max_chunk = session_->max_payload() - sizeof(RpcRequest);
@@ -1578,7 +1575,7 @@ Task<Result<std::size_t>> File::write_at(
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::data_follows);
     auto reply = co_await session_->rpc_header(
-        Opcode::write_at, request, chunk, buffer.subspan(completed, chunk));
+        Opcode::write_at, request, buffer.subspan(completed, chunk));
     if (!reply) {
       co_return Result<std::size_t>::failure(reply.error());
     }
@@ -1603,13 +1600,8 @@ Result<std::size_t> File::write_at_blocking(
   if (!valid()) {
     return Result<std::size_t>::failure(Errc::invalid_handle);
   }
-  if (offset >
-          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
-      buffer.size() >
-          static_cast<std::uint64_t>(
-              std::numeric_limits<std::int64_t>::max()) - offset) {
-    return Result<std::size_t>::failure(
-        std::make_error_code(std::errc::value_too_large));
+  if (const auto error = positioned_range_error(offset, buffer.size())) {
+    return Result<std::size_t>::failure(error);
   }
 
   std::size_t completed = 0;
@@ -1622,12 +1614,12 @@ Result<std::size_t> File::write_at_blocking(
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::data_follows);
     auto received = session_->rpc_header_blocking(
-        Opcode::write_at, request, chunk, buffer.subspan(completed, chunk));
+        Opcode::write_at, request, buffer.subspan(completed, chunk));
     if (!received) {
       return Result<std::size_t>::failure(received.error());
     }
     auto completion = std::move(received).value();
-    const auto descriptor = completion.descriptor();
+    const auto& descriptor = completion.descriptor();
     if (auto error = status_error(descriptor.status)) {
       return Result<std::size_t>::failure(error);
     }
