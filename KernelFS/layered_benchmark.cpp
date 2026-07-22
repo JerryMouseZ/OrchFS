@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -150,11 +151,24 @@ orchfs::async::Result<T> run_one(
   return std::move(joined).value();
 }
 
+template <typename>
+struct PhaseTaskTraits;
+
+template <typename T>
+struct PhaseTaskTraits<
+    orchfs::async::Task<orchfs::async::Result<T>>> {
+  using RootResult = orchfs::async::Result<T>;
+  using Value = T;
+};
+
 template <typename MakeTask>
 orchfs::async::Result<BenchmarkSample> run_phase(
     orchfs::async::Runtime& runtime, std::size_t coroutine_count,
     MakeTask make_task) {
-  using RootResult = orchfs::async::Result<std::uint64_t>;
+  using Traits = PhaseTaskTraits<std::remove_cvref_t<
+      std::invoke_result_t<MakeTask&, std::size_t>>>;
+  using RootResult = typename Traits::RootResult;
+  using Value = typename Traits::Value;
   std::vector<orchfs::async::JoinHandle<RootResult>> handles;
   try {
     handles.reserve(coroutine_count);
@@ -190,7 +204,9 @@ orchfs::async::Result<BenchmarkSample> run_phase(
       }
       continue;
     }
-    bytes += result.value();
+    if constexpr (!std::is_void_v<Value>) {
+      bytes += result.value();
+    }
   }
   if (first_error) {
     return orchfs::async::Result<BenchmarkSample>::failure(first_error);
@@ -199,50 +215,6 @@ orchfs::async::Result<BenchmarkSample> run_phase(
       .bytes = bytes,
       .elapsed = std::chrono::steady_clock::now() - started,
   });
-}
-
-template <typename MakeTask>
-orchfs::async::Result<std::chrono::duration<double>> run_void_phase(
-    orchfs::async::Runtime& runtime, std::size_t task_count,
-    MakeTask make_task) {
-  using RootResult = orchfs::async::Result<void>;
-  std::vector<orchfs::async::JoinHandle<RootResult>> handles;
-  try {
-    handles.reserve(task_count);
-  } catch (const std::bad_alloc&) {
-    return orchfs::async::Result<std::chrono::duration<double>>::failure(
-        std::make_error_code(std::errc::not_enough_memory));
-  }
-
-  std::error_code first_error;
-  const auto started = std::chrono::steady_clock::now();
-  for (std::size_t index = 0; index < task_count; ++index) {
-    auto submitted = runtime.submit(make_task(index));
-    if (!submitted) {
-      first_error = submitted.error();
-      break;
-    }
-    handles.push_back(std::move(submitted).value());
-  }
-  for (auto& handle : handles) {
-    auto joined = std::move(handle).join();
-    if (!joined) {
-      if (!first_error) {
-        first_error = joined.error();
-      }
-      continue;
-    }
-    auto result = std::move(joined).value();
-    if (!result && !first_error) {
-      first_error = result.error();
-    }
-  }
-  if (first_error) {
-    return orchfs::async::Result<std::chrono::duration<double>>::failure(
-        first_error);
-  }
-  return orchfs::async::Result<std::chrono::duration<double>>::success(
-      std::chrono::steady_clock::now() - started);
 }
 
 void print_sample(std::string_view layer, std::string_view phase,
@@ -589,7 +561,7 @@ int benchmark_core(
   if (!populated) {
     return error_number(populated.error());
   }
-  auto initial_sync = run_void_phase(
+  auto initial_sync = run_phase(
       runtime, kStreamCount, [&](std::size_t stream) {
         return core->sync(nodes[stream].inode);
       });
@@ -605,14 +577,14 @@ int benchmark_core(
   if (!write) {
     return error_number(write.error());
   }
-  auto synced = run_void_phase(
+  auto synced = run_phase(
       runtime, kStreamCount, [&](std::size_t stream) {
         return core->sync(nodes[stream].inode);
       });
   if (!synced) {
     return error_number(synced.error());
   }
-  write.value().elapsed += synced.value();
+  write.value().elapsed += synced.value().elapsed;
 
   auto warm_read = run_phase(
       runtime, config.coroutine_count, [&](std::size_t coroutine) {
