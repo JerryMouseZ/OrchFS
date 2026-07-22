@@ -1086,16 +1086,10 @@ Task<Result<Client>> Client::connect(Runtime& runtime,
       .ring_capacity = static_cast<std::uint32_t>(options.ring_capacity),
       .data_slot_size = static_cast<std::uint32_t>(options.data_slot_size),
   };
-  auto connected =
-      co_await ConnectAwaiter(runtime, std::move(options.endpoint), config);
-  if (!connected) {
-    co_return Result<Client>::failure(connected.error());
-  }
-  auto session = Session::create(runtime, std::move(connected).value());
-  if (!session) {
-    co_return Result<Client>::failure(session.error());
-  }
-  co_return Result<Client>::success(Client(std::move(session).value()));
+  ORCHFS_TRY(transport, co_await ConnectAwaiter(
+      runtime, std::move(options.endpoint), config));
+  ORCHFS_TRY(session, Session::create(runtime, std::move(transport)));
+  co_return Result<Client>::success(Client(std::move(session)));
 }
 
 Task<Result<File>> Client::open(std::string path, int flags,
@@ -1106,15 +1100,12 @@ Task<Result<File>> Client::open(std::string path, int flags,
   RpcRequest request;
   request.open_flags = flags;
   request.mode = mode;
-  auto reply = co_await session_->rpc(
-      Opcode::open, make_request(session_->max_payload(), request, path));
-  if (!reply) {
-    co_return Result<File>::failure(reply.error());
-  }
-  if (auto error = status_error(reply.value().descriptor.status)) {
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::open, make_request(session_->max_payload(), request, path)));
+  if (auto error = status_error(reply.descriptor.status)) {
     co_return Result<File>::failure(error);
   }
-  const RemoteHandle handle = reply.value().descriptor.result_length;
+  const RemoteHandle handle = reply.descriptor.result_length;
   if (handle == kInvalidRemoteHandle) {
     co_return Result<File>::failure(std::make_error_code(std::errc::io_error));
   }
@@ -1132,15 +1123,12 @@ Task<Result<File>> Client::open_at(const Directory& directory,
   request.handle = directory.handle_;
   request.open_flags = flags;
   request.mode = mode;
-  auto reply = co_await session_->rpc(
-      Opcode::open_at, make_request(session_->max_payload(), request, path));
-  if (!reply) {
-    co_return Result<File>::failure(reply.error());
-  }
-  if (auto error = status_error(reply.value().descriptor.status)) {
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::open_at, make_request(session_->max_payload(), request, path)));
+  if (auto error = status_error(reply.descriptor.status)) {
     co_return Result<File>::failure(error);
   }
-  const RemoteHandle handle = reply.value().descriptor.result_length;
+  const RemoteHandle handle = reply.descriptor.result_length;
   if (handle == kInvalidRemoteHandle) {
     co_return Result<File>::failure(std::make_error_code(std::errc::protocol_error));
   }
@@ -1153,16 +1141,13 @@ Task<Result<Directory>> Client::open_directory(std::string path) {
     co_return Result<Directory>::failure(Errc::invalid_handle);
   }
   RpcRequest request;
-  auto reply = co_await session_->rpc(
+  ORCHFS_TRY(reply, co_await session_->rpc(
       Opcode::open_directory,
-      make_request(session_->max_payload(), request, path));
-  if (!reply) {
-    co_return Result<Directory>::failure(reply.error());
-  }
-  if (auto error = status_error(reply.value().descriptor.status)) {
+      make_request(session_->max_payload(), request, path)));
+  if (auto error = status_error(reply.descriptor.status)) {
     co_return Result<Directory>::failure(error);
   }
-  const RemoteHandle handle = reply.value().descriptor.result_length;
+  const RemoteHandle handle = reply.descriptor.result_length;
   if (handle == kInvalidRemoteHandle) {
     co_return Result<Directory>::failure(
         std::make_error_code(std::errc::protocol_error));
@@ -1177,16 +1162,13 @@ Task<Result<Directory>> Client::open_directory(const File& file) {
   }
   RpcRequest request;
   request.handle = file.handle_;
-  auto reply = co_await session_->rpc(
+  ORCHFS_TRY(reply, co_await session_->rpc(
       Opcode::open_directory_handle,
-      make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<Directory>::failure(reply.error());
-  }
-  if (auto error = status_error(reply.value().descriptor.status)) {
+      make_request(session_->max_payload(), request)));
+  if (auto error = status_error(reply.descriptor.status)) {
     co_return Result<Directory>::failure(error);
   }
-  const RemoteHandle handle = reply.value().descriptor.result_length;
+  const RemoteHandle handle = reply.descriptor.result_length;
   if (handle == kInvalidRemoteHandle) {
     co_return Result<Directory>::failure(
         std::make_error_code(std::errc::protocol_error));
@@ -1200,17 +1182,11 @@ Task<Result<FileStat>> Client::stat(std::string path) {
     co_return Result<FileStat>::failure(Errc::invalid_handle);
   }
   RpcRequest request;
-  auto reply = co_await session_->rpc(
+  ORCHFS_TRY(reply, co_await session_->rpc(
       Opcode::stat_path,
-      make_request(session_->max_payload(), request, path));
-  if (!reply) {
-    co_return Result<FileStat>::failure(reply.error());
-  }
-  auto decoded = decode_reply<RpcFileStat>(reply.value());
-  if (!decoded) {
-    co_return Result<FileStat>::failure(decoded.error());
-  }
-  co_return Result<FileStat>::success(from_wire(decoded.value()));
+      make_request(session_->max_payload(), request, path)));
+  ORCHFS_TRY(decoded, decode_reply<RpcFileStat>(reply));
+  co_return Result<FileStat>::success(from_wire(decoded));
 }
 
 Task<Result<void>> Client::path_mutation(Opcode opcode, RpcRequest request,
@@ -1219,12 +1195,9 @@ Task<Result<void>> Client::path_mutation(Opcode opcode, RpcRequest request,
   if (!session_) {
     co_return Result<void>::failure(Errc::invalid_handle);
   }
-  auto reply = co_await session_->rpc(
-      opcode, make_request(session_->max_payload(), request, path1, path2));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      opcode, make_request(session_->max_payload(), request, path1, path2)));
+  const auto error = status_error(reply.descriptor.status);
   co_return error ? Result<void>::failure(error) : Result<void>::success();
 }
 
@@ -1265,13 +1238,10 @@ Task<Result<void>> Client::shutdown() {
   }
   RpcRequest request;
   auto session = session_;
-  auto reply = co_await session->rpc(
+  ORCHFS_TRY(reply, co_await session->rpc(
       Opcode::shutdown_session,
-      make_request(session->max_payload(), request), true);
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
+      make_request(session->max_payload(), request), true));
+  const auto error = status_error(reply.descriptor.status);
   session_.reset();
   co_return error ? Result<void>::failure(error) : Result<void>::success();
 }
@@ -1310,16 +1280,10 @@ Task<Result<std::size_t>> File::read(std::span<std::byte> buffer) {
   if (!valid()) {
     co_return Result<std::size_t>::failure(Errc::invalid_handle);
   }
-  auto acquired = co_await offset_gate_.acquire(0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<std::size_t>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRY(permit,
+             co_await offset_gate_.acquire(0, 1, RangeMode::write));
   auto result = co_await read_unlocked(buffer);
-  auto released = co_await permit.release();
-  if (!released) {
-    co_return Result<std::size_t>::failure(released.error());
-  }
+  ORCHFS_TRYV(co_await permit.release());
   co_return result;
 }
 
@@ -1332,21 +1296,18 @@ Task<Result<std::size_t>> File::read_unlocked(std::span<std::byte> buffer) {
     request.handle = handle_;
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::implicit_offset);
-    auto reply = co_await session_->rpc_header(
-        Opcode::read, request, {}, buffer.subspan(completed, chunk));
-    if (!reply) {
-      co_return Result<std::size_t>::failure(reply.error());
-    }
-    if (auto error = status_error(reply.value().descriptor.status)) {
+    ORCHFS_TRY(reply, co_await session_->rpc_header(
+        Opcode::read, request, {}, buffer.subspan(completed, chunk)));
+    if (auto error = status_error(reply.descriptor.status)) {
       co_return Result<std::size_t>::failure(error);
     }
-    const std::size_t bytes = reply.value().descriptor.result_length;
-    if (bytes > chunk || reply.value().payload_size != bytes) {
+    const std::size_t bytes = reply.descriptor.result_length;
+    if (bytes > chunk || reply.payload_size != bytes) {
       co_return Result<std::size_t>::failure(
           std::make_error_code(std::errc::protocol_error));
     }
-    if (!reply.value().payload.empty()) {
-      std::memcpy(buffer.data() + completed, reply.value().payload.data(),
+    if (!reply.payload.empty()) {
+      std::memcpy(buffer.data() + completed, reply.payload.data(),
                   bytes);
     }
     completed += bytes;
@@ -1361,16 +1322,10 @@ Task<Result<std::size_t>> File::write(std::span<const std::byte> buffer) {
   if (!valid()) {
     co_return Result<std::size_t>::failure(Errc::invalid_handle);
   }
-  auto acquired = co_await offset_gate_.acquire(0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<std::size_t>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRY(permit,
+             co_await offset_gate_.acquire(0, 1, RangeMode::write));
   auto result = co_await write_unlocked(buffer);
-  auto released = co_await permit.release();
-  if (!released) {
-    co_return Result<std::size_t>::failure(released.error());
-  }
+  ORCHFS_TRYV(co_await permit.release());
   co_return result;
 }
 
@@ -1385,15 +1340,12 @@ Task<Result<std::size_t>> File::write_unlocked(
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::implicit_offset) |
                     static_cast<std::uint32_t>(RpcRequestFlag::data_follows);
-    auto reply = co_await session_->rpc_header(
-        Opcode::write, request, buffer.subspan(completed, chunk));
-    if (!reply) {
-      co_return Result<std::size_t>::failure(reply.error());
-    }
-    if (auto error = status_error(reply.value().descriptor.status)) {
+    ORCHFS_TRY(reply, co_await session_->rpc_header(
+        Opcode::write, request, buffer.subspan(completed, chunk)));
+    if (auto error = status_error(reply.descriptor.status)) {
       co_return Result<std::size_t>::failure(error);
     }
-    const std::size_t bytes = reply.value().descriptor.result_length;
+    const std::size_t bytes = reply.descriptor.result_length;
     if (bytes > chunk) {
       co_return Result<std::size_t>::failure(
           std::make_error_code(std::errc::protocol_error));
@@ -1422,21 +1374,18 @@ Task<Result<std::size_t>> File::read_at(std::uint64_t offset,
     request.handle = handle_;
     request.offset = static_cast<std::int64_t>(offset + completed);
     request.length = chunk;
-    auto reply = co_await session_->rpc_header(
-        Opcode::read_at, request, {}, buffer.subspan(completed, chunk));
-    if (!reply) {
-      co_return Result<std::size_t>::failure(reply.error());
-    }
-    if (auto error = status_error(reply.value().descriptor.status)) {
+    ORCHFS_TRY(reply, co_await session_->rpc_header(
+        Opcode::read_at, request, {}, buffer.subspan(completed, chunk)));
+    if (auto error = status_error(reply.descriptor.status)) {
       co_return Result<std::size_t>::failure(error);
     }
-    const std::size_t bytes = reply.value().descriptor.result_length;
-    if (bytes > chunk || reply.value().payload_size != bytes) {
+    const std::size_t bytes = reply.descriptor.result_length;
+    if (bytes > chunk || reply.payload_size != bytes) {
       co_return Result<std::size_t>::failure(
           std::make_error_code(std::errc::protocol_error));
     }
-    if (!reply.value().payload.empty()) {
-      std::memcpy(buffer.data() + completed, reply.value().payload.data(),
+    if (!reply.payload.empty()) {
+      std::memcpy(buffer.data() + completed, reply.payload.data(),
                   bytes);
     }
     completed += bytes;
@@ -1508,15 +1457,12 @@ Task<Result<std::size_t>> File::write_at(
     request.offset = static_cast<std::int64_t>(offset + completed);
     request.length = chunk;
     request.flags = static_cast<std::uint32_t>(RpcRequestFlag::data_follows);
-    auto reply = co_await session_->rpc_header(
-        Opcode::write_at, request, buffer.subspan(completed, chunk));
-    if (!reply) {
-      co_return Result<std::size_t>::failure(reply.error());
-    }
-    if (auto error = status_error(reply.value().descriptor.status)) {
+    ORCHFS_TRY(reply, co_await session_->rpc_header(
+        Opcode::write_at, request, buffer.subspan(completed, chunk)));
+    if (auto error = status_error(reply.descriptor.status)) {
       co_return Result<std::size_t>::failure(error);
     }
-    const std::size_t bytes = reply.value().descriptor.result_length;
+    const std::size_t bytes = reply.descriptor.result_length;
     if (bytes > chunk) {
       co_return Result<std::size_t>::failure(
           std::make_error_code(std::errc::protocol_error));
@@ -1574,16 +1520,10 @@ Task<Result<std::uint64_t>> File::seek(std::int64_t offset, int whence) {
   if (!valid()) {
     co_return Result<std::uint64_t>::failure(Errc::invalid_handle);
   }
-  auto acquired = co_await offset_gate_.acquire(0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<std::uint64_t>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRY(permit,
+             co_await offset_gate_.acquire(0, 1, RangeMode::write));
   auto result = co_await seek_unlocked(offset, whence);
-  auto released = co_await permit.release();
-  if (!released) {
-    co_return Result<std::uint64_t>::failure(released.error());
-  }
+  ORCHFS_TRYV(co_await permit.release());
   co_return result;
 }
 
@@ -1593,15 +1533,12 @@ Task<Result<std::uint64_t>> File::seek_unlocked(std::int64_t offset,
   request.handle = handle_;
   request.offset = offset;
   request.whence = whence;
-  auto reply = co_await session_->rpc(
-      Opcode::seek, make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<std::uint64_t>::failure(reply.error());
-  }
-  if (auto error = status_error(reply.value().descriptor.status)) {
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::seek, make_request(session_->max_payload(), request)));
+  if (auto error = status_error(reply.descriptor.status)) {
     co_return Result<std::uint64_t>::failure(error);
   }
-  co_return Result<std::uint64_t>::success(reply.value().descriptor.result_length);
+  co_return Result<std::uint64_t>::success(reply.descriptor.result_length);
 }
 
 Task<Result<FileStat>> File::stat() {
@@ -1610,16 +1547,10 @@ Task<Result<FileStat>> File::stat() {
   }
   RpcRequest request;
   request.handle = handle_;
-  auto reply = co_await session_->rpc(
-      Opcode::stat_handle, make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<FileStat>::failure(reply.error());
-  }
-  auto decoded = decode_reply<RpcFileStat>(reply.value());
-  if (!decoded) {
-    co_return Result<FileStat>::failure(decoded.error());
-  }
-  co_return Result<FileStat>::success(from_wire(decoded.value()));
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::stat_handle, make_request(session_->max_payload(), request)));
+  ORCHFS_TRY(decoded, decode_reply<RpcFileStat>(reply));
+  co_return Result<FileStat>::success(from_wire(decoded));
 }
 
 Task<Result<FileSystemStat>> File::statfs() {
@@ -1628,16 +1559,10 @@ Task<Result<FileSystemStat>> File::statfs() {
   }
   RpcRequest request;
   request.handle = handle_;
-  auto reply = co_await session_->rpc(
-      Opcode::statfs, make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<FileSystemStat>::failure(reply.error());
-  }
-  auto decoded = decode_reply<RpcStatFs>(reply.value());
-  if (!decoded) {
-    co_return Result<FileSystemStat>::failure(decoded.error());
-  }
-  co_return Result<FileSystemStat>::success(from_wire(decoded.value()));
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::statfs, make_request(session_->max_payload(), request)));
+  ORCHFS_TRY(decoded, decode_reply<RpcStatFs>(reply));
+  co_return Result<FileSystemStat>::success(from_wire(decoded));
 }
 
 Task<Result<void>> File::truncate(std::uint64_t size) {
@@ -1647,13 +1572,10 @@ Task<Result<void>> File::truncate(std::uint64_t size) {
   RpcRequest request;
   request.handle = handle_;
   request.length = size;
-  auto reply = co_await session_->rpc(
+  ORCHFS_TRY(reply, co_await session_->rpc(
       Opcode::truncate_handle,
-      make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
+      make_request(session_->max_payload(), request)));
+  const auto error = status_error(reply.descriptor.status);
   co_return error ? Result<void>::failure(error) : Result<void>::success();
 }
 
@@ -1663,12 +1585,9 @@ Task<Result<void>> File::sync() {
   }
   RpcRequest request;
   request.handle = handle_;
-  auto reply = co_await session_->rpc(
-      Opcode::sync, make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::sync, make_request(session_->max_payload(), request)));
+  const auto error = status_error(reply.descriptor.status);
   co_return error ? Result<void>::failure(error) : Result<void>::success();
 }
 
@@ -1679,16 +1598,13 @@ Task<Result<int>> File::get_flags() {
   RpcRequest request;
   request.handle = handle_;
   request.value = F_GETFL;
-  auto reply = co_await session_->rpc(
-      Opcode::set_flags, make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<int>::failure(reply.error());
-  }
-  if (auto error = status_error(reply.value().descriptor.status)) {
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::set_flags, make_request(session_->max_payload(), request)));
+  if (auto error = status_error(reply.descriptor.status)) {
     co_return Result<int>::failure(error);
   }
   co_return Result<int>::success(
-      static_cast<int>(reply.value().descriptor.result_length));
+      static_cast<int>(reply.descriptor.result_length));
 }
 
 Task<Result<void>> File::set_flags(int flags) {
@@ -1699,12 +1615,9 @@ Task<Result<void>> File::set_flags(int flags) {
   request.handle = handle_;
   request.value = F_SETFL;
   request.open_flags = flags;
-  auto reply = co_await session_->rpc(
-      Opcode::set_flags, make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::set_flags, make_request(session_->max_payload(), request)));
+  const auto error = status_error(reply.descriptor.status);
   co_return error ? Result<void>::failure(error) : Result<void>::success();
 }
 
@@ -1714,12 +1627,9 @@ Task<Result<void>> File::close() {
   }
   RpcRequest request;
   request.handle = handle_;
-  auto reply = co_await session_->rpc(
-      Opcode::close, make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
+  ORCHFS_TRY(reply, co_await session_->rpc(
+      Opcode::close, make_request(session_->max_payload(), request)));
+  const auto error = status_error(reply.descriptor.status);
   if (error) {
     co_return Result<void>::failure(error);
   }
@@ -1770,25 +1680,22 @@ Task<Result<std::size_t>> Directory::next_batch(
   RpcRequest request;
   request.handle = handle_;
   request.length = requested;
-  auto reply = co_await session_->rpc(
+  ORCHFS_TRY(reply, co_await session_->rpc(
       Opcode::read_directory_batch,
-      make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<std::size_t>::failure(reply.error());
-  }
-  if (auto error = status_error(reply.value().descriptor.status)) {
+      make_request(session_->max_payload(), request)));
+  if (auto error = status_error(reply.descriptor.status)) {
     co_return Result<std::size_t>::failure(error);
   }
-  const std::size_t count = reply.value().descriptor.result_length;
+  const std::size_t count = reply.descriptor.result_length;
   if (count > requested ||
-      reply.value().payload.size() != count * sizeof(RpcDirEntry)) {
+      reply.payload.size() != count * sizeof(RpcDirEntry)) {
     co_return Result<std::size_t>::failure(
         std::make_error_code(std::errc::protocol_error));
   }
   for (std::size_t i = 0; i < count; ++i) {
     RpcDirEntry wire{};
     std::memcpy(&wire,
-                reply.value().payload.data() + i * sizeof(RpcDirEntry),
+                reply.payload.data() + i * sizeof(RpcDirEntry),
                 sizeof(wire));
     if (wire.name_length >= wire.name.size()) {
       co_return Result<std::size_t>::failure(
@@ -1810,13 +1717,10 @@ Task<Result<void>> Directory::close() {
   }
   RpcRequest request;
   request.handle = handle_;
-  auto reply = co_await session_->rpc(
+  ORCHFS_TRY(reply, co_await session_->rpc(
       Opcode::close_directory,
-      make_request(session_->max_payload(), request));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
+      make_request(session_->max_payload(), request)));
+  const auto error = status_error(reply.descriptor.status);
   if (error) {
     co_return Result<void>::failure(error);
   }

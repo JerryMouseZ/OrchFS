@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
@@ -132,6 +133,21 @@ void wait_until(Predicate&& predicate, std::string_view message) {
 
 Task<int> answer_task() {
     co_return 42;
+}
+
+Task<Result<int>> try_value_task(Result<int> input) {
+    ORCHFS_TRY(value, std::move(input));
+    co_return Result<int>::success(value + 1);
+}
+
+Task<Result<std::string>> try_cross_type_task(Result<int> input) {
+    ORCHFS_TRY(value, std::move(input));
+    co_return Result<std::string>::success(std::to_string(value));
+}
+
+Task<Result<int>> try_void_task(Result<void> input) {
+    ORCHFS_TRYV(input);
+    co_return Result<int>::success(7);
 }
 
 Task<Result<std::size_t>> owner_task(Runtime& runtime, std::size_t owner) {
@@ -430,6 +446,29 @@ int main() {
 
     test_mpsc_inbox();
 
+    auto transformed = Result<int>::success(6).transform(
+        [](int value) { return value * 7; });
+    check(transformed && transformed.value() == 42,
+          "Result::transform success");
+    auto transform_failure = Result<int>::failure(
+        std::make_error_code(std::errc::permission_denied)).transform(
+        [](int value) { return value * 7; });
+    check(!transform_failure &&
+              transform_failure.error() ==
+                  std::make_error_code(std::errc::permission_denied),
+          "Result::transform failure");
+    auto chained = Result<int>::success(41).and_then([](int value) {
+        return Result<int>::success(value + 1);
+    });
+    check(chained && chained.value() == 42, "Result::and_then success");
+    auto void_chained = Result<void>::success()
+                            .transform([] { return 42; })
+                            .and_then([](int value) {
+                                return Result<int>::success(value);
+                            });
+    check(void_chained && void_chained.value() == 42,
+          "Result<void> combinators");
+
     std::atomic<unsigned> unobserved_errors{0};
     RuntimeOptions options;
     options.worker_count = 4;
@@ -444,6 +483,23 @@ int main() {
     check(static_cast<bool>(created), "runtime create");
     auto runtime = std::move(created).value();
     check(runtime->worker_count() == 4, "worker count");
+
+    auto try_value = runtime->block_on(
+        try_value_task(Result<int>::success(41)));
+    check(try_value && try_value.value() &&
+              try_value.value().value() == 42,
+          "ORCHFS_TRY success");
+    const auto denied = std::make_error_code(std::errc::permission_denied);
+    auto try_failure = runtime->block_on(
+        try_cross_type_task(Result<int>::failure(denied)));
+    check(try_failure && !try_failure.value() &&
+              try_failure.value().error() == denied,
+          "ORCHFS_TRY cross-type failure");
+    auto try_void_failure = runtime->block_on(
+        try_void_task(Result<void>::failure(denied)));
+    check(try_void_failure && !try_void_failure.value() &&
+              try_void_failure.value().error() == denied,
+          "ORCHFS_TRYV failure");
     for (std::size_t worker = 0; worker < runtime->worker_count(); ++worker) {
         auto cpu = runtime->worker_cpu(worker);
         check(static_cast<bool>(cpu), "worker CPU lookup");

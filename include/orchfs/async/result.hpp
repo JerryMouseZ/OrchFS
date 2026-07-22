@@ -2,6 +2,7 @@
 
 #include <concepts>
 #include <exception>
+#include <functional>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -69,10 +70,40 @@ public:
 }
 
 template <typename T>
+class Result;
+
+template <>
+class Result<void>;
+
+namespace detail {
+
+template <typename T>
+[[nodiscard, gnu::always_inline]] Result<T>
+make_result_failure(std::error_code error) noexcept;
+
+template <typename T, typename... Arguments>
+[[nodiscard, gnu::always_inline]] Result<T>
+make_result_success(Arguments&&... arguments);
+
+template <typename>
+struct IsResult : std::false_type {};
+
+template <typename T>
+struct IsResult<Result<T>> : std::true_type {};
+
+template <typename T>
+inline constexpr bool is_result_v =
+    IsResult<std::remove_cvref_t<T>>::value;
+
+} // namespace detail
+
+template <typename T>
 class [[nodiscard]] Result {
     static_assert(!std::is_reference_v<T>);
 
 public:
+    using value_type = T;
+
     Result(const Result&) = default;
     Result(Result&&) noexcept(std::is_nothrow_move_constructible_v<T>) = default;
     Result& operator=(const Result&) = default;
@@ -125,6 +156,47 @@ public:
         return value_ ? std::error_code{} : error_;
     }
 
+    template <typename Function>
+        requires detail::is_result_v<std::invoke_result_t<Function, T&>>
+    [[nodiscard, gnu::always_inline]] auto and_then(Function&& function) & {
+        return and_then_impl(*this, std::forward<Function>(function));
+    }
+
+    template <typename Function>
+        requires detail::is_result_v<
+            std::invoke_result_t<Function, const T&>>
+    [[nodiscard, gnu::always_inline]] auto and_then(
+        Function&& function) const& {
+        return and_then_impl(*this, std::forward<Function>(function));
+    }
+
+    template <typename Function>
+        requires detail::is_result_v<std::invoke_result_t<Function, T&&>>
+    [[nodiscard, gnu::always_inline]] auto and_then(Function&& function) && {
+        return and_then_impl(std::move(*this),
+                             std::forward<Function>(function));
+    }
+
+    template <typename Function>
+        requires std::invocable<Function, T&>
+    [[nodiscard, gnu::always_inline]] auto transform(Function&& function) & {
+        return transform_impl(*this, std::forward<Function>(function));
+    }
+
+    template <typename Function>
+        requires std::invocable<Function, const T&>
+    [[nodiscard, gnu::always_inline]] auto transform(
+        Function&& function) const& {
+        return transform_impl(*this, std::forward<Function>(function));
+    }
+
+    template <typename Function>
+        requires std::invocable<Function, T&&>
+    [[nodiscard, gnu::always_inline]] auto transform(Function&& function) && {
+        return transform_impl(std::move(*this),
+                              std::forward<Function>(function));
+    }
+
 private:
     struct ValueTag {};
     struct ErrorTag {};
@@ -136,6 +208,40 @@ private:
     explicit Result(ErrorTag, std::error_code error) noexcept
         : error_(error ? error : std::make_error_code(std::errc::io_error)) {}
 
+    template <typename Self, typename Function>
+    [[nodiscard, gnu::always_inline]] static auto and_then_impl(
+        Self&& self, Function&& function) {
+        using Argument = decltype(*std::forward<Self>(self).value_);
+        using Next = std::remove_cvref_t<
+            std::invoke_result_t<Function, Argument>>;
+        if (!self.value_) {
+            return Next::failure(self.error_);
+        }
+        return std::invoke(std::forward<Function>(function),
+                           *std::forward<Self>(self).value_);
+    }
+
+    template <typename Self, typename Function>
+    [[nodiscard, gnu::always_inline]] static auto transform_impl(
+        Self&& self, Function&& function) {
+        using Argument = decltype(*std::forward<Self>(self).value_);
+        using Transformed = std::invoke_result_t<Function, Argument>;
+        using Value = std::conditional_t<std::is_void_v<Transformed>, void,
+                                         std::remove_cvref_t<Transformed>>;
+        if (!self.value_) {
+            return detail::make_result_failure<Value>(self.error_);
+        }
+        if constexpr (std::is_void_v<Transformed>) {
+            std::invoke(std::forward<Function>(function),
+                        *std::forward<Self>(self).value_);
+            return detail::make_result_success<Value>();
+        } else {
+            return detail::make_result_success<Value>(
+                std::invoke(std::forward<Function>(function),
+                            *std::forward<Self>(self).value_));
+        }
+    }
+
     std::optional<T> value_;
     std::error_code error_;
 };
@@ -143,6 +249,8 @@ private:
 template <>
 class [[nodiscard]] Result<void> {
 public:
+    using value_type = void;
+
     [[nodiscard]] static Result success() noexcept {
         return Result({});
     }
@@ -167,6 +275,39 @@ public:
         return error_;
     }
 
+    template <typename Function>
+        requires detail::is_result_v<std::invoke_result_t<Function>>
+    [[nodiscard, gnu::always_inline]] auto and_then(
+        Function&& function) const {
+        using Next = std::remove_cvref_t<std::invoke_result_t<Function>>;
+        if (error_) {
+            return Next::failure(error_);
+        }
+        return std::invoke(std::forward<Function>(function));
+    }
+
+    template <typename Function>
+        requires std::invocable<Function>
+    [[nodiscard, gnu::always_inline]] auto transform(
+        Function&& function) const {
+        using Transformed = std::invoke_result_t<Function>;
+        if (error_) {
+            if constexpr (std::is_void_v<Transformed>) {
+                return Result<void>::failure(error_);
+            } else {
+                return Result<std::remove_cvref_t<Transformed>>::failure(
+                    error_);
+            }
+        }
+        if constexpr (std::is_void_v<Transformed>) {
+            std::invoke(std::forward<Function>(function));
+            return Result<void>::success();
+        } else {
+            return Result<std::remove_cvref_t<Transformed>>::success(
+                std::invoke(std::forward<Function>(function)));
+        }
+    }
+
 private:
     explicit Result(std::error_code error) noexcept
         : error_(error) {}
@@ -176,18 +317,77 @@ private:
 
 namespace detail {
 
-template <typename>
-struct IsResult : std::false_type {};
-
 template <typename T>
-struct IsResult<Result<T>> : std::true_type {};
+[[nodiscard, gnu::always_inline]] inline Result<T>
+make_result_failure(std::error_code error) noexcept {
+    return Result<T>::failure(error);
+}
 
-template <typename T>
-inline constexpr bool is_result_v = IsResult<std::remove_cv_t<T>>::value;
+template <typename T, typename... Arguments>
+[[nodiscard, gnu::always_inline]] inline Result<T>
+make_result_success(Arguments&&... arguments) {
+    if constexpr (std::is_void_v<T>) {
+        static_assert(sizeof...(Arguments) == 0);
+        return Result<void>::success();
+    } else {
+        return Result<T>::success(
+            std::forward<Arguments>(arguments)...);
+    }
+}
+
+class ResultFailure final {
+public:
+    explicit ResultFailure(std::error_code error) noexcept : error_(error) {}
+
+    template <typename T>
+    [[nodiscard, gnu::always_inline]] operator Result<T>() const noexcept {
+        return Result<T>::failure(error_);
+    }
+
+private:
+    std::error_code error_;
+};
+
+[[nodiscard, gnu::always_inline]] inline ResultFailure
+propagate_failure(std::error_code error) noexcept {
+    return ResultFailure(error);
+}
 
 } // namespace detail
 
 } // namespace orchfs::async
+
+// These macros are block-scope coroutine statements. ORCHFS_TRY keeps the
+// successful object in its Result storage and binds an rvalue reference to it,
+// avoiding an extra move on hot paths. ORCHFS_TRYV validates and discards any
+// successful value.
+#define ORCHFS_DETAIL_CONCAT_INNER(left, right) left##right
+#define ORCHFS_DETAIL_CONCAT(left, right) \
+    ORCHFS_DETAIL_CONCAT_INNER(left, right)
+
+#define ORCHFS_DETAIL_TRY_BIND(name, expression, id)                         \
+    auto ORCHFS_DETAIL_CONCAT(_orchfs_try_result_, id) = (expression);       \
+    if (!ORCHFS_DETAIL_CONCAT(_orchfs_try_result_, id)) {                    \
+        co_return ::orchfs::async::detail::propagate_failure(                \
+            ORCHFS_DETAIL_CONCAT(_orchfs_try_result_, id).error());          \
+    }                                                                        \
+    auto&& name = std::move(ORCHFS_DETAIL_CONCAT(_orchfs_try_result_, id))   \
+                      .value()
+
+#define ORCHFS_TRY(name, expression) \
+    ORCHFS_DETAIL_TRY_BIND(name, expression, __COUNTER__)
+
+#define ORCHFS_DETAIL_TRY_VOID(expression, id)                               \
+    do {                                                                     \
+        auto ORCHFS_DETAIL_CONCAT(_orchfs_try_result_, id) = (expression);   \
+        if (!ORCHFS_DETAIL_CONCAT(_orchfs_try_result_, id)) {                \
+            co_return ::orchfs::async::detail::propagate_failure(            \
+                ORCHFS_DETAIL_CONCAT(_orchfs_try_result_, id).error());      \
+        }                                                                    \
+    } while (false)
+
+#define ORCHFS_TRYV(expression) \
+    ORCHFS_DETAIL_TRY_VOID(expression, __COUNTER__)
 
 template <>
 struct std::is_error_code_enum<orchfs::async::Errc> : true_type {};

@@ -823,10 +823,7 @@ class KfsCoroutineCore::Impl {
   }
 
   Task<Result<void>> release(OpenedNode node) {
-    auto scheduled = co_await schedule_namespace_owner();
-    if (!scheduled) {
-      co_return Result<void>::failure(scheduled.error());
-    }
+    ORCHFS_TRYV(co_await schedule_namespace_owner());
     auto found = open_references_.find(node.inode);
     if (found == open_references_.end() || found->second == 0) {
       co_return errno_failure<void>(EBADF);
@@ -840,20 +837,13 @@ class KfsCoroutineCore::Impl {
       co_return Result<void>::success();
     }
 
-    auto transaction_result = LogTransaction::create();
-    if (!transaction_result) {
-      co_return Result<void>::failure(transaction_result.error());
-    }
-    auto transaction = std::move(transaction_result).value();
+    ORCHFS_TRY(transaction, LogTransaction::create());
     const int error = transaction->invoke(
         [&] { return orchfs_core_delete_inode(node.inode); });
     if (error != 0) {
       co_return errno_failure<void>(error);
     }
-    auto committed = co_await journal_.commit(transaction->release());
-    if (!committed) {
-      co_return committed;
-    }
+    ORCHFS_TRYV(co_await journal_.commit(transaction->release()));
     open_references_.erase(node.inode);
     orphaned_.erase(node.inode);
     erase_snapshot(node.inode);
@@ -923,12 +913,9 @@ class KfsCoroutineCore::Impl {
          cursor < static_cast<std::uint64_t>(parent.size);) {
       const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(
           window.size(), static_cast<std::uint64_t>(parent.size) - cursor));
-      auto read = co_await read_unlocked(
-          directory, cursor, std::span<std::byte>(window).first(length));
-      if (!read) {
-        co_return Result<NamespaceEntry>::failure(read.error());
-      }
-      if (read.value() != length) {
+      ORCHFS_TRY(bytes_read, co_await read_unlocked(
+          directory, cursor, std::span<std::byte>(window).first(length)));
+      if (bytes_read != length) {
         co_return errno_failure<NamespaceEntry>(EIO);
       }
       for (std::size_t inside = 0; inside < length;
@@ -961,10 +948,7 @@ class KfsCoroutineCore::Impl {
 
   Task<Result<NamespaceEntry>> resolve(
       std::string_view path, std::optional<InodeNumber> relative_to = {}) {
-    auto split = split_path(path);
-    if (!split) {
-      co_return Result<NamespaceEntry>::failure(split.error());
-    }
+    ORCHFS_TRY(components, split_path(path));
     InodeNumber current =
         !path.empty() && path.front() != '/' && relative_to
             ? *relative_to
@@ -978,15 +962,12 @@ class KfsCoroutineCore::Impl {
     if (error != 0) {
       co_return errno_failure<NamespaceEntry>(error);
     }
-    for (const auto& component : split.value()) {
+    for (const auto& component : components) {
       if (component == ".") {
         continue;
       }
-      auto child = co_await find_child(current, component);
-      if (!child) {
-        co_return child;
-      }
-      located = std::move(child).value();
+      ORCHFS_TRY(child, co_await find_child(current, component));
+      located = std::move(child);
       current = located.inode.inode;
     }
     co_return Result<NamespaceEntry>::success(std::move(located));
@@ -994,14 +975,10 @@ class KfsCoroutineCore::Impl {
 
   Task<Result<ParentPath>> resolve_parent(
       std::string_view path, std::optional<InodeNumber> relative_to = {}) {
-    auto split = split_path(path);
-    if (!split) {
-      co_return Result<ParentPath>::failure(split.error());
-    }
-    if (split.value().empty()) {
+    ORCHFS_TRY(components, split_path(path));
+    if (components.empty()) {
       co_return errno_failure<ParentPath>(EBUSY);
     }
-    auto components = std::move(split).value();
     std::string name = std::move(components.back());
     components.pop_back();
     if (name.empty() || name == "." || name == "..") {
@@ -1015,14 +992,11 @@ class KfsCoroutineCore::Impl {
       if (component == ".") {
         continue;
       }
-      auto child = co_await find_child(current, component);
-      if (!child) {
-        co_return Result<ParentPath>::failure(child.error());
-      }
-      if (child.value().inode.type != ORCHFS_CORE_DIRECTORY) {
+      ORCHFS_TRY(child, co_await find_child(current, component));
+      if (child.inode.type != ORCHFS_CORE_DIRECTORY) {
         co_return errno_failure<ParentPath>(ENOTDIR);
       }
-      current = child.value().inode.inode;
+      current = child.inode.inode;
     }
     co_return Result<ParentPath>::success(
         ParentPath{.parent = current, .name = std::move(name)});
@@ -1033,12 +1007,9 @@ class KfsCoroutineCore::Impl {
       const orchfs_core_dirent& entry,
       LogTransaction* transaction = nullptr) {
     auto bytes = std::as_bytes(std::span(&entry, 1));
-    auto written = co_await write_unlocked(directory, offset, bytes, false,
-                                            true, transaction);
-    if (!written) {
-      co_return Result<void>::failure(written.error());
-    }
-    co_return written.value().bytes == sizeof(entry)
+    ORCHFS_TRY(written, co_await write_unlocked(
+        directory, offset, bytes, false, true, transaction));
+    co_return written.bytes == sizeof(entry)
                   ? Result<void>::success()
                   : errno_failure<void>(EIO);
   }
@@ -1057,10 +1028,7 @@ class KfsCoroutineCore::Impl {
     for (std::uint64_t cursor = 2 * ORCHFS_CORE_DIRENT_SIZE;
          cursor < static_cast<std::uint64_t>(snapshot.size);
          cursor += ORCHFS_CORE_DIRENT_SIZE) {
-      auto read = co_await read_unlocked(directory, cursor, bytes);
-      if (!read) {
-        co_return Result<std::uint64_t>::failure(read.error());
-      }
+      ORCHFS_TRYV(co_await read_unlocked(directory, cursor, bytes));
       orchfs_core_dirent entry{};
       std::memcpy(&entry, bytes.data(), sizeof(entry));
       if (entry.type == 0) {
@@ -1082,11 +1050,7 @@ class KfsCoroutineCore::Impl {
       co_return Result<NamespaceEntry>::failure(existing.error());
     }
 
-    auto transaction_result = LogTransaction::create();
-    if (!transaction_result) {
-      co_return Result<NamespaceEntry>::failure(transaction_result.error());
-    }
-    auto transaction = std::move(transaction_result).value();
+    ORCHFS_TRY(transaction, LogTransaction::create());
 
     orchfs_core_inode inode{};
     int error = transaction->invoke(
@@ -1106,35 +1070,24 @@ class KfsCoroutineCore::Impl {
       initial[1].name_length = 2;
       initial[1].type = ORCHFS_CORE_DIRECTORY;
       std::memcpy(initial[1].name, "..", 2);
-      auto initialized = co_await write_unlocked(
+      ORCHFS_TRY(initialized, co_await write_unlocked(
           inode.inode, 0, std::as_bytes(std::span(initial)), false, true,
-          transaction.get());
-      if (!initialized || initialized.value().bytes != sizeof(initial)) {
-        co_return initialized
-                      ? errno_failure<NamespaceEntry>(EIO)
-                      : Result<NamespaceEntry>::failure(initialized.error());
+          transaction.get()));
+      if (initialized.bytes != sizeof(initial)) {
+        co_return errno_failure<NamespaceEntry>(EIO);
       }
     }
 
-    auto slot = co_await free_directory_slot(parent);
-    if (!slot) {
-      co_return Result<NamespaceEntry>::failure(slot.error());
-    }
+    ORCHFS_TRY(slot, co_await free_directory_slot(parent));
     orchfs_core_dirent entry{};
     entry.inode = inode.inode;
-    entry.offset = static_cast<std::int64_t>(slot.value());
+    entry.offset = static_cast<std::int64_t>(slot);
     entry.name_length = static_cast<std::uint16_t>(name.size());
     entry.type = static_cast<std::uint8_t>(type);
     std::memcpy(entry.name, name.data(), name.size());
-    auto inserted = co_await write_directory_entry(
-        parent, slot.value(), entry, transaction.get());
-    if (!inserted) {
-      co_return Result<NamespaceEntry>::failure(inserted.error());
-    }
-    auto committed = co_await journal_.commit(transaction->release());
-    if (!committed) {
-      co_return Result<NamespaceEntry>::failure(committed.error());
-    }
+    ORCHFS_TRYV(co_await write_directory_entry(
+        parent, slot, entry, transaction.get()));
+    ORCHFS_TRYV(co_await journal_.commit(transaction->release()));
     (void)orchfs_core_snapshot(inode.inode, &inode);
     publish(inode);
     orchfs_core_inode parent_snapshot{};
@@ -1144,7 +1097,7 @@ class KfsCoroutineCore::Impl {
     co_return Result<NamespaceEntry>::success(NamespaceEntry{
         .inode = inode,
         .parent = parent,
-        .offset = slot.value(),
+        .offset = slot,
         .entry = entry,
     });
   }
@@ -1160,12 +1113,9 @@ class KfsCoroutineCore::Impl {
       if (located.error().value() != ENOENT || (flags & O_CREAT) == 0) {
         co_return Result<OpenedNode>::failure(located.error());
       }
-      auto parent = co_await resolve_parent(path, relative_to);
-      if (!parent) {
-        co_return Result<OpenedNode>::failure(parent.error());
-      }
-      located = co_await create_node(parent.value().parent,
-                                     std::move(parent.value().name),
+      ORCHFS_TRY(parent, co_await resolve_parent(path, relative_to));
+      located = co_await create_node(parent.parent,
+                                     std::move(parent.name),
                                      ORCHFS_CORE_REGULAR, mode);
       if (!located) {
         co_return Result<OpenedNode>::failure(located.error());
@@ -1182,16 +1132,9 @@ class KfsCoroutineCore::Impl {
       if ((flags & O_ACCMODE) == O_RDONLY) {
         co_return errno_failure<OpenedNode>(EINVAL);
       }
-      auto range = range_for(located.value().inode.inode);
-      if (!range) {
-        co_return Result<OpenedNode>::failure(range.error());
-      }
-      auto acquired = co_await range.value()->acquire(
-          0, kWholeFile, RangeMode::write);
-      if (!acquired) {
-        co_return Result<OpenedNode>::failure(acquired.error());
-      }
-      auto range_permit = std::move(acquired).value();
+      ORCHFS_TRY(range, range_for(located.value().inode.inode));
+      ORCHFS_TRY(range_permit, co_await range->acquire(
+          0, kWholeFile, RangeMode::write));
       const std::uint64_t old_extent_size = located.value().inode.size > 0
           ? static_cast<std::uint64_t>(located.value().inode.size)
           : 0;
@@ -1250,10 +1193,7 @@ class KfsCoroutineCore::Impl {
     for (std::uint64_t cursor = 2 * ORCHFS_CORE_DIRENT_SIZE;
          cursor < static_cast<std::uint64_t>(snapshot.size);
          cursor += ORCHFS_CORE_DIRENT_SIZE) {
-      auto read = co_await read_unlocked(inode, cursor, bytes);
-      if (!read) {
-        co_return Result<bool>::failure(read.error());
-      }
+      ORCHFS_TRYV(co_await read_unlocked(inode, cursor, bytes));
       orchfs_core_dirent entry{};
       std::memcpy(&entry, bytes.data(), sizeof(entry));
       if (entry.type != 0) {
@@ -1264,58 +1204,44 @@ class KfsCoroutineCore::Impl {
   }
 
   Task<Result<void>> remove_path(std::string_view path, int expected_type) {
-    auto parent = co_await resolve_parent(path);
-    if (!parent) {
-      co_return Result<void>::failure(parent.error());
-    }
-    auto child = co_await find_child(parent.value().parent,
-                                     parent.value().name);
-    if (!child) {
-      co_return Result<void>::failure(child.error());
-    }
-    if (child.value().inode.inode == orchfs_core_root_inode()) {
+    ORCHFS_TRY(parent, co_await resolve_parent(path));
+    ORCHFS_TRY(child, co_await find_child(parent.parent, parent.name));
+    if (child.inode.inode == orchfs_core_root_inode()) {
       co_return errno_failure<void>(EBUSY);
     }
-    if (child.value().inode.type != expected_type) {
+    if (child.inode.type != expected_type) {
       co_return errno_failure<void>(
           expected_type == ORCHFS_CORE_DIRECTORY ? ENOTDIR : EISDIR);
     }
     if (expected_type == ORCHFS_CORE_DIRECTORY) {
-      auto empty = co_await directory_empty(child.value().inode.inode);
+      ORCHFS_TRY(empty, co_await directory_empty(child.inode.inode));
       if (!empty) {
-        co_return Result<void>::failure(empty.error());
-      }
-      if (!empty.value()) {
         co_return errno_failure<void>(ENOTEMPTY);
       }
     }
-    child.value().entry.type = 0;
-    auto transaction_result = LogTransaction::create();
-    if (!transaction_result) {
-      co_return Result<void>::failure(transaction_result.error());
-    }
-    auto transaction = std::move(transaction_result).value();
+    child.entry.type = 0;
+    ORCHFS_TRY(transaction, LogTransaction::create());
     const bool defer_delete = open_references_.contains(
-        child.value().inode.inode);
+        child.inode.inode);
     if (defer_delete) {
       try {
-        orphaned_.insert(child.value().inode.inode);
+        orphaned_.insert(child.inode.inode);
       } catch (const std::bad_alloc&) {
         co_return errno_failure<void>(ENOMEM);
       }
     }
     auto removed = co_await write_directory_entry(
-        child.value().parent, child.value().offset, child.value().entry,
+        child.parent, child.offset, child.entry,
         transaction.get());
     if (!removed) {
       if (defer_delete) {
-        orphaned_.erase(child.value().inode.inode);
+        orphaned_.erase(child.inode.inode);
       }
       co_return removed;
     }
     if (!defer_delete) {
       const int error = transaction->invoke([&] {
-        return orchfs_core_delete_inode(child.value().inode.inode);
+        return orchfs_core_delete_inode(child.inode.inode);
       });
       if (error != 0) {
         co_return errno_failure<void>(error);
@@ -1324,15 +1250,15 @@ class KfsCoroutineCore::Impl {
     auto committed = co_await journal_.commit(transaction->release());
     if (!committed) {
       if (defer_delete) {
-        orphaned_.erase(child.value().inode.inode);
+        orphaned_.erase(child.inode.inode);
       }
       co_return committed;
     }
     if (!defer_delete) {
-      erase_snapshot(child.value().inode.inode);
+      erase_snapshot(child.inode.inode);
     }
     orchfs_core_inode parent_snapshot{};
-    if (orchfs_core_snapshot(child.value().parent, &parent_snapshot) == 0) {
+    if (orchfs_core_snapshot(child.parent, &parent_snapshot) == 0) {
       publish(parent_snapshot);
     }
     co_return Result<void>::success();
@@ -1340,41 +1266,31 @@ class KfsCoroutineCore::Impl {
 
   Task<Result<void>> rename_path(std::string_view old_path,
                                  std::string_view new_path) {
-    auto old_parent = co_await resolve_parent(old_path);
-    if (!old_parent) {
-      co_return Result<void>::failure(old_parent.error());
-    }
-    auto new_parent = co_await resolve_parent(new_path);
-    if (!new_parent) {
-      co_return Result<void>::failure(new_parent.error());
-    }
-    if (old_parent.value().parent != new_parent.value().parent) {
+    ORCHFS_TRY(old_parent, co_await resolve_parent(old_path));
+    ORCHFS_TRY(new_parent, co_await resolve_parent(new_path));
+    if (old_parent.parent != new_parent.parent) {
       co_return errno_failure<void>(EXDEV);
     }
-    auto source = co_await find_child(old_parent.value().parent,
-                                      old_parent.value().name);
-    if (!source) {
-      co_return Result<void>::failure(source.error());
-    }
-    if (old_parent.value().name == new_parent.value().name) {
+    ORCHFS_TRY(source,
+               co_await find_child(old_parent.parent, old_parent.name));
+    if (old_parent.name == new_parent.name) {
       co_return Result<void>::success();
     }
-    auto destination = co_await find_child(new_parent.value().parent,
-                                           new_parent.value().name);
+    auto destination = co_await find_child(new_parent.parent,
+                                           new_parent.name);
     if (destination) {
       co_return errno_failure<void>(EEXIST);
     }
     if (destination.error().value() != ENOENT) {
       co_return Result<void>::failure(destination.error());
     }
-    auto& entry = source.value().entry;
+    auto& entry = source.entry;
     entry.name_length =
-        static_cast<std::uint16_t>(new_parent.value().name.size());
+        static_cast<std::uint16_t>(new_parent.name.size());
     std::memset(entry.name, 0, sizeof(entry.name));
-    std::memcpy(entry.name, new_parent.value().name.data(),
-                new_parent.value().name.size());
+    std::memcpy(entry.name, new_parent.name.data(), new_parent.name.size());
     co_return co_await write_directory_entry(
-        source.value().parent, source.value().offset, entry);
+        source.parent, source.offset, entry);
   }
 
   Task<Result<std::size_t>> read_unlocked(
@@ -1401,11 +1317,8 @@ class KfsCoroutineCore::Impl {
 
     std::shared_ptr<const ExtentSnapshot> extent_snapshot;
     if (snapshot.type == ORCHFS_CORE_REGULAR) {
-      auto cached_extents = extents_for(inode, snapshot);
-      if (!cached_extents) {
-        co_return Result<std::size_t>::failure(cached_extents.error());
-      }
-      extent_snapshot = std::move(cached_extents).value();
+      ORCHFS_TRY(cached_extents, extents_for(inode, snapshot));
+      extent_snapshot = std::move(cached_extents);
     }
 
     const std::uint64_t first_block = offset / kBlockSize;
@@ -1463,10 +1376,7 @@ class KfsCoroutineCore::Impl {
           page_consumed += part;
           copied_since_yield += part;
           if (copied_since_yield >= kYieldBytes) {
-            auto yielded = co_await Runtime::yield();
-            if (!yielded) {
-              co_return Result<std::size_t>::failure(yielded.error());
-            }
+            ORCHFS_TRYV(co_await Runtime::yield());
             copied_since_yield = 0;
           }
         }
@@ -1505,16 +1415,13 @@ class KfsCoroutineCore::Impl {
     }
 
     if (!requests.empty()) {
-      auto read = co_await device_.read_batch(
-          std::span<const BlockRead>(requests.data(), requests.size()));
-      if (!read) {
-        co_return Result<std::size_t>::failure(read.error());
-      }
+      ORCHFS_TRY(bytes_read, co_await device_.read_batch(
+          std::span<const BlockRead>(requests.data(), requests.size())));
       std::size_t expected = 0;
       for (const auto& request : requests) {
         expected += request.destination.size();
       }
-      if (read.value() != expected) {
+      if (bytes_read != expected) {
         co_return errno_failure<std::size_t>(EIO);
       }
     }
@@ -1544,10 +1451,7 @@ class KfsCoroutineCore::Impl {
                   item.length);
       copied_since_yield += item.length;
       if (copied_since_yield >= kYieldBytes) {
-        auto yielded = co_await Runtime::yield();
-        if (!yielded) {
-          co_return Result<std::size_t>::failure(yielded.error());
-        }
+        ORCHFS_TRYV(co_await Runtime::yield());
         copied_since_yield = 0;
       }
     }
@@ -1610,11 +1514,7 @@ class KfsCoroutineCore::Impl {
                             source.size() % kBlockSize == 0 &&
                             end <= current_size;
     if (stable_overwrite) {
-      auto cached_extents = extents_for(inode, snapshot);
-      if (!cached_extents) {
-        co_return Result<WriteResult>::failure(cached_extents.error());
-      }
-      const auto extent_snapshot = std::move(cached_extents).value();
+      ORCHFS_TRY(extent_snapshot, extents_for(inode, snapshot));
       for (std::size_t index = 0; index < blocks.size(); ++index) {
         if (!mapping_from_snapshot(*extent_snapshot, first_block + index,
                                    blocks[index]) ||
@@ -1627,11 +1527,8 @@ class KfsCoroutineCore::Impl {
     }
     if (!stable_overwrite) {
       if (transaction == nullptr) {
-        auto created = LogTransaction::create();
-        if (!created) {
-          co_return Result<WriteResult>::failure(created.error());
-        }
-        owned_transaction = std::move(created).value();
+        ORCHFS_TRY(created, LogTransaction::create());
+        owned_transaction = std::move(created);
         transaction = owned_transaction.get();
       }
       error = transaction->invoke([&] {
@@ -1788,12 +1685,9 @@ class KfsCoroutineCore::Impl {
     }
 
     if (!merge_reads.empty()) {
-      auto read = co_await device_.read_batch(
-          std::span<const BlockRead>(merge_reads.data(), merge_reads.size()));
-      if (!read) {
-        co_return Result<WriteResult>::failure(read.error());
-      }
-      if (read.value() != merge_reads.size() * kPageSize) {
+      ORCHFS_TRY(bytes_read, co_await device_.read_batch(
+          std::span<const BlockRead>(merge_reads.data(), merge_reads.size())));
+      if (bytes_read != merge_reads.size() * kPageSize) {
         co_return errno_failure<WriteResult>(EIO);
       }
       for (auto& merge : merges) {
@@ -1809,16 +1703,13 @@ class KfsCoroutineCore::Impl {
     }
 
     if (!writes.empty()) {
-      auto written = co_await device_.write_batch(
-          std::span<const BlockWrite>(writes.data(), writes.size()));
-      if (!written) {
-        co_return Result<WriteResult>::failure(written.error());
-      }
+      ORCHFS_TRY(bytes_written, co_await device_.write_batch(
+          std::span<const BlockWrite>(writes.data(), writes.size())));
       std::size_t expected = 0;
       for (const auto& request : writes) {
         expected += request.source.size();
       }
-      if (written.value() != expected) {
+      if (bytes_written != expected) {
         co_return errno_failure<WriteResult>(EIO);
       }
     }
@@ -1835,10 +1726,7 @@ class KfsCoroutineCore::Impl {
       }
       copied_since_yield += operation.length;
       if (copied_since_yield >= kYieldBytes) {
-        auto yielded = co_await Runtime::yield();
-        if (!yielded) {
-          co_return Result<WriteResult>::failure(yielded.error());
-        }
+        ORCHFS_TRYV(co_await Runtime::yield());
         copied_since_yield = 0;
       }
     }
@@ -1858,10 +1746,7 @@ class KfsCoroutineCore::Impl {
       }
     }
     if (owned_transaction) {
-      auto committed = co_await journal_.commit(owned_transaction->release());
-      if (!committed) {
-        co_return Result<WriteResult>::failure(committed.error());
-      }
+      ORCHFS_TRYV(co_await journal_.commit(owned_transaction->release()));
       error = orchfs_core_snapshot(inode, &snapshot);
       if (error == 0) {
         publish(snapshot);
@@ -1913,16 +1798,9 @@ Result<std::shared_ptr<KfsCoroutineCore>> KfsCoroutineCore::create(
 
 Task<Result<OpenedNode>> KfsCoroutineCore::open(
     std::string path, int flags, std::uint32_t mode) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<OpenedNode>::failure(scheduled.error());
-  }
-  auto acquired = co_await impl_->namespace_gate_.acquire(
-      0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<OpenedNode>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_TRY(permit, co_await impl_->namespace_gate_.acquire(
+      0, 1, RangeMode::write));
   auto result = co_await impl_->open_path(path, flags, mode);
   if (result) {
     auto retained = impl_->retain(result.value().inode);
@@ -1943,16 +1821,9 @@ Task<Result<OpenedNode>> KfsCoroutineCore::open(
 
 Task<Result<OpenedNode>> KfsCoroutineCore::open_at(
     InodeNumber directory, std::string path, int flags, std::uint32_t mode) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<OpenedNode>::failure(scheduled.error());
-  }
-  auto acquired = co_await impl_->namespace_gate_.acquire(
-      0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<OpenedNode>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_TRY(permit, co_await impl_->namespace_gate_.acquire(
+      0, 1, RangeMode::write));
   auto result = co_await impl_->open_path(path, flags, mode, directory);
   if (result) {
     auto retained = impl_->retain(result.value().inode);
@@ -1988,20 +1859,10 @@ Task<Result<std::size_t>> KfsCoroutineCore::read(
               std::numeric_limits<std::int64_t>::max()) - offset) {
     co_return errno_failure<std::size_t>(EOVERFLOW);
   }
-  auto scheduled = co_await impl_->schedule_inode_owner(inode);
-  if (!scheduled) {
-    co_return Result<std::size_t>::failure(scheduled.error());
-  }
-  auto range = impl_->range_for(inode);
-  if (!range) {
-    co_return Result<std::size_t>::failure(range.error());
-  }
-  auto acquired = co_await range.value()->acquire(
-      offset, range_length(offset, destination.size()), RangeMode::read);
-  if (!acquired) {
-    co_return Result<std::size_t>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
+  ORCHFS_TRY(range, impl_->range_for(inode));
+  ORCHFS_TRY(permit, co_await range->acquire(
+      offset, range_length(offset, destination.size()), RangeMode::read));
   auto result = co_await impl_->read_unlocked(inode, offset, destination);
   auto released = co_await permit.release();
   if (!released && result) {
@@ -2013,23 +1874,13 @@ Task<Result<std::size_t>> KfsCoroutineCore::read(
 Task<Result<WriteResult>> KfsCoroutineCore::write(
     InodeNumber inode, std::uint64_t offset,
     std::span<const std::byte> source, bool append) {
-  auto scheduled = co_await impl_->schedule_inode_owner(inode);
-  if (!scheduled) {
-    co_return Result<WriteResult>::failure(scheduled.error());
-  }
-  auto range = impl_->range_for(inode);
-  if (!range) {
-    co_return Result<WriteResult>::failure(range.error());
-  }
+  ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
+  ORCHFS_TRY(range, impl_->range_for(inode));
   const std::uint64_t range_start = append ? 0 : offset;
   const std::uint64_t length = append ? kWholeFile
                                       : range_length(offset, source.size());
-  auto acquired = co_await range.value()->acquire(
-      range_start, length, RangeMode::write);
-  if (!acquired) {
-    co_return Result<WriteResult>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRY(permit, co_await range->acquire(
+      range_start, length, RangeMode::write));
   auto result = co_await impl_->write_unlocked(inode, offset, source, append);
   auto released = co_await permit.release();
   if (!released && result) {
@@ -2039,16 +1890,9 @@ Task<Result<WriteResult>> KfsCoroutineCore::write(
 }
 
 Task<Result<FileStat>> KfsCoroutineCore::stat(std::string path) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<FileStat>::failure(scheduled.error());
-  }
-  auto acquired = co_await impl_->namespace_gate_.acquire(
-      0, 1, RangeMode::read);
-  if (!acquired) {
-    co_return Result<FileStat>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_TRY(permit, co_await impl_->namespace_gate_.acquire(
+      0, 1, RangeMode::read));
   auto located = co_await impl_->resolve(path);
   if (located) {
     impl_->publish(located.value().inode);
@@ -2064,10 +1908,7 @@ Task<Result<FileStat>> KfsCoroutineCore::stat(std::string path) {
 }
 
 Task<Result<FileStat>> KfsCoroutineCore::stat(InodeNumber inode) {
-  auto scheduled = co_await impl_->schedule_inode_owner(inode);
-  if (!scheduled) {
-    co_return Result<FileStat>::failure(scheduled.error());
-  }
+  ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
   auto cached = impl_->cached(inode);
   if (cached) {
     co_return cached;
@@ -2082,10 +1923,7 @@ Task<Result<FileStat>> KfsCoroutineCore::stat(InodeNumber inode) {
 }
 
 Task<Result<FileSystemStat>> KfsCoroutineCore::statfs(InodeNumber inode) {
-  auto scheduled = co_await impl_->schedule_inode_owner(inode);
-  if (!scheduled) {
-    co_return Result<FileSystemStat>::failure(scheduled.error());
-  }
+  ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
   orchfs_core_inode snapshot{};
   const int error = orchfs_core_snapshot(inode, &snapshot);
   if (error != 0) {
@@ -2108,10 +1946,7 @@ Task<Result<FileSystemStat>> KfsCoroutineCore::statfs(InodeNumber inode) {
 Task<Result<std::uint64_t>> KfsCoroutineCore::seek(
     InodeNumber inode, std::uint64_t current_offset,
     std::int64_t offset, int whence) {
-  auto scheduled = co_await impl_->schedule_inode_owner(inode);
-  if (!scheduled) {
-    co_return Result<std::uint64_t>::failure(scheduled.error());
-  }
+  ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
   std::uint64_t base = 0;
   if (whence == SEEK_CUR) {
     base = current_offset;
@@ -2148,16 +1983,9 @@ Task<Result<std::uint64_t>> KfsCoroutineCore::seek(
 
 Task<Result<void>> KfsCoroutineCore::truncate(std::string path,
                                                std::uint64_t size) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<void>::failure(scheduled.error());
-  }
-  auto namespace_acquired = co_await impl_->namespace_gate_.acquire(
-      0, 1, RangeMode::read);
-  if (!namespace_acquired) {
-    co_return Result<void>::failure(namespace_acquired.error());
-  }
-  auto namespace_permit = std::move(namespace_acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_TRY(namespace_permit, co_await impl_->namespace_gate_.acquire(
+      0, 1, RangeMode::read));
   auto located = co_await impl_->resolve(path);
   auto released = co_await namespace_permit.release();
   if (!located) {
@@ -2174,20 +2002,10 @@ Task<Result<void>> KfsCoroutineCore::truncate(InodeNumber inode,
   if (size > kMaximumFileSize) {
     co_return errno_failure<void>(EFBIG);
   }
-  auto scheduled = co_await impl_->schedule_inode_owner(inode);
-  if (!scheduled) {
-    co_return Result<void>::failure(scheduled.error());
-  }
-  auto range = impl_->range_for(inode);
-  if (!range) {
-    co_return Result<void>::failure(range.error());
-  }
-  auto acquired = co_await range.value()->acquire(
-      0, kWholeFile, RangeMode::write);
-  if (!acquired) {
-    co_return Result<void>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
+  ORCHFS_TRY(range, impl_->range_for(inode));
+  ORCHFS_TRY(permit, co_await range->acquire(
+      0, kWholeFile, RangeMode::write));
   orchfs_core_inode snapshot{};
   int error = orchfs_core_snapshot(inode, &snapshot);
   Result<void> result = error == 0 ? Result<void>::success()
@@ -2248,20 +2066,10 @@ Task<Result<void>> KfsCoroutineCore::truncate(InodeNumber inode,
 }
 
 Task<Result<void>> KfsCoroutineCore::sync(InodeNumber inode) {
-  auto scheduled = co_await impl_->schedule_inode_owner(inode);
-  if (!scheduled) {
-    co_return Result<void>::failure(scheduled.error());
-  }
-  auto range = impl_->range_for(inode);
-  if (!range) {
-    co_return Result<void>::failure(range.error());
-  }
-  auto acquired = co_await range.value()->acquire(
-      0, kWholeFile, RangeMode::write);
-  if (!acquired) {
-    co_return Result<void>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
+  ORCHFS_TRY(range, impl_->range_for(inode));
+  ORCHFS_TRY(permit, co_await range->acquire(
+      0, kWholeFile, RangeMode::write));
   const int metadata_error = orchfs_core_sync_inode(inode);
   Result<void> result = metadata_error == 0
       ? co_await impl_->device_.flush()
@@ -2275,16 +2083,9 @@ Task<Result<void>> KfsCoroutineCore::sync(InodeNumber inode) {
 
 Task<Result<void>> KfsCoroutineCore::make_directory(
     std::string path, std::uint32_t mode) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<void>::failure(scheduled.error());
-  }
-  auto acquired = co_await impl_->namespace_gate_.acquire(
-      0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<void>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_TRY(permit, co_await impl_->namespace_gate_.acquire(
+      0, 1, RangeMode::write));
   auto parent = co_await impl_->resolve_parent(path);
   Result<void> result = parent
       ? Result<void>::success()
@@ -2304,16 +2105,9 @@ Task<Result<void>> KfsCoroutineCore::make_directory(
 }
 
 Task<Result<void>> KfsCoroutineCore::remove_directory(std::string path) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<void>::failure(scheduled.error());
-  }
-  auto acquired = co_await impl_->namespace_gate_.acquire(
-      0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<void>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_TRY(permit, co_await impl_->namespace_gate_.acquire(
+      0, 1, RangeMode::write));
   auto result = co_await impl_->remove_path(path, ORCHFS_CORE_DIRECTORY);
   auto released = co_await permit.release();
   if (!released && result) {
@@ -2323,16 +2117,9 @@ Task<Result<void>> KfsCoroutineCore::remove_directory(std::string path) {
 }
 
 Task<Result<void>> KfsCoroutineCore::unlink(std::string path) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<void>::failure(scheduled.error());
-  }
-  auto acquired = co_await impl_->namespace_gate_.acquire(
-      0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<void>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_TRY(permit, co_await impl_->namespace_gate_.acquire(
+      0, 1, RangeMode::write));
   auto result = co_await impl_->remove_path(path, ORCHFS_CORE_REGULAR);
   auto released = co_await permit.release();
   if (!released && result) {
@@ -2343,16 +2130,9 @@ Task<Result<void>> KfsCoroutineCore::unlink(std::string path) {
 
 Task<Result<void>> KfsCoroutineCore::rename(std::string old_path,
                                              std::string new_path) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<void>::failure(scheduled.error());
-  }
-  auto acquired = co_await impl_->namespace_gate_.acquire(
-      0, 1, RangeMode::write);
-  if (!acquired) {
-    co_return Result<void>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+  ORCHFS_TRY(permit, co_await impl_->namespace_gate_.acquire(
+      0, 1, RangeMode::write));
   auto result = co_await impl_->rename_path(old_path, new_path);
   auto released = co_await permit.release();
   if (!released && result) {
@@ -2362,21 +2142,16 @@ Task<Result<void>> KfsCoroutineCore::rename(std::string old_path,
 }
 
 Task<Result<OpenedNode>> KfsCoroutineCore::open_directory(std::string path) {
-  auto opened = co_await open(std::move(path), O_RDONLY | O_DIRECTORY, 0);
-  if (!opened) {
-    co_return opened;
-  }
-  if (opened.value().type != NodeType::directory) {
+  ORCHFS_TRY(opened,
+             co_await open(std::move(path), O_RDONLY | O_DIRECTORY, 0));
+  if (opened.type != NodeType::directory) {
     co_return errno_failure<OpenedNode>(ENOTDIR);
   }
-  co_return opened;
+  co_return Result<OpenedNode>::success(std::move(opened));
 }
 
 Task<Result<OpenedNode>> KfsCoroutineCore::open_directory(InodeNumber inode) {
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<OpenedNode>::failure(scheduled.error());
-  }
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
   orchfs_core_inode snapshot{};
   const int error = orchfs_core_snapshot(inode, &snapshot);
   if (error != 0) {
@@ -2386,10 +2161,7 @@ Task<Result<OpenedNode>> KfsCoroutineCore::open_directory(InodeNumber inode) {
     co_return errno_failure<OpenedNode>(ENOTDIR);
   }
   impl_->publish(snapshot);
-  auto retained = impl_->retain(inode);
-  if (!retained) {
-    co_return Result<OpenedNode>::failure(retained.error());
-  }
+  ORCHFS_TRYV(impl_->retain(inode));
   co_return Result<OpenedNode>::success(opened_node(snapshot));
 }
 
@@ -2398,20 +2170,10 @@ Task<Result<DirectoryReadResult>> KfsCoroutineCore::read_directory(
   if (cursor % ORCHFS_CORE_DIRENT_SIZE != 0) {
     co_return errno_failure<DirectoryReadResult>(EINVAL);
   }
-  auto scheduled = co_await impl_->schedule_inode_owner(inode);
-  if (!scheduled) {
-    co_return Result<DirectoryReadResult>::failure(scheduled.error());
-  }
-  auto range = impl_->range_for(inode);
-  if (!range) {
-    co_return Result<DirectoryReadResult>::failure(range.error());
-  }
-  auto acquired = co_await range.value()->acquire(
-      0, kWholeFile, RangeMode::read);
-  if (!acquired) {
-    co_return Result<DirectoryReadResult>::failure(acquired.error());
-  }
-  auto permit = std::move(acquired).value();
+  ORCHFS_TRYV(co_await impl_->schedule_inode_owner(inode));
+  ORCHFS_TRY(range, impl_->range_for(inode));
+  ORCHFS_TRY(permit, co_await range->acquire(
+      0, kWholeFile, RangeMode::read));
   orchfs_core_inode snapshot{};
   int error = orchfs_core_snapshot(inode, &snapshot);
   Result<DirectoryReadResult> result =
@@ -2489,16 +2251,9 @@ Task<Result<DirectoryReadResult>> KfsCoroutineCore::read_directory(
 
 Task<Result<bool>> KfsCoroutineCore::migrate(std::size_t max_operations) {
   for (std::size_t migrated = 0; migrated < max_operations; ++migrated) {
-    auto scheduled = co_await impl_->schedule_namespace_owner();
-    if (!scheduled) {
-      co_return Result<bool>::failure(scheduled.error());
-    }
-    auto namespace_acquired = co_await impl_->namespace_gate_.acquire(
-        0, 1, RangeMode::read);
-    if (!namespace_acquired) {
-      co_return Result<bool>::failure(namespace_acquired.error());
-    }
-    auto namespace_permit = std::move(namespace_acquired).value();
+    ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
+    ORCHFS_TRY(namespace_permit, co_await impl_->namespace_gate_.acquire(
+        0, 1, RangeMode::read));
 
     orchfs_migration_plan* plan = nullptr;
     int error = orchfs_prepare_migration(&plan);
@@ -2597,10 +2352,7 @@ Task<Result<bool>> KfsCoroutineCore::migrate(std::size_t max_operations) {
       co_return errno_failure<bool>(error);
     }
   }
-  auto scheduled = co_await impl_->schedule_namespace_owner();
-  if (!scheduled) {
-    co_return Result<bool>::failure(scheduled.error());
-  }
+  ORCHFS_TRYV(co_await impl_->schedule_namespace_owner());
   co_return Result<bool>::success(orchfs_migration_has_pending() != 0);
 }
 
