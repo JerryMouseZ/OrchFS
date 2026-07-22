@@ -553,6 +553,33 @@ std::optional<FileLease> acquire_file(AdapterState &adapter, int fd) noexcept {
   return std::optional<FileLease>(std::in_place, adapter, std::move(slot));
 }
 
+template <typename Return, typename Operation, typename Success>
+[[gnu::always_inline]] Return with_file(int fd, Return failure_value,
+                                        Operation &&operation,
+                                        Success &&success) {
+  auto &adapter = state();
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return failure_value;
+  }
+  auto result = std::forward<Operation>(operation)(*lease);
+  if (!result) {
+    return fail(result.error(), failure_value);
+  }
+  if constexpr (requires { std::move(result).value(); }) {
+    return std::forward<Success>(success)(std::move(result).value());
+  } else {
+    return std::forward<Success>(success)();
+  }
+}
+
+[[gnu::always_inline]] ssize_t posix_count(std::size_t value) noexcept {
+  if (value > static_cast<std::size_t>(SSIZE_MAX)) {
+    return fail(EOVERFLOW, static_cast<ssize_t>(-1));
+  }
+  return static_cast<ssize_t>(value);
+}
+
 std::optional<DirectoryLease>
 acquire_directory(AdapterState &adapter, DIR *directory) noexcept {
   OwnerLease lifecycle_lock(adapter.lifecycle_owner);
@@ -1062,21 +1089,14 @@ extern "C" ssize_t orchfs_async_read(int fd, void *buffer, size_t length) {
   if (!buffer && length != 0) {
     return fail(EFAULT, static_cast<ssize_t>(-1));
   }
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result = run(
-      lease->epoch(),
-      lease->slot().file.read({static_cast<std::byte *>(buffer), length}));
-  if (!result) {
-    return fail(result.error(), static_cast<ssize_t>(-1));
-  }
-  if (result.value() > static_cast<std::size_t>(SSIZE_MAX)) {
-    return fail(EOVERFLOW, static_cast<ssize_t>(-1));
-  }
-  return static_cast<ssize_t>(result.value());
+  return with_file(
+      fd, static_cast<ssize_t>(-1),
+      [buffer, length](FileLease &lease) {
+        return run(lease.epoch(), lease.slot().file.read(
+                                      {static_cast<std::byte *>(buffer),
+                                       length}));
+      },
+      posix_count);
 }
 
 extern "C" ssize_t orchfs_async_write(int fd, const void *buffer,
@@ -1084,21 +1104,14 @@ extern "C" ssize_t orchfs_async_write(int fd, const void *buffer,
   if (!buffer && length != 0) {
     return fail(EFAULT, static_cast<ssize_t>(-1));
   }
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result =
-      run(lease->epoch(), lease->slot().file.write(
-                              {static_cast<const std::byte *>(buffer), length}));
-  if (!result) {
-    return fail(result.error(), static_cast<ssize_t>(-1));
-  }
-  if (result.value() > static_cast<std::size_t>(SSIZE_MAX)) {
-    return fail(EOVERFLOW, static_cast<ssize_t>(-1));
-  }
-  return static_cast<ssize_t>(result.value());
+  return with_file(
+      fd, static_cast<ssize_t>(-1),
+      [buffer, length](FileLease &lease) {
+        return run(lease.epoch(), lease.slot().file.write(
+                                      {static_cast<const std::byte *>(buffer),
+                                       length}));
+      },
+      posix_count);
 }
 
 extern "C" ssize_t orchfs_async_pread(int fd, void *buffer, size_t length,
@@ -1107,21 +1120,14 @@ extern "C" ssize_t orchfs_async_pread(int fd, void *buffer, size_t length,
     return fail(!buffer && length != 0 ? EFAULT : EINVAL,
                 static_cast<ssize_t>(-1));
   }
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result = lease->slot().file.read_at_blocking(
-      static_cast<std::uint64_t>(offset),
-      {static_cast<std::byte *>(buffer), length});
-  if (!result) {
-    return fail(result.error(), static_cast<ssize_t>(-1));
-  }
-  if (result.value() > static_cast<std::size_t>(SSIZE_MAX)) {
-    return fail(EOVERFLOW, static_cast<ssize_t>(-1));
-  }
-  return static_cast<ssize_t>(result.value());
+  return with_file(
+      fd, static_cast<ssize_t>(-1),
+      [buffer, length, offset](FileLease &lease) {
+        return lease.slot().file.read_at_blocking(
+            static_cast<std::uint64_t>(offset),
+            {static_cast<std::byte *>(buffer), length});
+      },
+      posix_count);
 }
 
 extern "C" ssize_t orchfs_async_pwrite(int fd, const void *buffer,
@@ -1130,55 +1136,44 @@ extern "C" ssize_t orchfs_async_pwrite(int fd, const void *buffer,
     return fail(!buffer && length != 0 ? EFAULT : EINVAL,
                 static_cast<ssize_t>(-1));
   }
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result = lease->slot().file.write_at_blocking(
-      static_cast<std::uint64_t>(offset),
-      {static_cast<const std::byte *>(buffer), length});
-  if (!result) {
-    return fail(result.error(), static_cast<ssize_t>(-1));
-  }
-  if (result.value() > static_cast<std::size_t>(SSIZE_MAX)) {
-    return fail(EOVERFLOW, static_cast<ssize_t>(-1));
-  }
-  return static_cast<ssize_t>(result.value());
+  return with_file(
+      fd, static_cast<ssize_t>(-1),
+      [buffer, length, offset](FileLease &lease) {
+        return lease.slot().file.write_at_blocking(
+            static_cast<std::uint64_t>(offset),
+            {static_cast<const std::byte *>(buffer), length});
+      },
+      posix_count);
 }
 
 extern "C" off_t orchfs_async_lseek(int fd, off_t offset, int whence) {
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result = run(lease->epoch(), lease->slot().file.seek(offset, whence));
-  if (!result) {
-    return fail(result.error(), static_cast<off_t>(-1));
-  }
-  if (result.value() >
-      static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
-    return fail(EOVERFLOW, static_cast<off_t>(-1));
-  }
-  return static_cast<off_t>(result.value());
+  return with_file(
+      fd, static_cast<off_t>(-1),
+      [offset, whence](FileLease &lease) {
+        return run(lease.epoch(), lease.slot().file.seek(offset, whence));
+      },
+      [](std::uint64_t value) {
+        if (value > static_cast<std::uint64_t>(
+                        std::numeric_limits<off_t>::max())) {
+          return fail(EOVERFLOW, static_cast<off_t>(-1));
+        }
+        return static_cast<off_t>(value);
+      });
 }
 
 extern "C" int orchfs_async_fstat(int fd, struct stat *stat_buffer) {
   if (!stat_buffer) {
     return fail(EFAULT, -1);
   }
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result = run(lease->epoch(), lease->slot().file.stat());
-  if (!result) {
-    return fail(result.error(), -1);
-  }
-  populate_stat(result.value(), *stat_buffer);
-  return 0;
+  return with_file(
+      fd, -1,
+      [](FileLease &lease) {
+        return run(lease.epoch(), lease.slot().file.stat());
+      },
+      [stat_buffer](const FileStat &value) {
+        populate_stat(value, *stat_buffer);
+        return 0;
+      });
 }
 
 extern "C" int orchfs_async_stat(const char *path, struct stat *stat_buffer) {
@@ -1202,17 +1197,15 @@ extern "C" int orchfs_async_fstatfs(int fd, struct statfs *stat_buffer) {
   if (!stat_buffer) {
     return fail(EFAULT, -1);
   }
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result = run(lease->epoch(), lease->slot().file.statfs());
-  if (!result) {
-    return fail(result.error(), -1);
-  }
-  populate_statfs(result.value(), *stat_buffer);
-  return 0;
+  return with_file(
+      fd, -1,
+      [](FileLease &lease) {
+        return run(lease.epoch(), lease.slot().file.statfs());
+      },
+      [stat_buffer](const FileSystemStat &value) {
+        populate_statfs(value, *stat_buffer);
+        return 0;
+      });
 }
 
 extern "C" int orchfs_async_statfs(const char *path,
@@ -1260,25 +1253,22 @@ extern "C" int orchfs_async_ftruncate(int fd, off_t length) {
   if (length < 0) {
     return fail(EINVAL, -1);
   }
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result = run(
-      lease->epoch(),
-      lease->slot().file.truncate(static_cast<std::uint64_t>(length)));
-  return result ? 0 : fail(result.error(), -1);
+  return with_file(
+      fd, -1,
+      [length](FileLease &lease) {
+        return run(lease.epoch(), lease.slot().file.truncate(
+                                      static_cast<std::uint64_t>(length)));
+      },
+      [] { return 0; });
 }
 
 extern "C" int orchfs_async_fsync(int fd) {
-  auto &adapter = state();
-  auto lease = acquire_file(adapter, fd);
-  if (!lease) {
-    return -1;
-  }
-  auto result = run(lease->epoch(), lease->slot().file.sync());
-  return result ? 0 : fail(result.error(), -1);
+  return with_file(
+      fd, -1,
+      [](FileLease &lease) {
+        return run(lease.epoch(), lease.slot().file.sync());
+      },
+      [] { return 0; });
 }
 
 extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
