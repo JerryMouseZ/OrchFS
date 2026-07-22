@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "orchfs/async/filesystem.hpp"
+#include "orchfs/async/ipc_protocol.hpp"
 #include "orchfs/async/result.hpp"
 #include "orchfs/async/range_arbiter.hpp"
 #include "orchfs/async/rpc_protocol.hpp"
@@ -66,6 +67,9 @@ class Client {
 
  private:
   explicit Client(std::shared_ptr<Session> session) noexcept;
+  Task<Result<void>> path_mutation(Opcode opcode, RpcRequest request,
+                                   std::string path1,
+                                   std::string path2 = {});
   std::shared_ptr<Session> session_;
 
   friend class File;

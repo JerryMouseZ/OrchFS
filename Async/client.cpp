@@ -1213,81 +1213,50 @@ Task<Result<FileStat>> Client::stat(std::string path) {
   co_return Result<FileStat>::success(from_wire(decoded.value()));
 }
 
-Task<Result<void>> Client::make_directory(std::string path,
-                                          std::uint32_t mode) {
+Task<Result<void>> Client::path_mutation(Opcode opcode, RpcRequest request,
+                                         std::string path1,
+                                         std::string path2) {
   if (!session_) {
     co_return Result<void>::failure(Errc::invalid_handle);
   }
-  RpcRequest request;
-  request.mode = mode;
   auto reply = co_await session_->rpc(
-      Opcode::mkdir, make_request(session_->max_payload(), request, path));
+      opcode, make_request(session_->max_payload(), request, path1, path2));
   if (!reply) {
     co_return Result<void>::failure(reply.error());
   }
   const auto error = status_error(reply.value().descriptor.status);
   co_return error ? Result<void>::failure(error) : Result<void>::success();
+}
+
+Task<Result<void>> Client::make_directory(std::string path,
+                                          std::uint32_t mode) {
+  RpcRequest request;
+  request.mode = mode;
+  return path_mutation(Opcode::mkdir, request, std::move(path));
 }
 
 Task<Result<void>> Client::remove_directory(std::string path) {
-  if (!session_) {
-    co_return Result<void>::failure(Errc::invalid_handle);
-  }
   RpcRequest request;
-  auto reply = co_await session_->rpc(
-      Opcode::rmdir, make_request(session_->max_payload(), request, path));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
-  co_return error ? Result<void>::failure(error) : Result<void>::success();
+  return path_mutation(Opcode::rmdir, request, std::move(path));
 }
 
 Task<Result<void>> Client::unlink(std::string path) {
-  if (!session_) {
-    co_return Result<void>::failure(Errc::invalid_handle);
-  }
   RpcRequest request;
-  auto reply = co_await session_->rpc(
-      Opcode::unlink, make_request(session_->max_payload(), request, path));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
-  co_return error ? Result<void>::failure(error) : Result<void>::success();
+  return path_mutation(Opcode::unlink, request, std::move(path));
 }
 
 Task<Result<void>> Client::rename(std::string old_path,
                                   std::string new_path) {
-  if (!session_) {
-    co_return Result<void>::failure(Errc::invalid_handle);
-  }
   RpcRequest request;
-  auto reply = co_await session_->rpc(
-      Opcode::rename,
-      make_request(session_->max_payload(), request, old_path, new_path));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
-  co_return error ? Result<void>::failure(error) : Result<void>::success();
+  return path_mutation(Opcode::rename, request, std::move(old_path),
+                       std::move(new_path));
 }
 
 Task<Result<void>> Client::truncate(std::string path,
                                     std::uint64_t size) {
-  if (!session_) {
-    co_return Result<void>::failure(Errc::invalid_handle);
-  }
   RpcRequest request;
   request.length = size;
-  auto reply = co_await session_->rpc(
-      Opcode::truncate_path,
-      make_request(session_->max_payload(), request, path));
-  if (!reply) {
-    co_return Result<void>::failure(reply.error());
-  }
-  const auto error = status_error(reply.value().descriptor.status);
-  co_return error ? Result<void>::failure(error) : Result<void>::success();
+  return path_mutation(Opcode::truncate_path, request, std::move(path));
 }
 
 Task<Result<void>> Client::shutdown() {
