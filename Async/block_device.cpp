@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -91,125 +92,35 @@ void append_merged_request(BatchRequestList& requests,
     requests.push_back(request);
 }
 
-class DeviceAwaiter final {
-public:
-    enum class SubmissionState : std::uint8_t {
-        submitting,
-        suspended,
-        completed,
-    };
-
-    DeviceAwaiter(Runtime& runtime, Operation operation, std::uint64_t offset,
-                  void* buffer, std::size_t length) noexcept
-        : runtime_(&runtime), operation_(operation), offset_(offset),
-          buffer_(buffer), length_(length) {}
-
-    [[nodiscard]] bool await_ready() const noexcept { return false; }
-
-    [[nodiscard]] bool await_suspend(
-        std::coroutine_handle<> continuation) noexcept {
-        if (Runtime::current() != runtime_ ||
-            Runtime::current_worker() == detail::no_worker) {
-            error_ = make_error_code(Errc::not_in_runtime);
-            return false;
-        }
-        constexpr auto max_offset = static_cast<std::uint64_t>(
-            std::numeric_limits<std::int64_t>::max());
-        if (offset_ > max_offset ||
-            length_ > static_cast<std::size_t>(max_offset - offset_)) {
-            error_ = std::make_error_code(std::errc::value_too_large);
-            return false;
-        }
-
-        continuation_ = continuation;
-        worker_ = Runtime::current_worker();
-        int error = 0;
-        switch (operation_) {
-        case Operation::read:
-            error = submit_read_data_from_devs(
-                buffer_, static_cast<std::int64_t>(length_),
-                static_cast<std::int64_t>(offset_), &complete, this);
-            break;
-        case Operation::write:
-            error = submit_write_data_to_devs(
-                buffer_, static_cast<std::int64_t>(length_),
-                static_cast<std::int64_t>(offset_), &complete, this);
-            break;
-        case Operation::flush:
-            error = submit_device_sync(&complete, this);
-            break;
-        }
-        if (error != 0) {
-            error_ = detail::errno_error<false>(error);
-            continuation_ = {};
-            return false;
-        }
-        const auto previous = submission_state_.exchange(
-            SubmissionState::suspended, std::memory_order_acq_rel);
-        if (previous == SubmissionState::completed) {
-            continuation_ = {};
-            return false;
-        }
-        if (previous != SubmissionState::submitting) {
-            std::terminate();
-        }
-        return true;
-    }
-
-    [[nodiscard]] Result<std::size_t> await_resume() const noexcept {
-        if (error_) {
-            return Result<std::size_t>::failure(error_);
-        }
-        return Result<std::size_t>::success(bytes_);
-    }
-
-private:
-    static void complete(void* context, int error_number,
-                         std::size_t bytes) noexcept {
-        auto& awaiter = *static_cast<DeviceAwaiter*>(context);
-        if (error_number == 0 && bytes != awaiter.length_) {
-            error_number = EIO;
-        }
-        if (error_number != 0) {
-            awaiter.error_ = detail::errno_error<false>(error_number);
-        }
-        awaiter.bytes_ = bytes;
-        const auto previous = awaiter.submission_state_.exchange(
-            SubmissionState::completed, std::memory_order_acq_rel);
-        if (previous == SubmissionState::submitting) {
-            return;
-        }
-        if (previous != SubmissionState::suspended) {
-            std::terminate();
-        }
-        const auto continuation =
-            std::exchange(awaiter.continuation_, std::coroutine_handle<>{});
-        if (!continuation ||
-            !awaiter.runtime_->schedule(continuation, awaiter.worker_)) {
-            std::terminate();
-        }
-    }
-
-    Runtime* runtime_;
-    Operation operation_;
-    std::uint64_t offset_{};
-    void* buffer_{};
-    std::size_t length_{};
-    std::size_t worker_{detail::no_worker};
-    std::coroutine_handle<> continuation_{};
-    std::error_code error_;
-    std::size_t bytes_{};
-    std::atomic<SubmissionState> submission_state_{
-        SubmissionState::submitting};
-};
-
+template <bool kBatch>
 class BatchDeviceAwaiter;
 
 struct BatchCompletion {
-    BatchDeviceAwaiter* awaiter{};
+    BatchDeviceAwaiter<true>* awaiter{};
     std::size_t expected{};
 };
 
+struct SingleRequestStorage {
+    BatchRequest request;
+};
+
+struct BatchRequestStorage {
+    std::span<const BatchRequest> requests;
+    std::span<BatchCompletion> completions;
+};
+
+struct SingleCompletionState {
+    std::error_code error;
+    std::size_t bytes{};
+};
+
+struct BatchCompletionState {
+    std::atomic<std::size_t> outstanding{1};
+    std::atomic<std::size_t> bytes{0};
+    std::atomic<int> error{0};
+};
+
+template <bool kBatch>
 class BatchDeviceAwaiter final {
 public:
     enum class SubmissionState : std::uint8_t {
@@ -219,21 +130,36 @@ public:
     };
 
     BatchDeviceAwaiter(Runtime& runtime, Operation operation,
+                       BatchRequest request) noexcept
+        requires (!kBatch)
+        : runtime_(&runtime), operation_(operation),
+          requests_{.request = request} {}
+
+    BatchDeviceAwaiter(Runtime& runtime, Operation operation,
                        std::span<const BatchRequest> requests,
                        std::span<BatchCompletion> completions) noexcept
-        : runtime_(&runtime), operation_(operation), requests_(requests),
-          completions_(completions) {}
+        requires kBatch
+        : runtime_(&runtime), operation_(operation),
+          requests_{.requests = requests, .completions = completions} {}
 
     [[nodiscard]] bool await_ready() const noexcept {
-        return requests_.empty();
+        if constexpr (kBatch) {
+            return requests_.requests.empty();
+        }
+        return false;
     }
 
     [[nodiscard]] bool await_suspend(
         std::coroutine_handle<> continuation) noexcept {
         if (Runtime::current() != runtime_ ||
             Runtime::current_worker() == detail::no_worker) {
-            error_.store(make_error_code(Errc::not_in_runtime).value(),
-                         std::memory_order_relaxed);
+            if constexpr (kBatch) {
+                completion_.error.store(
+                    make_error_code(Errc::not_in_runtime).value(),
+                    std::memory_order_relaxed);
+            } else {
+                completion_.error = make_error_code(Errc::not_in_runtime);
+            }
             return false;
         }
         continuation_ = continuation;
@@ -241,50 +167,65 @@ public:
         constexpr auto max_offset = static_cast<std::uint64_t>(
             std::numeric_limits<std::int64_t>::max());
 
-        if (completions_.size() != requests_.size()) {
-            record_error(EINVAL);
-            continuation_ = {};
-            return false;
-        }
-
-        for (std::size_t index = 0; index < requests_.size(); ++index) {
-            const auto& request = requests_[index];
-            if ((request.buffer == nullptr && request.length != 0) ||
-                request.offset > max_offset ||
-                request.length >
-                    static_cast<std::size_t>(max_offset - request.offset)) {
+        if constexpr (kBatch) {
+            if (requests_.completions.size() != requests_.requests.size()) {
                 record_error(EINVAL);
-                break;
+                continuation_ = {};
+                return false;
             }
-            completions_[index] = BatchCompletion{
-                .awaiter = this,
-                .expected = request.length,
-            };
-            outstanding_.fetch_add(1, std::memory_order_relaxed);
-            const int submitted = operation_ == Operation::read
-                ? submit_read_data_from_devs(
-                      request.buffer, static_cast<std::int64_t>(request.length),
-                      static_cast<std::int64_t>(request.offset), &complete,
-                      &completions_[index])
-                : submit_write_data_to_devs(
-                      request.buffer, static_cast<std::int64_t>(request.length),
-                      static_cast<std::int64_t>(request.offset), &complete,
-                      &completions_[index]);
+            for (std::size_t index = 0; index < requests_.requests.size();
+                 ++index) {
+                const auto& request = requests_.requests[index];
+                if ((request.buffer == nullptr && request.length != 0) ||
+                    request.offset > max_offset ||
+                    request.length > static_cast<std::size_t>(
+                                         max_offset - request.offset)) {
+                    record_error(EINVAL);
+                    break;
+                }
+                requests_.completions[index] = BatchCompletion{
+                    .awaiter = this,
+                    .expected = request.length,
+                };
+                completion_.outstanding.fetch_add(
+                    1, std::memory_order_relaxed);
+                const int submitted = submit(
+                    request, &requests_.completions[index]);
+                if (submitted != 0) {
+                    completion_.outstanding.fetch_sub(
+                        1, std::memory_order_relaxed);
+                    record_error(submitted);
+                    break;
+                }
+            }
+
+            // Drop the submission sentinel after every request that reached
+            // the device has installed its callback.
+            if (completion_.outstanding.fetch_sub(
+                    1, std::memory_order_acq_rel) == 1) {
+                submission_state_.store(SubmissionState::completed,
+                                        std::memory_order_release);
+                continuation_ = {};
+                return false;
+            }
+        } else {
+            const auto& request = requests_.request;
+            if (request.offset > max_offset ||
+                request.length > static_cast<std::size_t>(
+                                     max_offset - request.offset)) {
+                completion_.error =
+                    std::make_error_code(std::errc::value_too_large);
+                continuation_ = {};
+                return false;
+            }
+            const int submitted = submit(request, this);
             if (submitted != 0) {
-                outstanding_.fetch_sub(1, std::memory_order_relaxed);
-                record_error(submitted);
-                break;
+                completion_.error = detail::errno_error<false>(submitted);
+                continuation_ = {};
+                return false;
             }
         }
 
-        // Drop the submission sentinel after every request that reached the
-        // device has installed its callback.
-        if (outstanding_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            submission_state_.store(SubmissionState::completed,
-                                    std::memory_order_release);
-            continuation_ = {};
-            return false;
-        }
         const auto previous = submission_state_.exchange(
             SubmissionState::suspended, std::memory_order_acq_rel);
         if (previous == SubmissionState::completed) {
@@ -298,40 +239,90 @@ public:
     }
 
     [[nodiscard]] Result<std::size_t> await_resume() const noexcept {
-        const int error = error_.load(std::memory_order_acquire);
-        if (error != 0) {
-            return Result<std::size_t>::failure(
-                detail::errno_error<false>(error));
+        if constexpr (kBatch) {
+            const int error =
+                completion_.error.load(std::memory_order_acquire);
+            if (error != 0) {
+                return Result<std::size_t>::failure(
+                    detail::errno_error<false>(error));
+            }
+            return Result<std::size_t>::success(
+                completion_.bytes.load(std::memory_order_acquire));
+        } else {
+            if (completion_.error) {
+                return Result<std::size_t>::failure(completion_.error);
+            }
+            return Result<std::size_t>::success(completion_.bytes);
         }
-        return Result<std::size_t>::success(
-            bytes_.load(std::memory_order_acquire));
     }
 
 private:
+    using RequestStorage = std::conditional_t<
+        kBatch, BatchRequestStorage, SingleRequestStorage>;
+    using CompletionState = std::conditional_t<
+        kBatch, BatchCompletionState, SingleCompletionState>;
+
     void record_error(int error) noexcept {
+        static_assert(kBatch);
         if (error == 0) {
             return;
         }
         int expected = 0;
-        (void)error_.compare_exchange_strong(
+        (void)completion_.error.compare_exchange_strong(
             expected, error, std::memory_order_acq_rel);
+    }
+
+    [[nodiscard, gnu::always_inline]] int submit(
+        const BatchRequest& request, void* context) noexcept {
+        switch (operation_) {
+        case Operation::read:
+            return submit_read_data_from_devs(
+                request.buffer, static_cast<std::int64_t>(request.length),
+                static_cast<std::int64_t>(request.offset), &complete, context);
+        case Operation::write:
+            return submit_write_data_to_devs(
+                request.buffer, static_cast<std::int64_t>(request.length),
+                static_cast<std::int64_t>(request.offset), &complete, context);
+        case Operation::flush:
+            return submit_device_sync(&complete, context);
+        }
+        std::terminate();
     }
 
     static void complete(void* context, int error,
                          std::size_t bytes) noexcept {
-        auto& completion = *static_cast<BatchCompletion*>(context);
-        auto& awaiter = *completion.awaiter;
-        if (error == 0 && bytes != completion.expected) {
+        BatchDeviceAwaiter* awaiter;
+        std::size_t expected;
+        if constexpr (kBatch) {
+            auto& completion = *static_cast<BatchCompletion*>(context);
+            awaiter = completion.awaiter;
+            expected = completion.expected;
+        } else {
+            awaiter = static_cast<BatchDeviceAwaiter*>(context);
+            expected = awaiter->requests_.request.length;
+        }
+        if (error == 0 && bytes != expected) {
             error = EIO;
         }
-        awaiter.record_error(error);
-        if (error == 0) {
-            awaiter.bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        if constexpr (kBatch) {
+            awaiter->record_error(error);
+            if (error == 0) {
+                awaiter->completion_.bytes.fetch_add(
+                    bytes, std::memory_order_relaxed);
+            }
+            if (awaiter->completion_.outstanding.fetch_sub(
+                    1, std::memory_order_acq_rel) != 1) {
+                return;
+            }
+        } else {
+            if (error != 0) {
+                awaiter->completion_.error =
+                    detail::errno_error<false>(error);
+            }
+            awaiter->completion_.bytes = bytes;
         }
-        if (awaiter.outstanding_.fetch_sub(1, std::memory_order_acq_rel) != 1) {
-            return;
-        }
-        const auto previous = awaiter.submission_state_.exchange(
+
+        const auto previous = awaiter->submission_state_.exchange(
             SubmissionState::completed, std::memory_order_acq_rel);
         if (previous == SubmissionState::submitting) {
             return;
@@ -340,101 +331,100 @@ private:
             std::terminate();
         }
         const auto continuation = std::exchange(
-            awaiter.continuation_, std::coroutine_handle<>{});
+            awaiter->continuation_, std::coroutine_handle<>{});
         if (!continuation ||
-            !awaiter.runtime_->schedule(continuation, awaiter.worker_)) {
+            !awaiter->runtime_->schedule(continuation, awaiter->worker_)) {
             std::terminate();
         }
     }
 
     Runtime* runtime_;
     Operation operation_;
-    std::span<const BatchRequest> requests_;
-    std::span<BatchCompletion> completions_;
+    RequestStorage requests_;
     std::size_t worker_{detail::no_worker};
     std::coroutine_handle<> continuation_{};
-    std::atomic<std::size_t> outstanding_{1};
-    std::atomic<std::size_t> bytes_{0};
-    std::atomic<int> error_{0};
+    CompletionState completion_;
     std::atomic<SubmissionState> submission_state_{
         SubmissionState::submitting};
 };
+
+template <Operation operation, typename Request>
+Task<Result<std::size_t>> submit_batch(
+    Runtime& runtime, std::span<const Request> requests) {
+    static_assert(operation == Operation::read ||
+                  operation == Operation::write);
+    static_assert((operation == Operation::read &&
+                   std::is_same_v<Request, BlockRead>) ||
+                  (operation == Operation::write &&
+                   std::is_same_v<Request, BlockWrite>));
+
+    std::optional<BatchRequestList> native;
+    std::array<BatchCompletion, kInlineBatchRequests> inline_completions{};
+    std::vector<BatchCompletion> completions;
+    try {
+        native.emplace(requests.size());
+        for (const auto& request : requests) {
+            if constexpr (operation == Operation::read) {
+                append_merged_request(*native, BatchRequest{
+                    .offset = request.offset,
+                    .buffer = request.destination.data(),
+                    .length = request.destination.size(),
+                });
+            } else {
+                append_merged_request(*native, BatchRequest{
+                    .offset = request.offset,
+                    .buffer = const_cast<std::byte*>(request.source.data()),
+                    .length = request.source.size(),
+                });
+            }
+        }
+        if (native->size() > inline_completions.size()) {
+            completions.resize(native->size());
+        }
+    } catch (const std::bad_alloc&) {
+        co_return Result<std::size_t>::failure(
+            std::make_error_code(std::errc::not_enough_memory));
+    }
+    const auto completion_span = native->size() <= inline_completions.size()
+        ? std::span<BatchCompletion>(inline_completions.data(), native->size())
+        : std::span<BatchCompletion>(completions);
+    co_return co_await BatchDeviceAwaiter<true>(
+        runtime, operation, native->span(), completion_span);
+}
 
 } // namespace
 
 Task<Result<std::size_t>> AsyncBlockDevice::read(
     std::uint64_t offset, std::span<std::byte> destination) const {
-    co_return co_await DeviceAwaiter(
-        *runtime_, Operation::read, offset, destination.data(),
-        destination.size());
+    co_return co_await BatchDeviceAwaiter<false>(
+        *runtime_, Operation::read,
+        BatchRequest{.offset = offset,
+                     .buffer = destination.data(),
+                     .length = destination.size()});
 }
 
 Task<Result<std::size_t>> AsyncBlockDevice::write(
     std::uint64_t offset, std::span<const std::byte> source) const {
-    co_return co_await DeviceAwaiter(
-        *runtime_, Operation::write, offset, const_cast<std::byte*>(source.data()),
-        source.size());
+    co_return co_await BatchDeviceAwaiter<false>(
+        *runtime_, Operation::write,
+        BatchRequest{.offset = offset,
+                     .buffer = const_cast<std::byte*>(source.data()),
+                     .length = source.size()});
 }
 
 Task<Result<std::size_t>> AsyncBlockDevice::read_batch(
     std::span<const BlockRead> requests) const {
-    std::optional<BatchRequestList> native;
-    std::array<BatchCompletion, kInlineBatchRequests> inline_completions{};
-    std::vector<BatchCompletion> completions;
-    try {
-        native.emplace(requests.size());
-        for (const auto& request : requests) {
-            append_merged_request(*native, BatchRequest{
-                .offset = request.offset,
-                .buffer = request.destination.data(),
-                .length = request.destination.size(),
-            });
-        }
-        if (native->size() > inline_completions.size()) {
-            completions.resize(native->size());
-        }
-    } catch (const std::bad_alloc&) {
-        co_return Result<std::size_t>::failure(
-            std::make_error_code(std::errc::not_enough_memory));
-    }
-    const auto completion_span = native->size() <= inline_completions.size()
-        ? std::span<BatchCompletion>(inline_completions.data(), native->size())
-        : std::span<BatchCompletion>(completions);
-    co_return co_await BatchDeviceAwaiter(
-        *runtime_, Operation::read, native->span(), completion_span);
+    return submit_batch<Operation::read>(*runtime_, requests);
 }
 
 Task<Result<std::size_t>> AsyncBlockDevice::write_batch(
     std::span<const BlockWrite> requests) const {
-    std::optional<BatchRequestList> native;
-    std::array<BatchCompletion, kInlineBatchRequests> inline_completions{};
-    std::vector<BatchCompletion> completions;
-    try {
-        native.emplace(requests.size());
-        for (const auto& request : requests) {
-            append_merged_request(*native, BatchRequest{
-                .offset = request.offset,
-                .buffer = const_cast<std::byte*>(request.source.data()),
-                .length = request.source.size(),
-            });
-        }
-        if (native->size() > inline_completions.size()) {
-            completions.resize(native->size());
-        }
-    } catch (const std::bad_alloc&) {
-        co_return Result<std::size_t>::failure(
-            std::make_error_code(std::errc::not_enough_memory));
-    }
-    const auto completion_span = native->size() <= inline_completions.size()
-        ? std::span<BatchCompletion>(inline_completions.data(), native->size())
-        : std::span<BatchCompletion>(completions);
-    co_return co_await BatchDeviceAwaiter(
-        *runtime_, Operation::write, native->span(), completion_span);
+    return submit_batch<Operation::write>(*runtime_, requests);
 }
 
 Task<Result<void>> AsyncBlockDevice::flush() const {
-    auto flushed = co_await DeviceAwaiter(*runtime_, Operation::flush, 0,
-                                          nullptr, 0);
+    auto flushed = co_await BatchDeviceAwaiter<false>(
+        *runtime_, Operation::flush, BatchRequest{});
     if (!flushed) {
         co_return Result<void>::failure(flushed.error());
     }
