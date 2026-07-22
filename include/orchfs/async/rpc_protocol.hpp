@@ -1,9 +1,16 @@
 #pragma once
 
+#include "orchfs/async/result.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <span>
+#include <system_error>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace orchfs::async {
 
@@ -101,5 +108,51 @@ static_assert(std::is_trivially_copyable_v<RpcResponse>);
 static_assert(std::is_trivially_copyable_v<RpcFileStat>);
 static_assert(std::is_trivially_copyable_v<RpcStatFs>);
 static_assert(std::is_trivially_copyable_v<RpcDirEntry>);
+
+namespace detail {
+
+template <typename T>
+[[gnu::always_inline]] inline void append_object(
+    std::vector<std::byte>& bytes, const T& value) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  const auto old_size = bytes.size();
+  bytes.resize(old_size + sizeof(T));
+  std::memcpy(bytes.data() + old_size, &value, sizeof(T));
+}
+
+[[gnu::always_inline]] inline void append_bytes(std::vector<std::byte>& bytes,
+                                                const void* data,
+                                                std::size_t size) {
+  if (size == 0) {
+    return;
+  }
+  const auto old_size = bytes.size();
+  bytes.resize(old_size + size);
+  std::memcpy(bytes.data() + old_size, data, size);
+}
+
+template <typename T>
+[[nodiscard, gnu::always_inline]] inline Result<T>
+decode_object(std::span<const std::byte> bytes) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  if (bytes.size() != sizeof(T)) {
+    return Result<T>::failure(
+        std::make_error_code(std::errc::protocol_error));
+  }
+  T value{};
+  std::memcpy(&value, bytes.data(), sizeof(T));
+  return Result<T>::success(std::move(value));
+}
+
+template <typename T>
+[[nodiscard, gnu::always_inline]] inline std::vector<std::byte>
+encode_object(const T& value) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  std::vector<std::byte> bytes(sizeof(T));
+  std::memcpy(bytes.data(), &value, sizeof(T));
+  return bytes;
+}
+
+}  // namespace detail
 
 }  // namespace orchfs::async

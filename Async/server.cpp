@@ -24,7 +24,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -202,14 +201,6 @@ RpcStatFs to_wire(const FileSystemStat& value) noexcept {
       .fragment_size = value.fragment_size,
       .flags = value.flags,
   };
-}
-
-template <typename T>
-std::vector<std::byte> encode_object(const T& value) {
-  static_assert(std::is_trivially_copyable_v<T>);
-  std::vector<std::byte> bytes(sizeof(T));
-  std::memcpy(bytes.data(), &value, sizeof(T));
-  return bytes;
 }
 
 struct Completion {
@@ -1132,7 +1123,7 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
     if (!stated) {
       fail(completion, error_number(stated.error()));
     } else {
-      completion.payload = encode_object(to_wire(stated.value()));
+      completion.payload = detail::encode_object(to_wire(stated.value()));
       completion.descriptor.result_length = completion.payload.size();
     }
     co_return completion;
@@ -1156,7 +1147,7 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
     if (!stated) {
       fail(completion, error_number(stated.error()));
     } else {
-      completion.payload = encode_object(to_wire(stated.value()));
+      completion.payload = detail::encode_object(to_wire(stated.value()));
       completion.descriptor.result_length = completion.payload.size();
     }
     auto released = co_await permit.release();
@@ -1184,7 +1175,7 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
     if (!stated) {
       fail(completion, error_number(stated.error()));
     } else {
-      completion.payload = encode_object(to_wire(stated.value()));
+      completion.payload = detail::encode_object(to_wire(stated.value()));
       completion.descriptor.result_length = completion.payload.size();
     }
     auto released = co_await permit.release();

@@ -29,24 +29,6 @@ struct RpcReply {
   std::size_t payload_size{};
 };
 
-template <typename T>
-void append_object(std::vector<std::byte>& bytes, const T& value) {
-  static_assert(std::is_trivially_copyable_v<T>);
-  const auto old_size = bytes.size();
-  bytes.resize(old_size + sizeof(T));
-  std::memcpy(bytes.data() + old_size, &value, sizeof(T));
-}
-
-void append_bytes(std::vector<std::byte>& bytes, const void* data,
-                  std::size_t size) {
-  if (size == 0) {
-    return;
-  }
-  const auto old_size = bytes.size();
-  bytes.resize(old_size + size);
-  std::memcpy(bytes.data() + old_size, data, size);
-}
-
 Result<std::vector<std::byte>> make_request(
     std::size_t wire_size_limit, const RpcRequest& request,
     std::string_view path1 = {}, std::string_view path2 = {},
@@ -75,10 +57,10 @@ Result<std::vector<std::byte>> make_request(
 
   std::vector<std::byte> bytes;
   bytes.reserve(wire_size);
-  append_object(bytes, wire);
-  append_bytes(bytes, path1.data(), path1.size());
-  append_bytes(bytes, path2.data(), path2.size());
-  append_bytes(bytes, data.data(), data.size());
+  detail::append_object(bytes, wire);
+  detail::append_bytes(bytes, path1.data(), path1.size());
+  detail::append_bytes(bytes, path2.data(), path2.size());
+  detail::append_bytes(bytes, data.data(), data.size());
   return Result<std::vector<std::byte>>::success(std::move(bytes));
 }
 
@@ -105,16 +87,11 @@ std::error_code positioned_range_error(std::uint64_t offset,
 }
 
 template <typename T>
-Result<T> decode_object(const RpcReply& reply) {
+[[gnu::always_inline]] inline Result<T> decode_reply(const RpcReply& reply) {
   if (auto error = status_error(reply.descriptor.status)) {
     return Result<T>::failure(error);
   }
-  if (reply.payload.size() != sizeof(T)) {
-    return Result<T>::failure(std::make_error_code(std::errc::protocol_error));
-  }
-  T value{};
-  std::memcpy(&value, reply.payload.data(), sizeof(T));
-  return Result<T>::success(std::move(value));
+  return detail::decode_object<T>(reply.payload);
 }
 
 FileStat from_wire(const RpcFileStat& value) noexcept {
@@ -1241,7 +1218,7 @@ Task<Result<FileStat>> Client::stat(std::string path) {
   if (!reply) {
     co_return Result<FileStat>::failure(reply.error());
   }
-  auto decoded = decode_object<RpcFileStat>(reply.value());
+  auto decoded = decode_reply<RpcFileStat>(reply.value());
   if (!decoded) {
     co_return Result<FileStat>::failure(decoded.error());
   }
@@ -1681,7 +1658,7 @@ Task<Result<FileStat>> File::stat() {
   if (!reply) {
     co_return Result<FileStat>::failure(reply.error());
   }
-  auto decoded = decode_object<RpcFileStat>(reply.value());
+  auto decoded = decode_reply<RpcFileStat>(reply.value());
   if (!decoded) {
     co_return Result<FileStat>::failure(decoded.error());
   }
@@ -1699,7 +1676,7 @@ Task<Result<FileSystemStat>> File::statfs() {
   if (!reply) {
     co_return Result<FileSystemStat>::failure(reply.error());
   }
-  auto decoded = decode_object<RpcStatFs>(reply.value());
+  auto decoded = decode_reply<RpcStatFs>(reply.value());
   if (!decoded) {
     co_return Result<FileSystemStat>::failure(decoded.error());
   }
