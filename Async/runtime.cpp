@@ -347,11 +347,10 @@ struct Runtime::Impl {
         static constexpr std::uint64_t kOwnerMask = 1ULL << 63U;
 
         static std::size_t hash(void* coroutine) noexcept {
-            std::uint64_t value = reinterpret_cast<std::uintptr_t>(coroutine);
-            value ^= value >> 33U;
-            value *= 0xff51afd7ed558ccdULL;
-            value ^= value >> 33U;
-            return static_cast<std::size_t>(value) & (kCapacity - 1);
+            const auto value = static_cast<std::uint64_t>(
+                reinterpret_cast<std::uintptr_t>(coroutine));
+            return static_cast<std::size_t>(detail::fmix64<false>(value)) &
+                   (kCapacity - 1);
         }
 
         std::unique_ptr<Slot[]> slots_;
@@ -1083,12 +1082,8 @@ Result<Runtime::PollRegistration> Runtime::register_poller(
 std::size_t Runtime::owner_for(std::uint64_t key) const noexcept {
     // A fixed integer hash avoids depending on an implementation-defined
     // std::hash salt while still spreading sequential inode IDs.
-    key ^= key >> 33U;
-    key *= 0xff51afd7ed558ccdULL;
-    key ^= key >> 33U;
-    key *= 0xc4ceb9fe1a85ec53ULL;
-    key ^= key >> 33U;
-    return static_cast<std::size_t>(key % impl_->workers.size());
+    return static_cast<std::size_t>(
+        detail::fmix64(key) % impl_->workers.size());
 }
 
 RuntimePollerStats Runtime::poller_stats() const noexcept {

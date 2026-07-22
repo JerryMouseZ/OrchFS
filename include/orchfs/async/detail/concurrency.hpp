@@ -1,9 +1,25 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <immintrin.h>
 
 namespace orchfs::async::detail {
+
+// Some fixed-size tables historically use only the first mixing round. The
+// template keeps those indices bit-for-bit stable while sharing the sequence.
+template <bool kComplete = true>
+[[nodiscard, gnu::always_inline]] constexpr std::uint64_t
+fmix64(std::uint64_t value) noexcept {
+    value ^= value >> 33U;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33U;
+    if constexpr (kComplete) {
+        value *= 0xc4ceb9fe1a85ec53ULL;
+        value ^= value >> 33U;
+    }
+    return value;
+}
 
 template <bool kPause = true>
 class AtomicFlagGuard final {

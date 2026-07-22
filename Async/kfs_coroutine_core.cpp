@@ -1,6 +1,7 @@
 #include "orchfs/async/kfs_coroutine_core.hpp"
 
 #include "orchfs/async/block_device.hpp"
+#include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/range_arbiter.hpp"
 #include "orchfs/async/runtime.hpp"
 
@@ -593,11 +594,9 @@ class KfsCoroutineCore::Impl {
   }
 
   static std::size_t extent_cache_index(InodeNumber inode) noexcept {
-    auto key = static_cast<std::uint64_t>(inode);
-    key ^= key >> 33U;
-    key *= 0xff51afd7ed558ccdULL;
-    key ^= key >> 33U;
-    return static_cast<std::size_t>(key) & (kExtentCacheEntries - 1U);
+    const auto key = static_cast<std::uint64_t>(inode);
+    return static_cast<std::size_t>(detail::fmix64<false>(key)) &
+           (kExtentCacheEntries - 1U);
   }
 
   ExtentCacheEntry* find_extent_entry(InodeNumber inode,
