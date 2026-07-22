@@ -110,6 +110,8 @@ add_library(orchfs::spdk_backend ALIAS orchfs_spdk_backend)
 target_compile_features(orchfs_spdk_backend PUBLIC cxx_std_20)
 target_include_directories(orchfs_spdk_backend PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/KernelFS")
+target_include_directories(orchfs_spdk_backend PRIVATE
+  "${ORCHFS_PUBLIC_INCLUDE_DIR}")
 target_link_libraries(orchfs_spdk_backend PUBLIC Threads::Threads)
 
 if(ORCHFS_ENABLE_SPDK)

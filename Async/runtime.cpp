@@ -1,5 +1,7 @@
 #include "orchfs/async/runtime.hpp"
 
+#include "orchfs/async/detail/concurrency.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -41,25 +43,6 @@ struct WorkNode {
     std::atomic<bool> remote_claimed{false};
 };
 
-class AtomicFlagGuard final {
-public:
-    explicit AtomicFlagGuard(std::atomic_flag& flag) noexcept : flag_(&flag) {
-        while (flag_->test_and_set(std::memory_order_acquire)) {
-            _mm_pause();
-        }
-    }
-
-    ~AtomicFlagGuard() {
-        flag_->clear(std::memory_order_release);
-    }
-
-    AtomicFlagGuard(const AtomicFlagGuard&) = delete;
-    AtomicFlagGuard& operator=(const AtomicFlagGuard&) = delete;
-
-private:
-    std::atomic_flag* flag_;
-};
-
 class CoroutineFramePool final {
 public:
     CoroutineFramePool() {
@@ -70,7 +53,7 @@ public:
 
     [[nodiscard]] void* allocate(std::size_t size) {
         {
-            AtomicFlagGuard guard(lock_);
+            detail::AtomicFlagGuard guard(lock_);
             for (std::size_t index = 0; index < buckets_.size(); ++index) {
                 auto& bucket = buckets_[index];
                 if (size > bucket.payload_size || bucket.free_head == nullptr) {
@@ -147,7 +130,7 @@ private:
         if (bucket_index >= buckets_.size()) {
             std::terminate();
         }
-        AtomicFlagGuard guard(lock_);
+        detail::AtomicFlagGuard guard(lock_);
         auto& bucket = buckets_[bucket_index];
         *static_cast<void**>(frame) = bucket.free_head;
         bucket.free_head = frame;
@@ -619,7 +602,7 @@ struct Runtime::Impl {
         auto& deferred = worker.deferred_completed;
         if (!deferred.empty()) {
             {
-                AtomicFlagGuard guard(roots_update);
+                detail::AtomicFlagGuard guard(roots_update);
                 for (auto* completed : deferred) {
                     roots.erase(completed);
                 }
@@ -670,7 +653,7 @@ struct Runtime::Impl {
                 false, std::memory_order_acq_rel)) {
             return;
         }
-        AtomicFlagGuard guard(worker.poller_update);
+        detail::AtomicFlagGuard guard(worker.poller_update);
         const auto* current = worker.pollers.load(std::memory_order_acquire);
         auto& generations = worker.poller_generations;
         generations.erase(
@@ -948,7 +931,7 @@ Result<void> Runtime::submit_root(
     }
 
     try {
-        AtomicFlagGuard guard(impl_->roots_update);
+        detail::AtomicFlagGuard guard(impl_->roots_update);
         const bool inserted = impl_->roots.emplace(state.get(), state).second;
         if (!inserted) {
             std::terminate();
@@ -968,7 +951,7 @@ Result<void> Runtime::submit_root(
 
     if (!schedule_internal(coroutine, worker, 0, false)) {
         {
-            AtomicFlagGuard guard(impl_->roots_update);
+            detail::AtomicFlagGuard guard(impl_->roots_update);
             impl_->roots.erase(state.get());
         }
         impl_->pending_roots.fetch_sub(1, std::memory_order_release);
@@ -1069,7 +1052,7 @@ Result<Runtime::PollRegistration> Runtime::register_poller(
         auto& target = *impl_->workers[worker];
         state->quiescence = target.quiescence;
         {
-            AtomicFlagGuard guard(target.poller_update);
+            detail::AtomicFlagGuard guard(target.poller_update);
             const auto* current = target.pollers.load(std::memory_order_acquire);
             auto updated = std::make_unique<Impl::PollerList>();
             updated->reserve(current->size() + 1);
@@ -1112,7 +1095,7 @@ RuntimePollerStats Runtime::poller_stats() const noexcept {
     RuntimePollerStats stats;
     for (const auto& worker_ptr : impl_->workers) {
         auto& worker = *worker_ptr;
-        AtomicFlagGuard guard(worker.poller_update);
+        detail::AtomicFlagGuard guard(worker.poller_update);
         stats.generations += worker.poller_generations.size();
         const auto* pollers = worker.pollers.load(std::memory_order_acquire);
         for (const auto& poller : *pollers) {

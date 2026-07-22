@@ -1,12 +1,12 @@
 #include "orchfs/async/range_arbiter.hpp"
 
+#include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/runtime.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <deque>
-#include <immintrin.h>
 #include <limits>
 #include <new>
 #include <utility>
@@ -71,9 +71,7 @@ struct RangeState {
 
     [[nodiscard]] std::error_code ensure_owner(Runtime& runtime,
                                                 std::size_t worker) noexcept {
-        while (owner_update.test_and_set(std::memory_order_acquire)) {
-            _mm_pause();
-        }
+        AtomicFlagGuard guard(owner_update);
         std::error_code error;
         if (owner_runtime == nullptr) {
             owner_runtime = &runtime;
@@ -81,14 +79,11 @@ struct RangeState {
         } else if (owner_runtime != &runtime) {
             error = make_error_code(Errc::wrong_runtime);
         }
-        owner_update.clear(std::memory_order_release);
         return error;
     }
 
     [[nodiscard]] std::error_code ensure_poller() noexcept {
-        while (owner_update.test_and_set(std::memory_order_acquire)) {
-            _mm_pause();
-        }
+        AtomicFlagGuard guard(owner_update);
         std::error_code error;
         if (!registration) {
             auto registered = owner_runtime->register_poller(
@@ -99,7 +94,6 @@ struct RangeState {
                 registration = std::move(registered).value();
             }
         }
-        owner_update.clear(std::memory_order_release);
         return error;
     }
 

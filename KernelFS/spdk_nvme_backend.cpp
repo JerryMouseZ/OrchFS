@@ -1,6 +1,8 @@
 #include "spdk_nvme_backend.hpp"
 #include "thread_affinity_guard.hpp"
 
+#include "orchfs/async/detail/concurrency.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -75,22 +77,6 @@ const std::error_category &nvme_status_category() noexcept {
 std::error_code invalid_argument() noexcept {
     return std::make_error_code(std::errc::invalid_argument);
 }
-
-class AtomicFlagGuard final {
-public:
-    explicit AtomicFlagGuard(std::atomic_flag &flag) noexcept : flag_(flag) {
-        while (flag_.test_and_set(std::memory_order_acquire)) {
-        }
-    }
-
-    ~AtomicFlagGuard() { flag_.clear(std::memory_order_release); }
-
-    AtomicFlagGuard(const AtomicFlagGuard &) = delete;
-    AtomicFlagGuard &operator=(const AtomicFlagGuard &) = delete;
-
-private:
-    std::atomic_flag &flag_;
-};
 
 } // namespace
 
@@ -211,7 +197,7 @@ detail::WriteCoordinator::Ticket detail::WriteCoordinator::accept(
         return {};
     }
 
-    AtomicFlagGuard guard(lock_);
+    async::detail::AtomicFlagGuard<false> guard(lock_);
     if (storage.linked) {
         error = invalid_argument();
         return {};
@@ -241,7 +227,7 @@ bool detail::WriteCoordinator::try_grant(Ticket ticket) noexcept {
     if (ticket == nullptr) {
         return false;
     }
-    AtomicFlagGuard guard(lock_);
+    async::detail::AtomicFlagGuard<false> guard(lock_);
     if (!ticket->linked) {
         return false;
     }
@@ -266,7 +252,7 @@ void detail::WriteCoordinator::complete(Ticket ticket) noexcept {
     if (ticket == nullptr) {
         return;
     }
-    AtomicFlagGuard guard(lock_);
+    async::detail::AtomicFlagGuard<false> guard(lock_);
     if (!ticket->linked) {
         return;
     }
@@ -287,12 +273,12 @@ void detail::WriteCoordinator::complete(Ticket ticket) noexcept {
 }
 
 std::uint64_t detail::WriteCoordinator::capture_fence() const noexcept {
-    AtomicFlagGuard guard(lock_);
+    async::detail::AtomicFlagGuard<false> guard(lock_);
     return last_sequence_;
 }
 
 bool detail::WriteCoordinator::fence_ready(std::uint64_t fence) const noexcept {
-    AtomicFlagGuard guard(lock_);
+    async::detail::AtomicFlagGuard<false> guard(lock_);
     for (WriteTicket *ticket = head_; ticket != nullptr; ticket = ticket->next) {
         if (ticket->sequence <= fence) {
             return false;
