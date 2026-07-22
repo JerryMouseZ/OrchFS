@@ -21,6 +21,14 @@ struct ServerOptions {
   std::shared_ptr<AsyncFilesystem> filesystem;
 };
 
+struct ServerSessionStats {
+  std::size_t active{};
+  std::size_t retired{};
+  std::size_t dma_regions{};
+  std::size_t dma_registrations{};
+  std::size_t dma_unregistrations{};
+};
+
 class Server {
  public:
   Server(Server&&) noexcept;
@@ -38,6 +46,7 @@ class Server {
   void request_drain() noexcept;
   void request_stop() noexcept;
   Result<void> join();
+  [[nodiscard]] ServerSessionStats session_stats() const noexcept;
 
  private:
   class Impl;

@@ -87,30 +87,53 @@ public:
   explicit OwnerLease(OwnerGate &gate) noexcept : gate_(&gate) {
     gate_->acquire();
   }
-  ~OwnerLease() { gate_->release(); }
+  ~OwnerLease() {
+    if (gate_) {
+      gate_->release();
+    }
+  }
   OwnerLease(const OwnerLease &) = delete;
   OwnerLease &operator=(const OwnerLease &) = delete;
+  OwnerLease(OwnerLease &&other) noexcept
+      : gate_(std::exchange(other.gate_, nullptr)) {}
 
 private:
   OwnerGate *gate_;
 };
 
+enum class SlotState : std::uint8_t { open, closing, closed };
+
+struct SessionEpoch {
+  SessionEpoch(Runtime &runtime_value, Client client_value,
+               std::uint64_t generation_value) noexcept
+      : runtime(&runtime_value), client(std::move(client_value)),
+        generation(generation_value) {}
+
+  Runtime *runtime;
+  Client client;
+  std::uint64_t generation;
+};
+
 struct FileSlot {
   FileSlot(File value, std::optional<Directory> directory_value,
-           std::string opened_path, int flags)
-      : file(std::move(value)), directory(std::move(directory_value)),
+           std::string opened_path, int flags,
+           std::shared_ptr<SessionEpoch> epoch_value)
+      : epoch(std::move(epoch_value)), file(std::move(value)),
+        directory(std::move(directory_value)),
         directory_checked(directory.has_value()), path(std::move(opened_path)),
         open_flags(flags),
         descriptor_flags((flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0) {}
 
   OwnerGate owner;
+  std::shared_ptr<SessionEpoch> epoch;
+  std::atomic<std::size_t> inflight{0};
   File file;
   std::optional<Directory> directory;
   bool directory_checked{};
   std::string path;
   int open_flags{};
   int descriptor_flags{};
-  bool closed{};
+  SlotState state{SlotState::open};
 };
 
 struct DirectoryToken {
@@ -119,14 +142,17 @@ struct DirectoryToken {
 };
 
 struct DirectorySlot {
-  explicit DirectorySlot(Directory value) : directory(std::move(value)) {}
+  DirectorySlot(Directory value, std::shared_ptr<SessionEpoch> epoch_value)
+      : epoch(std::move(epoch_value)), directory(std::move(value)) {}
 
   OwnerGate owner;
+  std::shared_ptr<SessionEpoch> epoch;
+  std::atomic<std::size_t> inflight{0};
   Directory directory;
   std::array<DirEntry, kDirectoryBatchSize> batch;
   std::size_t cursor{};
   std::size_t count{};
-  bool closed{};
+  SlotState state{SlotState::open};
   struct dirent entry {};
   struct dirent64 entry64 {};
 };
@@ -139,8 +165,12 @@ struct AdapterState {
   pid_t owner_pid{::getpid()};
   OwnerGate lifecycle_owner;
   std::unique_ptr<Runtime> runtime;
-  std::optional<Client> client;
+  std::shared_ptr<SessionEpoch> current_epoch;
+  std::uint64_t next_epoch{1};
   std::error_code initialization_error;
+  bool accepting_calls{true};
+  std::atomic<std::size_t> active_calls{0};
+  std::atomic<std::size_t> peak_active_calls{0};
   std::atomic<bool> ever_connected{false};
 
   std::atomic<std::shared_ptr<const FileTable>> files{
@@ -225,31 +255,151 @@ Return fail(int error, Return failure_value) noexcept {
   return failure_value;
 }
 
-template <typename T>
-Result<T> run(AdapterState &adapter, Task<Result<T>> task) {
-  if (!adapter.runtime) {
-    const auto error = adapter.initialization_error
-                           ? adapter.initialization_error
-                           : std::make_error_code(std::errc::not_connected);
-    return Result<T>::failure(error);
+void begin_active_call(AdapterState &adapter) noexcept {
+  const std::size_t active =
+      adapter.active_calls.fetch_add(1, std::memory_order_acq_rel) + 1;
+  std::size_t peak =
+      adapter.peak_active_calls.load(std::memory_order_relaxed);
+  while (peak < active &&
+         !adapter.peak_active_calls.compare_exchange_weak(
+             peak, active, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
   }
-  auto submitted = adapter.runtime->submit(std::move(task));
-  if (!submitted) {
-    return Result<T>::failure(submitted.error());
-  }
-  auto joined = std::move(submitted).value().join();
-  if (!joined) {
-    return Result<T>::failure(joined.error());
-  }
-  return std::move(joined).value();
 }
 
-bool ready(const AdapterState &adapter) noexcept {
-  return adapter.runtime && adapter.client && adapter.client->valid();
+void finish_active_call(AdapterState &adapter) noexcept {
+  if (adapter.active_calls.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    adapter.active_calls.notify_all();
+  }
+}
+
+void wait_for_active_calls(AdapterState &adapter) noexcept {
+  std::size_t active = adapter.active_calls.load(std::memory_order_acquire);
+  while (active != 0) {
+    adapter.active_calls.wait(active, std::memory_order_relaxed);
+    active = adapter.active_calls.load(std::memory_order_acquire);
+  }
+}
+
+template <typename Slot>
+void finish_slot_call(AdapterState &adapter, Slot &slot) noexcept {
+  if (slot.inflight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    slot.inflight.notify_all();
+  }
+  finish_active_call(adapter);
+}
+
+template <typename Slot>
+void wait_for_slot_calls(Slot &slot) noexcept {
+  std::size_t active = slot.inflight.load(std::memory_order_acquire);
+  while (active != 0) {
+    slot.inflight.wait(active, std::memory_order_relaxed);
+    active = slot.inflight.load(std::memory_order_acquire);
+  }
+}
+
+class EpochLease {
+public:
+  EpochLease(AdapterState &adapter,
+             std::shared_ptr<SessionEpoch> epoch) noexcept
+      : adapter_(&adapter), epoch_(std::move(epoch)) {}
+  ~EpochLease() {
+    if (adapter_) {
+      finish_active_call(*adapter_);
+    }
+  }
+  EpochLease(const EpochLease &) = delete;
+  EpochLease &operator=(const EpochLease &) = delete;
+  EpochLease(EpochLease &&other) noexcept
+      : adapter_(std::exchange(other.adapter_, nullptr)),
+        epoch_(std::move(other.epoch_)) {}
+
+  SessionEpoch &epoch() const noexcept { return *epoch_; }
+  const std::shared_ptr<SessionEpoch> &shared_epoch() const noexcept {
+    return epoch_;
+  }
+
+private:
+  AdapterState *adapter_;
+  std::shared_ptr<SessionEpoch> epoch_;
+};
+
+template <typename Slot>
+class SlotLease {
+public:
+  SlotLease(AdapterState &adapter, std::shared_ptr<Slot> slot) noexcept
+      : adapter_(&adapter), slot_(std::move(slot)), epoch_(slot_->epoch) {}
+  ~SlotLease() {
+    if (adapter_) {
+      finish_slot_call(*adapter_, *slot_);
+    }
+  }
+  SlotLease(const SlotLease &) = delete;
+  SlotLease &operator=(const SlotLease &) = delete;
+  SlotLease(SlotLease &&other) noexcept
+      : adapter_(std::exchange(other.adapter_, nullptr)),
+        slot_(std::move(other.slot_)), epoch_(std::move(other.epoch_)) {}
+
+  Slot &slot() const noexcept { return *slot_; }
+  SessionEpoch &epoch() const noexcept { return *epoch_; }
+  const std::shared_ptr<Slot> &shared_slot() const noexcept { return slot_; }
+  const std::shared_ptr<SessionEpoch> &shared_epoch() const noexcept {
+    return epoch_;
+  }
+
+private:
+  AdapterState *adapter_;
+  std::shared_ptr<Slot> slot_;
+  std::shared_ptr<SessionEpoch> epoch_;
+};
+
+using FileLease = SlotLease<FileSlot>;
+using DirectoryLease = SlotLease<DirectorySlot>;
+
+template <typename T>
+Result<T> run(Runtime &runtime, Task<Result<T>> task) {
+  auto completed = runtime.block_on(std::move(task));
+  if (!completed) {
+    return Result<T>::failure(completed.error());
+  }
+  return std::move(completed).value();
+}
+
+template <typename T>
+Result<T> run(SessionEpoch &epoch, Task<Result<T>> task) {
+  return run(*epoch.runtime, std::move(task));
+}
+
+bool ready_locked(const AdapterState &adapter) noexcept {
+  return adapter.accepting_calls && adapter.runtime && adapter.current_epoch &&
+         adapter.current_epoch->client.valid();
+}
+
+std::error_code unavailable_error_locked(const AdapterState &adapter) noexcept {
+  if (!adapter.accepting_calls) {
+    return orchfs::async::make_error_code(Errc::runtime_stopping);
+  }
+  return adapter.initialization_error
+             ? adapter.initialization_error
+             : std::make_error_code(std::errc::not_connected);
+}
+
+std::optional<EpochLease> acquire_epoch(AdapterState &adapter) noexcept {
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
+  if (!ready_locked(adapter)) {
+    errno = errno_from_error(unavailable_error_locked(adapter));
+    return std::nullopt;
+  }
+  begin_active_call(adapter);
+  return std::optional<EpochLease>(
+      std::in_place, adapter, adapter.current_epoch);
 }
 
 std::size_t configured_worker_count() noexcept {
-  constexpr std::size_t kDefaultWorkerCount = 4;
+  // POSIX callers already provide request concurrency.  One Runtime worker
+  // keeps the SHM lane hot without spending the remaining client CPUs in
+  // duplicate busy-poll loops; deployments can still opt into more workers.
+  constexpr std::size_t kDefaultWorkerCount = 1;
   const char *text = std::getenv("ORCHFS_CLIENT_WORKERS");
   if (!text || !*text) {
     cpu_set_t affinity;
@@ -378,6 +528,58 @@ void erase_directory(AdapterState &adapter, DIR *key,
   }
 }
 
+std::optional<FileLease> acquire_file(AdapterState &adapter, int fd) noexcept {
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
+  if (!adapter.accepting_calls) {
+    errno = ESHUTDOWN;
+    return std::nullopt;
+  }
+  auto slot = find_file(adapter, fd);
+  if (!slot) {
+    errno = EBADF;
+    return std::nullopt;
+  }
+  OwnerLease slot_lock(slot->owner);
+  if (slot->state != SlotState::open) {
+    errno = EBADF;
+    return std::nullopt;
+  }
+  if (!slot->epoch || !slot->epoch->client.valid()) {
+    errno = errno_from_error(unavailable_error_locked(adapter));
+    return std::nullopt;
+  }
+  slot->inflight.fetch_add(1, std::memory_order_acq_rel);
+  begin_active_call(adapter);
+  return std::optional<FileLease>(std::in_place, adapter, std::move(slot));
+}
+
+std::optional<DirectoryLease>
+acquire_directory(AdapterState &adapter, DIR *directory) noexcept {
+  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
+  if (!adapter.accepting_calls) {
+    errno = ESHUTDOWN;
+    return std::nullopt;
+  }
+  auto slot = find_directory(adapter, directory);
+  if (!slot) {
+    errno = EBADF;
+    return std::nullopt;
+  }
+  OwnerLease slot_lock(slot->owner);
+  if (slot->state != SlotState::open) {
+    errno = EBADF;
+    return std::nullopt;
+  }
+  if (!slot->epoch || !slot->epoch->client.valid()) {
+    errno = errno_from_error(unavailable_error_locked(adapter));
+    return std::nullopt;
+  }
+  slot->inflight.fetch_add(1, std::memory_order_acq_rel);
+  begin_active_call(adapter);
+  return std::optional<DirectoryLease>(std::in_place, adapter,
+                                       std::move(slot));
+}
+
 void populate_stat(const FileStat &input, struct stat &output) noexcept {
   std::memset(&output, 0, sizeof(output));
   output.st_dev = static_cast<dev_t>(input.device);
@@ -433,7 +635,7 @@ std::optional<std::string> joined_openat_path(const FileSlot &directory,
   }
 }
 
-std::error_code ensure_directory_handle(AdapterState &adapter, FileSlot &slot) {
+std::error_code ensure_directory_handle(SessionEpoch &epoch, FileSlot &slot) {
   if (slot.directory) {
     return {};
   }
@@ -441,7 +643,7 @@ std::error_code ensure_directory_handle(AdapterState &adapter, FileSlot &slot) {
     return std::make_error_code(std::errc::not_a_directory);
   }
 
-  auto opened = run(adapter, adapter.client->open_directory(slot.file));
+  auto opened = run(epoch, epoch.client.open_directory(slot.file));
   if (opened) {
     slot.directory.emplace(std::move(opened).value());
     slot.directory_checked = true;
@@ -456,50 +658,25 @@ std::error_code ensure_directory_handle(AdapterState &adapter, FileSlot &slot) {
   return opened.error();
 }
 
-std::optional<std::string> path_for_openat(AdapterState &adapter, int dirfd,
+std::optional<std::string> path_for_openat(FileLease &directory,
                                            const char *path) {
   if (!valid_path(path)) {
     errno = path ? ENOENT : EFAULT;
     return std::nullopt;
-  }
-  if (*path == '/' || dirfd == AT_FDCWD) {
-    return std::string(path);
-  }
-  auto directory = find_file(adapter, dirfd);
-  if (!directory) {
-    errno = EBADF;
-    return std::nullopt;
-  }
-
-  {
-    OwnerLease lock(directory->owner);
-    if (directory->closed) {
-      errno = EBADF;
-      return std::nullopt;
-    }
-    if (directory->directory) {
-      return joined_openat_path(*directory, path);
-    }
-    if (directory->directory_checked) {
-      errno = ENOTDIR;
-      return std::nullopt;
-    }
   }
 
   // Resolve the capability lazily from the already-open File handle. This
   // preserves the inode selected by open(2), even if its pathname is renamed
   // or recreated before the first openat(2), without taxing ordinary file
   // opens with a second RPC.
-  OwnerLease lock(directory->owner);
-  if (directory->closed) {
-    errno = EBADF;
-    return std::nullopt;
-  }
-  if (const auto error = ensure_directory_handle(adapter, *directory); error) {
+  auto &slot = directory.slot();
+  OwnerLease lock(slot.owner);
+  if (const auto error = ensure_directory_handle(directory.epoch(), slot);
+      error) {
     errno = errno_from_error(error);
     return std::nullopt;
   }
-  return joined_openat_path(*directory, path);
+  return joined_openat_path(slot, path);
 }
 
 template <typename Entry>
@@ -517,31 +694,47 @@ void populate_directory_entry(const DirEntry &input, Entry &output) noexcept {
 }
 
 template <typename Entry>
-Entry *read_directory_entry(AdapterState &adapter, DIR *directory,
+Entry *read_directory_entry(DirectoryLease &lease,
                             Entry DirectorySlot::*entry_member) {
-  auto slot = find_directory(adapter, directory);
-  if (!slot) {
-    return fail(EBADF, static_cast<Entry *>(nullptr));
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, static_cast<Entry *>(nullptr));
-  }
-  if (slot->cursor == slot->count) {
-    slot->cursor = 0;
-    auto result = run(adapter, slot->directory.next_batch(slot->batch));
+  auto &slot = lease.slot();
+  OwnerLease lock(slot.owner);
+  if (slot.cursor == slot.count) {
+    slot.cursor = 0;
+    auto result = run(lease.epoch(), slot.directory.next_batch(slot.batch));
     if (!result) {
       return fail(result.error(), static_cast<Entry *>(nullptr));
     }
-    slot->count = std::move(result).value();
-    if (slot->count == 0) {
+    slot.count = std::move(result).value();
+    if (slot.count == 0) {
       errno = 0;
       return nullptr;
     }
   }
-  Entry &output = slot.get()->*entry_member;
-  populate_directory_entry(slot->batch[slot->cursor++], output);
+  Entry &output = slot.*entry_member;
+  populate_directory_entry(slot.batch[slot.cursor++], output);
   return &output;
+}
+
+int install_opened_file(AdapterState &adapter, Result<File> opened,
+                        std::string path, int flags,
+                        std::shared_ptr<SessionEpoch> epoch) {
+  if (!opened) {
+    return fail(opened.error(), -1);
+  }
+  try {
+    auto slot = std::make_shared<FileSlot>(
+        std::move(opened).value(), std::nullopt, std::move(path), flags,
+        std::move(epoch));
+    const int fd = insert_file(adapter, std::move(slot));
+    if (fd < 0) {
+      return fail(EMFILE, -1);
+    }
+    return fd;
+  } catch (const std::bad_alloc &) {
+    return fail(ENOMEM, -1);
+  } catch (...) {
+    return fail(EIO, -1);
+  }
 }
 
 } // namespace
@@ -549,15 +742,24 @@ Entry *read_directory_entry(AdapterState &adapter, DIR *directory,
 extern "C" int orchfs_async_adapter_init(void) {
   auto &adapter = state();
   OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (ready(adapter)) {
+  if (!adapter.accepting_calls) {
+    return fail(ESHUTDOWN, -1);
+  }
+  if (ready_locked(adapter)) {
     return 0;
   }
 
+  bool created_runtime = false;
   try {
-    bool created_runtime = false;
     if (!adapter.runtime) {
       RuntimeOptions runtime_options;
       runtime_options.worker_count = configured_worker_count();
+      runtime_options.blocking_spin_count =
+          configured_size("ORCHFS_CLIENT_BLOCKING_SPINS", 1024);
+      runtime_options.blocking_spin_limit =
+          configured_size("ORCHFS_CLIENT_BLOCKING_SPIN_LIMIT", 4);
+      runtime_options.blocking_spin_warmup =
+          configured_size("ORCHFS_CLIENT_BLOCKING_SPIN_WARMUP", 64);
       auto runtime = Runtime::create(std::move(runtime_options));
       if (!runtime) {
         adapter.initialization_error = runtime.error();
@@ -569,7 +771,7 @@ extern "C" int orchfs_async_adapter_init(void) {
       // A transport failure invalidates Client but not the process Runtime.
       // Reuse those workers for a fresh session instead of violating the
       // one-Runtime-per-process invariant.
-      adapter.client.reset();
+      adapter.current_epoch.reset();
     }
 
     ClientOptions client_options;
@@ -577,12 +779,15 @@ extern "C" int orchfs_async_adapter_init(void) {
         endpoint && *endpoint) {
       client_options.endpoint = endpoint;
     }
+    client_options.lane_count =
+        configured_size("ORCHFS_CLIENT_LANES", 4);
     client_options.ring_capacity = configured_size(
         "ORCHFS_IPC_RING_CAPACITY", client_options.ring_capacity);
     client_options.data_slot_size = configured_size(
         "ORCHFS_IPC_DATA_SLOT_SIZE", client_options.data_slot_size);
     auto connected = run(
-        adapter, Client::connect(*adapter.runtime, std::move(client_options)));
+        *adapter.runtime,
+        Client::connect(*adapter.runtime, std::move(client_options)));
     if (!connected) {
       adapter.initialization_error = connected.error();
       if (created_runtime) {
@@ -592,7 +797,8 @@ extern "C" int orchfs_async_adapter_init(void) {
       }
       return fail(adapter.initialization_error, -1);
     }
-    adapter.client.emplace(std::move(connected).value());
+    adapter.current_epoch = std::make_shared<SessionEpoch>(
+        *adapter.runtime, std::move(connected).value(), adapter.next_epoch++);
     adapter.ever_connected.store(true, std::memory_order_release);
     adapter.initialization_error.clear();
     return 0;
@@ -603,12 +809,12 @@ extern "C" int orchfs_async_adapter_init(void) {
     adapter.initialization_error = std::make_error_code(std::errc::io_error);
   }
 
-  if (adapter.runtime) {
+  adapter.current_epoch.reset();
+  if (created_runtime && adapter.runtime) {
     adapter.runtime->request_stop();
     (void)adapter.runtime->join();
     adapter.runtime.reset();
   }
-  adapter.client.reset();
   return fail(adapter.initialization_error, -1);
 }
 
@@ -616,13 +822,21 @@ extern "C" int orchfs_async_adapter_ready(void) {
   auto &adapter = state();
   {
     OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-    if (ready(adapter)) {
+    if (ready_locked(adapter)) {
       return 1;
+    }
+    if (!adapter.accepting_calls) {
+      errno = ESHUTDOWN;
+      return 0;
     }
   }
   // Pathname wrappers use this as the lazy reconnect point. init() serializes
   // concurrent callers and reuses the process Runtime after a dead session.
   return orchfs_async_adapter_init() == 0 ? 1 : 0;
+}
+
+extern "C" size_t orchfs_async_adapter_peak_inflight(void) {
+  return state().peak_active_calls.load(std::memory_order_acquire);
 }
 
 extern "C" int orchfs_async_adapter_allow_host_fallback(int adapter_was_ready,
@@ -640,8 +854,10 @@ extern "C" int orchfs_async_adapter_allow_host_fallback(int adapter_was_ready,
 extern "C" void orchfs_async_adapter_shutdown(void) {
   auto &adapter = state();
   OwnerLease lifecycle_lock(adapter.lifecycle_owner);
+  adapter.accepting_calls = false;
+  wait_for_active_calls(adapter);
   if (!adapter.runtime) {
-    adapter.client.reset();
+    adapter.current_epoch.reset();
     return;
   }
 
@@ -650,11 +866,18 @@ extern "C" void orchfs_async_adapter_shutdown(void) {
   for (const auto &[fd, slot] : *files) {
     (void)fd;
     OwnerLease lock(slot->owner);
-    (void)run(adapter, slot->file.close());
+    slot->state = SlotState::closing;
+    wait_for_slot_calls(*slot);
+    if (slot->epoch) {
+      (void)run(*slot->epoch, slot->file.close());
+    }
     if (slot->directory) {
-      (void)run(adapter, slot->directory->close());
+      if (slot->epoch) {
+        (void)run(*slot->epoch, slot->directory->close());
+      }
       slot->directory.reset();
     }
+    slot->state = SlotState::closed;
   }
 
   auto directories = adapter.directories.exchange(
@@ -662,7 +885,12 @@ extern "C" void orchfs_async_adapter_shutdown(void) {
   for (const auto &[token, slot] : *directories) {
     {
       OwnerLease lock(slot->owner);
-      (void)run(adapter, slot->directory.close());
+      slot->state = SlotState::closing;
+      wait_for_slot_calls(*slot);
+      if (slot->epoch) {
+        (void)run(*slot->epoch, slot->directory.close());
+      }
+      slot->state = SlotState::closed;
     }
     delete reinterpret_cast<DirectoryToken *>(token);
   }
@@ -674,10 +902,11 @@ extern "C" void orchfs_async_adapter_shutdown(void) {
   files.reset();
   directories.reset();
 
-  if (adapter.client && adapter.client->valid()) {
-    (void)run(adapter, adapter.client->shutdown());
+  if (adapter.current_epoch && adapter.current_epoch->client.valid()) {
+    (void)run(*adapter.current_epoch,
+              adapter.current_epoch->client.shutdown());
   }
-  adapter.client.reset();
+  adapter.current_epoch.reset();
   adapter.runtime->request_stop();
   (void)adapter.runtime->join();
   adapter.runtime.reset();
@@ -696,28 +925,14 @@ extern "C" int orchfs_async_open(const char *path, int flags, ...) {
   }
 
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return -1;
   }
-  auto opened = run(adapter, adapter.client->open(path, flags, mode));
-  if (!opened) {
-    return fail(opened.error(), -1);
-  }
-
-  try {
-    auto slot = std::make_shared<FileSlot>(
-        std::move(opened).value(), std::nullopt, std::string(path), flags);
-    const int fd = insert_file(adapter, std::move(slot));
-    if (fd < 0) {
-      return fail(EMFILE, -1);
-    }
-    return fd;
-  } catch (const std::bad_alloc &) {
-    return fail(ENOMEM, -1);
-  } catch (...) {
-    return fail(EIO, -1);
-  }
+  auto opened = run(epoch->epoch(),
+                    epoch->epoch().client.open(path, flags, mode));
+  return install_opened_file(adapter, std::move(opened), std::string(path),
+                             flags, epoch->shared_epoch());
 }
 
 extern "C" int orchfs_async_openat(int dirfd, const char *path, int flags,
@@ -729,91 +944,116 @@ extern "C" int orchfs_async_openat(int dirfd, const char *path, int flags,
     mode = va_arg(arguments, mode_t);
     va_end(arguments);
   }
+  if (!valid_path(path)) {
+    return fail(path ? ENOENT : EFAULT, -1);
+  }
 
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  {
+    OwnerLease lifecycle_lock(adapter.lifecycle_owner);
+    if (!ready_locked(adapter)) {
+      return fail(unavailable_error_locked(adapter), -1);
+    }
   }
-  auto combined_path = path_for_openat(adapter, dirfd, path);
+  if (*path == '/' || dirfd == AT_FDCWD) {
+    auto epoch = acquire_epoch(adapter);
+    if (!epoch) {
+      return -1;
+    }
+    auto opened = run(epoch->epoch(),
+                      epoch->epoch().client.open(path, flags, mode));
+    return install_opened_file(adapter, std::move(opened), std::string(path),
+                               flags, epoch->shared_epoch());
+  }
+
+  auto parent = acquire_file(adapter, dirfd);
+  if (!parent) {
+    return -1;
+  }
+  auto combined_path = path_for_openat(*parent, path);
   if (!combined_path) {
     return -1;
   }
+
   Result<File> opened = [&]() {
-    if (*path == '/' || dirfd == AT_FDCWD) {
-      return run(adapter, adapter.client->open(*combined_path, flags, mode));
-    }
-    auto parent = find_file(adapter, dirfd);
-    if (!parent) {
-      return Result<File>::failure(
-          std::make_error_code(std::errc::bad_file_descriptor));
-    }
-    OwnerLease parent_lock(parent->owner);
-    if (parent->closed) {
-      return Result<File>::failure(
-          std::make_error_code(std::errc::bad_file_descriptor));
-    }
-    if (!parent->directory) {
+    OwnerLease parent_lock(parent->slot().owner);
+    if (!parent->slot().directory) {
       return Result<File>::failure(
           std::make_error_code(std::errc::not_a_directory));
     }
-    return run(adapter,
-               adapter.client->open_at(*parent->directory, std::string(path),
-                                       flags, mode));
+    return run(parent->epoch(),
+               parent->epoch().client.open_at(*parent->slot().directory,
+                                              std::string(path), flags, mode));
   }();
-  if (!opened) {
-    return fail(opened.error(), -1);
-  }
-
-  try {
-    auto slot =
-        std::make_shared<FileSlot>(std::move(opened).value(), std::nullopt,
-                                   std::move(*combined_path), flags);
-    const int fd = insert_file(adapter, std::move(slot));
-    if (fd < 0) {
-      return fail(EMFILE, -1);
-    }
-    return fd;
-  } catch (const std::bad_alloc &) {
-    return fail(ENOMEM, -1);
-  } catch (...) {
-    return fail(EIO, -1);
-  }
+  return install_opened_file(adapter, std::move(opened),
+                             std::move(*combined_path), flags,
+                             parent->shared_epoch());
 }
 
 extern "C" int orchfs_async_close(int fd) {
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, -1);
+  std::shared_ptr<FileSlot> slot;
+  std::optional<EpochLease> call;
+  {
+    OwnerLease lifecycle_lock(adapter.lifecycle_owner);
+    if (!adapter.accepting_calls) {
+      return fail(ESHUTDOWN, -1);
+    }
+    slot = find_file(adapter, fd);
+    if (!slot) {
+      return fail(EBADF, -1);
+    }
+    OwnerLease slot_lock(slot->owner);
+    if (slot->state != SlotState::open) {
+      return fail(EBADF, -1);
+    }
+    slot->state = SlotState::closing;
+    begin_active_call(adapter);
+    call.emplace(adapter, slot->epoch);
   }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, -1);
-  }
-  if (!ready(adapter)) {
+
+  wait_for_slot_calls(*slot);
+  if (!call->epoch().client.valid()) {
     // A dead transport makes a remote retry impossible; the server's
     // once-only session cleanup owns the peer handle. Closing the local proxy
     // must still retire it instead of leaking it until a pathname reconnect.
-    slot->closed = true;
-    slot->directory.reset();
+    {
+      OwnerLease slot_lock(slot->owner);
+      slot->state = SlotState::closed;
+      slot->directory.reset();
+    }
     erase_file(adapter, fd, slot);
     return 0;
   }
-  auto result = run(adapter, slot->file.close());
+  auto result = run(call->epoch(), slot->file.close());
   if (!result) {
+    if (!call->epoch().client.valid()) {
+      {
+        OwnerLease slot_lock(slot->owner);
+        slot->state = SlotState::closed;
+        slot->directory.reset();
+      }
+      erase_file(adapter, fd, slot);
+      return 0;
+    }
     // close(2) failures leave this compatibility handle usable so callers can
     // observe the error and retry.  No local state is discarded first.
+    {
+      OwnerLease slot_lock(slot->owner);
+      slot->state = SlotState::open;
+    }
     return fail(result.error(), -1);
   }
-  if (slot->directory) {
-    // This is an auxiliary handle used solely to preserve openat inode
-    // semantics.  The user-visible File close already succeeded.
-    (void)run(adapter, slot->directory->close());
-    slot->directory.reset();
+  {
+    OwnerLease slot_lock(slot->owner);
+    if (slot->directory) {
+      // This is an auxiliary handle used solely to preserve openat inode
+      // semantics.  The user-visible File close already succeeded.
+      (void)run(call->epoch(), slot->directory->close());
+      slot->directory.reset();
+    }
+    slot->state = SlotState::closed;
   }
-  slot->closed = true;
   erase_file(adapter, fd, slot);
   return 0;
 }
@@ -823,20 +1063,13 @@ extern "C" ssize_t orchfs_async_read(int fd, void *buffer, size_t length) {
     return fail(EFAULT, static_cast<ssize_t>(-1));
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, static_cast<ssize_t>(-1));
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, static_cast<ssize_t>(-1));
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, static_cast<ssize_t>(-1));
-  }
-  auto result =
-      run(adapter, slot->file.read({static_cast<std::byte *>(buffer), length}));
+  auto result = run(
+      lease->epoch(),
+      lease->slot().file.read({static_cast<std::byte *>(buffer), length}));
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -852,21 +1085,13 @@ extern "C" ssize_t orchfs_async_write(int fd, const void *buffer,
     return fail(EFAULT, static_cast<ssize_t>(-1));
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, static_cast<ssize_t>(-1));
-  }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, static_cast<ssize_t>(-1));
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, static_cast<ssize_t>(-1));
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
   auto result =
-      run(adapter,
-          slot->file.write({static_cast<const std::byte *>(buffer), length}));
+      run(lease->epoch(), lease->slot().file.write(
+                              {static_cast<const std::byte *>(buffer), length}));
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -883,21 +1108,14 @@ extern "C" ssize_t orchfs_async_pread(int fd, void *buffer, size_t length,
                 static_cast<ssize_t>(-1));
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, static_cast<ssize_t>(-1));
-  }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, static_cast<ssize_t>(-1));
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, static_cast<ssize_t>(-1));
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
   auto result = run(
-      adapter, slot->file.read_at(static_cast<std::uint64_t>(offset),
-                                  {static_cast<std::byte *>(buffer), length}));
+      lease->epoch(),
+      lease->slot().file.read_at(static_cast<std::uint64_t>(offset),
+                                 {static_cast<std::byte *>(buffer), length}));
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -914,22 +1132,15 @@ extern "C" ssize_t orchfs_async_pwrite(int fd, const void *buffer,
                 static_cast<ssize_t>(-1));
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, static_cast<ssize_t>(-1));
-  }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, static_cast<ssize_t>(-1));
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, static_cast<ssize_t>(-1));
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
   auto result = run(
-      adapter,
-      slot->file.write_at(static_cast<std::uint64_t>(offset),
-                          {static_cast<const std::byte *>(buffer), length}));
+      lease->epoch(),
+      lease->slot().file.write_at(
+          static_cast<std::uint64_t>(offset),
+          {static_cast<const std::byte *>(buffer), length}));
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -941,19 +1152,11 @@ extern "C" ssize_t orchfs_async_pwrite(int fd, const void *buffer,
 
 extern "C" off_t orchfs_async_lseek(int fd, off_t offset, int whence) {
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, static_cast<off_t>(-1));
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, static_cast<off_t>(-1));
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, static_cast<off_t>(-1));
-  }
-  auto result = run(adapter, slot->file.seek(offset, whence));
+  auto result = run(lease->epoch(), lease->slot().file.seek(offset, whence));
   if (!result) {
     return fail(result.error(), static_cast<off_t>(-1));
   }
@@ -969,19 +1172,11 @@ extern "C" int orchfs_async_fstat(int fd, struct stat *stat_buffer) {
     return fail(EFAULT, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, -1);
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, -1);
-  }
-  auto result = run(adapter, slot->file.stat());
+  auto result = run(lease->epoch(), lease->slot().file.stat());
   if (!result) {
     return fail(result.error(), -1);
   }
@@ -994,11 +1189,11 @@ extern "C" int orchfs_async_stat(const char *path, struct stat *stat_buffer) {
     return fail(!path || !stat_buffer ? EFAULT : ENOENT, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return -1;
   }
-  auto result = run(adapter, adapter.client->stat(path));
+  auto result = run(epoch->epoch(), epoch->epoch().client.stat(path));
   if (!result) {
     return fail(result.error(), -1);
   }
@@ -1011,19 +1206,11 @@ extern "C" int orchfs_async_fstatfs(int fd, struct statfs *stat_buffer) {
     return fail(EFAULT, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, -1);
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, -1);
-  }
-  auto result = run(adapter, slot->file.statfs());
+  auto result = run(lease->epoch(), lease->slot().file.statfs());
   if (!result) {
     return fail(result.error(), -1);
   }
@@ -1037,19 +1224,20 @@ extern "C" int orchfs_async_statfs(const char *path,
     return fail(!path || !stat_buffer ? EFAULT : ENOENT, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return -1;
   }
-  auto opened = run(adapter, adapter.client->open(std::string(path), O_RDONLY));
+  auto opened = run(epoch->epoch(),
+                    epoch->epoch().client.open(std::string(path), O_RDONLY));
   if (!opened) {
     return fail(opened.error(), -1);
   }
   File file = std::move(opened).value();
-  auto result = run(adapter, file.statfs());
+  auto result = run(epoch->epoch(), file.statfs());
   const std::error_code operation_error =
       result ? std::error_code{} : result.error();
-  (void)run(adapter, file.close());
+  (void)run(epoch->epoch(), file.close());
   if (operation_error) {
     return fail(operation_error, -1);
   }
@@ -1062,13 +1250,12 @@ extern "C" int orchfs_async_truncate(const char *path, off_t length) {
     return fail(!path ? EFAULT : EINVAL, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return -1;
   }
-  auto result =
-      run(adapter,
-          adapter.client->truncate(path, static_cast<std::uint64_t>(length)));
+  auto result = run(epoch->epoch(), epoch->epoch().client.truncate(
+                                         path, static_cast<std::uint64_t>(length)));
   return result ? 0 : fail(result.error(), -1);
 }
 
@@ -1077,72 +1264,48 @@ extern "C" int orchfs_async_ftruncate(int fd, off_t length) {
     return fail(EINVAL, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, -1);
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, -1);
-  }
-  auto result =
-      run(adapter, slot->file.truncate(static_cast<std::uint64_t>(length)));
+  auto result = run(
+      lease->epoch(),
+      lease->slot().file.truncate(static_cast<std::uint64_t>(length)));
   return result ? 0 : fail(result.error(), -1);
 }
 
 extern "C" int orchfs_async_fsync(int fd) {
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, -1);
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
-  }
-  OwnerLease lock(slot->owner);
-  if (slot->closed) {
-    return fail(EBADF, -1);
-  }
-  auto result = run(adapter, slot->file.sync());
+  auto result = run(lease->epoch(), lease->slot().file.sync());
   return result ? 0 : fail(result.error(), -1);
 }
 
 extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_file(adapter, fd);
-  if (!slot) {
-    return fail(EBADF, -1);
+  auto lease = acquire_file(adapter, fd);
+  if (!lease) {
+    return -1;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
-  }
+  auto &slot = lease->slot();
   if (command == F_GETFD || command == F_GETFL) {
-    OwnerLease lock(slot->owner);
-    if (slot->closed) {
-      return fail(EBADF, -1);
-    }
+    OwnerLease lock(slot.owner);
     if (command == F_GETFD) {
-      return slot->descriptor_flags;
+      return slot.descriptor_flags;
     }
-    auto result = run(adapter, slot->file.get_flags());
+    auto result = run(lease->epoch(), slot.file.get_flags());
     return result ? result.value() : fail(result.error(), -1);
   }
 
   if (command == F_SETFD || command == F_SETFL) {
-    OwnerLease lock(slot->owner);
-    if (slot->closed) {
-      return fail(EBADF, -1);
-    }
+    OwnerLease lock(slot.owner);
     if (command == F_SETFD) {
       va_list arguments;
       va_start(arguments, command);
-      slot->descriptor_flags = va_arg(arguments, int) & FD_CLOEXEC;
+      slot.descriptor_flags = va_arg(arguments, int) & FD_CLOEXEC;
       va_end(arguments);
       return 0;
     }
@@ -1150,9 +1313,9 @@ extern "C" int orchfs_async_fcntl(int fd, int command, ...) {
     va_start(arguments, command);
     const int flags = va_arg(arguments, int);
     va_end(arguments);
-    auto result = run(adapter, slot->file.set_flags(flags));
+    auto result = run(lease->epoch(), slot.file.set_flags(flags));
     if (result) {
-      slot->open_flags = (slot->open_flags & (O_ACCMODE | O_DIRECTORY)) | flags;
+      slot.open_flags = (slot.open_flags & (O_ACCMODE | O_DIRECTORY)) | flags;
       return 0;
     }
     return fail(result.error(), -1);
@@ -1203,11 +1366,12 @@ extern "C" int orchfs_async_mkdir(const char *path, mode_t mode) {
     return fail(path ? ENOENT : EFAULT, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return -1;
   }
-  auto result = run(adapter, adapter.client->make_directory(path, mode));
+  auto result =
+      run(epoch->epoch(), epoch->epoch().client.make_directory(path, mode));
   return result ? 0 : fail(result.error(), -1);
 }
 
@@ -1216,11 +1380,12 @@ extern "C" int orchfs_async_rmdir(const char *path) {
     return fail(path ? ENOENT : EFAULT, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return -1;
   }
-  auto result = run(adapter, adapter.client->remove_directory(path));
+  auto result =
+      run(epoch->epoch(), epoch->epoch().client.remove_directory(path));
   return result ? 0 : fail(result.error(), -1);
 }
 
@@ -1229,11 +1394,11 @@ extern "C" int orchfs_async_unlink(const char *path) {
     return fail(path ? ENOENT : EFAULT, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return -1;
   }
-  auto result = run(adapter, adapter.client->unlink(path));
+  auto result = run(epoch->epoch(), epoch->epoch().client.unlink(path));
   return result ? 0 : fail(result.error(), -1);
 }
 
@@ -1242,11 +1407,12 @@ extern "C" int orchfs_async_rename(const char *old_path, const char *new_path) {
     return fail(!old_path || !new_path ? EFAULT : ENOENT, -1);
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, -1);
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return -1;
   }
-  auto result = run(adapter, adapter.client->rename(old_path, new_path));
+  auto result =
+      run(epoch->epoch(), epoch->epoch().client.rename(old_path, new_path));
   return result ? 0 : fail(result.error(), -1);
 }
 
@@ -1255,16 +1421,18 @@ extern "C" DIR *orchfs_async_opendir(const char *path) {
     return fail(path ? ENOENT : EFAULT, static_cast<DIR *>(nullptr));
   }
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error, static_cast<DIR *>(nullptr));
+  auto epoch = acquire_epoch(adapter);
+  if (!epoch) {
+    return nullptr;
   }
-  auto opened = run(adapter, adapter.client->open_directory(path));
+  auto opened =
+      run(epoch->epoch(), epoch->epoch().client.open_directory(path));
   if (!opened) {
     return fail(opened.error(), static_cast<DIR *>(nullptr));
   }
   try {
-    auto slot = std::make_shared<DirectorySlot>(std::move(opened).value());
+    auto slot = std::make_shared<DirectorySlot>(
+        std::move(opened).value(), epoch->shared_epoch());
     auto token = std::make_unique<DirectoryToken>();
     DIR *key = reinterpret_cast<DIR *>(token.get());
     insert_directory(adapter, key, std::move(slot));
@@ -1293,49 +1461,56 @@ extern "C" int orchfs_async_is_directory(DIR *directory) {
 
 extern "C" struct dirent *orchfs_async_readdir(DIR *directory) {
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!find_directory(adapter, directory)) {
-    return fail(EBADF, static_cast<struct dirent *>(nullptr));
+  auto lease = acquire_directory(adapter, directory);
+  if (!lease) {
+    return nullptr;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error,
-                static_cast<struct dirent *>(nullptr));
-  }
-  return read_directory_entry(adapter, directory, &DirectorySlot::entry);
+  return read_directory_entry(*lease, &DirectorySlot::entry);
 }
 
 extern "C" struct dirent64 *orchfs_async_readdir64(DIR *directory) {
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  if (!find_directory(adapter, directory)) {
-    return fail(EBADF, static_cast<struct dirent64 *>(nullptr));
+  auto lease = acquire_directory(adapter, directory);
+  if (!lease) {
+    return nullptr;
   }
-  if (!ready(adapter)) {
-    return fail(adapter.initialization_error,
-                static_cast<struct dirent64 *>(nullptr));
-  }
-  return read_directory_entry(adapter, directory, &DirectorySlot::entry64);
+  return read_directory_entry(*lease, &DirectorySlot::entry64);
 }
 
 extern "C" int orchfs_async_closedir(DIR *directory) {
   auto &adapter = state();
-  OwnerLease lifecycle_lock(adapter.lifecycle_owner);
-  auto slot = find_directory(adapter, directory);
-  if (!slot) {
-    return fail(EBADF, -1);
-  }
+  std::shared_ptr<DirectorySlot> slot;
+  std::optional<EpochLease> call;
   {
-    OwnerLease lock(slot->owner);
-    if (slot->closed) {
+    OwnerLease lifecycle_lock(adapter.lifecycle_owner);
+    if (!adapter.accepting_calls) {
+      return fail(ESHUTDOWN, -1);
+    }
+    slot = find_directory(adapter, directory);
+    if (!slot) {
       return fail(EBADF, -1);
     }
-    if (ready(adapter)) {
-      auto result = run(adapter, slot->directory.close());
-      if (!result) {
-        return fail(result.error(), -1);
-      }
+    OwnerLease slot_lock(slot->owner);
+    if (slot->state != SlotState::open) {
+      return fail(EBADF, -1);
     }
-    slot->closed = true;
+    slot->state = SlotState::closing;
+    begin_active_call(adapter);
+    call.emplace(adapter, slot->epoch);
+  }
+
+  wait_for_slot_calls(*slot);
+  if (call->epoch().client.valid()) {
+    auto result = run(call->epoch(), slot->directory.close());
+    if (!result && call->epoch().client.valid()) {
+      OwnerLease slot_lock(slot->owner);
+      slot->state = SlotState::open;
+      return fail(result.error(), -1);
+    }
+  }
+  {
+    OwnerLease slot_lock(slot->owner);
+    slot->state = SlotState::closed;
   }
   erase_directory(adapter, directory, slot);
   auto *token = reinterpret_cast<DirectoryToken *>(directory);

@@ -271,6 +271,7 @@ class Session final : public std::enable_shared_from_this<Session> {
     Runtime::PollRegistration registration;
     std::atomic<InboxNode*> inbox{nullptr};
     std::atomic<std::size_t> active_submitters{0};
+    std::atomic<bool> peer_failure_checked{false};
     std::atomic<bool> drained{false};
     std::pmr::unsynchronized_pool_resource pending_pool;
     std::pmr::unordered_map<std::uint64_t, std::shared_ptr<Pending>> pending{
@@ -337,8 +338,7 @@ class Session final : public std::enable_shared_from_this<Session> {
       }
       pending_->continuation = continuation;
       pending_->resume_worker = Runtime::current_worker();
-      pending_->lane = static_cast<std::uint32_t>(
-          pending_->resume_worker % session_->config_.lane_count);
+      pending_->lane = session_->select_lane(pending_->resume_worker);
       return session_->enqueue(pending_);
     }
 
@@ -488,6 +488,14 @@ class Session final : public std::enable_shared_from_this<Session> {
       lanes_.push_back(std::make_unique<LaneState>(
           *this, lane, lane % runtime.worker_count()));
     }
+  }
+
+  std::uint32_t select_lane(std::size_t resume_worker) noexcept {
+    if (config_.lane_count <= runtime_->worker_count()) {
+      return static_cast<std::uint32_t>(resume_worker % config_.lane_count);
+    }
+    return next_lane_.fetch_add(1, std::memory_order_relaxed) %
+           config_.lane_count;
   }
 
   std::error_code start() noexcept {
@@ -707,6 +715,9 @@ class Session final : public std::enable_shared_from_this<Session> {
   }
 
   bool drain_inbox(LaneState& lane) noexcept {
+    if (lane.inbox.load(std::memory_order_acquire) == nullptr) {
+      return false;
+    }
     InboxNode* stack =
         lane.inbox.exchange(nullptr, std::memory_order_acquire);
     const bool progress = stack != nullptr;
@@ -849,6 +860,18 @@ class Session final : public std::enable_shared_from_this<Session> {
     bool progress = drain_inbox(lane);
     progress |= pump_submissions(lane);
     progress |= pump_completions(lane);
+    if (peer_failed_.load(std::memory_order_acquire) &&
+        !lane.peer_failure_checked.load(std::memory_order_acquire)) {
+      // The server publishes any terminal completion before marking the
+      // transport dead. Give every lane one owner-local receive pass before
+      // control fails requests that genuinely have no completion. Otherwise
+      // a graceful shutdown reply can race with the control-socket close and
+      // be reported as ECONNRESET.
+      progress |= pump_completions(lane);
+      lane.peer_failure_checked.store(true, std::memory_order_release);
+      (void)runtime_->notify(control_owner_);
+      progress = true;
+    }
     if (stop_requested_.load(std::memory_order_acquire)) {
       accepting_.store(false, std::memory_order_release);
       if (lane.active_submitters.load(std::memory_order_acquire) == 0) {
@@ -863,9 +886,13 @@ class Session final : public std::enable_shared_from_this<Session> {
         }
       }
       if (lane_empty(lane)) {
-        lane.drained.store(true, std::memory_order_release);
+        // Control may release keep_alive_ as soon as every lane reports
+        // drained. Pin only this terminal callback and publish drained after
+        // clearing the owner-local registration member.
+        auto self = shared_from_this();
         lane.registration.reset();
         (void)runtime_->notify(control_owner_);
+        lane.drained.store(true, std::memory_order_release);
         return Runtime::PollState::progress;
       }
     }
@@ -889,7 +916,21 @@ class Session final : public std::enable_shared_from_this<Session> {
     if (idle || (++health_poll_ticks_ & kHealthPollMask) == 0) {
       transport_.heartbeat();
       if (!transport_.peer_alive()) {
-        peer_failed_.store(true, std::memory_order_release);
+        const bool first_failure =
+            !peer_failed_.exchange(true, std::memory_order_acq_rel);
+        if (first_failure) {
+          for (const auto& lane : lanes_) {
+            (void)runtime_->notify(lane->owner);
+          }
+        }
+      }
+    }
+    if (peer_failed_.load(std::memory_order_acquire)) {
+      const bool lanes_checked = std::all_of(
+          lanes_.begin(), lanes_.end(), [](const auto& lane) {
+            return lane->peer_failure_checked.load(std::memory_order_acquire);
+          });
+      if (lanes_checked) {
         request_stop();
       }
     }
@@ -903,12 +944,12 @@ class Session final : public std::enable_shared_from_this<Session> {
     if (!all_drained) {
       return Runtime::PollState::busy;
     }
-    finished_.store(true, std::memory_order_release);
-    finished_.notify_all();
     // keep_alive_ may be the last owner. Hold the session until this callback
     // returns, while keeping shared_ptr traffic off the steady polling path.
     auto self = shared_from_this();
     control_registration_.reset();
+    finished_.store(true, std::memory_order_release);
+    finished_.notify_all();
     keep_alive_.reset();
     return Runtime::PollState::progress;
   }
@@ -930,6 +971,7 @@ class Session final : public std::enable_shared_from_this<Session> {
   std::atomic<std::size_t> open_handles_{0};
   std::atomic<std::size_t> outstanding_{0};
   std::atomic<std::uint64_t> next_request_id_{1};
+  std::atomic<std::uint32_t> next_lane_{0};
   std::uint32_t health_poll_ticks_{};
 };
 
@@ -957,17 +999,19 @@ Client::~Client() {
 
 Task<Result<Client>> Client::connect(Runtime& runtime,
                                      ClientOptions options) {
+  const std::size_t lane_count =
+      options.lane_count == 0 ? runtime.worker_count() : options.lane_count;
   if (options.ring_capacity == 0 || options.data_slot_size <= sizeof(RpcRequest) ||
-      runtime.worker_count() == 0 ||
+      runtime.worker_count() == 0 || lane_count == 0 ||
       options.ring_capacity > std::numeric_limits<std::uint32_t>::max() ||
       options.data_slot_size > std::numeric_limits<std::uint32_t>::max() ||
-      runtime.worker_count() > kMaxIpcWorkerLanes) {
+      lane_count > kMaxIpcWorkerLanes) {
     co_return Result<Client>::failure(
         std::make_error_code(std::errc::invalid_argument));
   }
 
   TransportConfig config{
-      .lane_count = static_cast<std::uint32_t>(runtime.worker_count()),
+      .lane_count = static_cast<std::uint32_t>(lane_count),
       .ring_capacity = static_cast<std::uint32_t>(options.ring_capacity),
       .data_slot_size = static_cast<std::uint32_t>(options.data_slot_size),
   };

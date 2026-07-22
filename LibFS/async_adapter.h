@@ -20,6 +20,7 @@ extern "C" {
 int orchfs_async_adapter_init(void);
 void orchfs_async_adapter_shutdown(void);
 int orchfs_async_adapter_ready(void);
+size_t orchfs_async_adapter_peak_inflight(void);
 /* Plain relative single-path operations may fall back to libc before the
  * first successful connection, or after a genuine live-session ENOENT. Once
  * a session has existed, transport/storage failures are fail-closed. This

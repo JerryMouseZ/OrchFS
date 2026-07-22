@@ -22,6 +22,10 @@ class Directory;
 
 struct ClientOptions {
   std::string endpoint{"/tmp/orchfs-kfs.sock"};
+  // Zero preserves the native default of one lane per Runtime worker.  A
+  // blocking adapter may use more transport lanes than polling workers so a
+  // single hot client worker can still feed every server lane.
+  std::size_t lane_count{0};
   std::size_t ring_capacity{64};
   std::size_t data_slot_size{1024U * 1024U};
 };

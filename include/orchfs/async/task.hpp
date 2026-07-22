@@ -45,13 +45,17 @@ void deallocate_coroutine_frame(void* frame) noexcept;
 
 class CompletionStateBase;
 void root_completed(Runtime* runtime, CompletionStateBase* state) noexcept;
+void blocking_root_completed(Runtime* runtime,
+                             CompletionStateBase* state) noexcept;
 
 using UnobservedErrorHandler = std::function<void(std::error_code)>;
 
 class CompletionStateBase {
 public:
-    CompletionStateBase(Runtime* runtime, UnobservedErrorHandler handler)
-        : runtime_(runtime), unobserved_error_(std::move(handler)) {}
+    CompletionStateBase(Runtime* runtime, UnobservedErrorHandler handler,
+                        bool blocking = false)
+        : runtime_(runtime), unobserved_error_(std::move(handler)),
+          blocking_(blocking) {}
 
     CompletionStateBase(const CompletionStateBase&) = delete;
     CompletionStateBase& operator=(const CompletionStateBase&) = delete;
@@ -97,8 +101,16 @@ public:
         return false;
     }
 
-    void wait() noexcept {
+    void wait(std::size_t spin_count = 0) noexcept {
         void* state = waiter_state_.load(std::memory_order_acquire);
+        while (state != completed_sentinel() && spin_count-- != 0) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#else
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+            state = waiter_state_.load(std::memory_order_acquire);
+        }
         while (state != completed_sentinel()) {
             waiter_state_.wait(state, std::memory_order_acquire);
             state = waiter_state_.load(std::memory_order_acquire);
@@ -109,23 +121,36 @@ public:
         root_ = root;
     }
 
+    // A blocking root is owned by an external stack completion.  Its frame
+    // cannot be destroyed from final_suspend(), and the external waiter must
+    // not be released until the worker's resume() has returned.  Runtime calls
+    // these two operations, in order, from its deferred-completion phase.
+    void destroy_blocking_root() noexcept {
+        if (!blocking_ || !root_) {
+            std::terminate();
+        }
+        auto root = std::exchange(root_, {});
+        root.destroy();
+    }
+
+    void publish_blocking_ready() noexcept {
+        if (!blocking_) {
+            std::terminate();
+        }
+        publish_waiter_ready();
+    }
+
     [[nodiscard]] Runtime* runtime() const noexcept {
         return runtime_;
     }
 
 protected:
     void publish_ready() noexcept {
-        void* waiter = waiter_state_.exchange(
-            completed_sentinel(), std::memory_order_acq_rel);
-        waiter_state_.notify_all();
-        if (waiter != nullptr) {
-            if (waiter == completed_sentinel() ||
-                waiter_.address() != waiter) {
-                std::terminate();
-            }
-            schedule_resume(waiter_target_, waiter_,
-                            waiter_target_.pin_depth != 0);
+        if (blocking_) {
+            blocking_root_completed(runtime_, this);
+            return;
         }
+        publish_waiter_ready();
         root_completed(runtime_, this);
     }
 
@@ -145,12 +170,27 @@ protected:
     }
 
 private:
+    void publish_waiter_ready() noexcept {
+        void* waiter = waiter_state_.exchange(
+            completed_sentinel(), std::memory_order_acq_rel);
+        waiter_state_.notify_all();
+        if (waiter != nullptr) {
+            if (waiter == completed_sentinel() ||
+                waiter_.address() != waiter) {
+                std::terminate();
+            }
+            schedule_resume(waiter_target_, waiter_,
+                            waiter_target_.pin_depth != 0);
+        }
+    }
+
     static void* completed_sentinel() noexcept {
         return reinterpret_cast<void*>(static_cast<std::uintptr_t>(1));
     }
 
     Runtime* runtime_;
     UnobservedErrorHandler unobserved_error_;
+    bool blocking_{false};
     std::coroutine_handle<> root_{};
     std::atomic<bool> consumed_{false};
     std::atomic<bool> observed_{false};

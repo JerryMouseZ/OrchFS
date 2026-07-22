@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -76,6 +77,7 @@ std::mutex file_handle_mutex;
 std::unordered_map<int, std::string> file_handle_paths;
 std::unordered_set<int> close_failed_once;
 std::atomic<std::size_t> active_legacy_handles{0};
+std::atomic<bool> delayed_adapter_concurrency_once{false};
 
 // Opt-in integration benchmark. It measures the coroutine Runtime, shared-memory
 // RPC, server dispatch, and blocking-adapter path against /tmp; it is not an
@@ -83,7 +85,29 @@ std::atomic<std::size_t> active_legacy_handles{0};
 constexpr std::size_t benchmark_block_size = 64U * 1024U;
 constexpr std::size_t benchmark_stream_count = 4;
 constexpr std::size_t benchmark_warmup_operations = 64;
-constexpr std::size_t benchmark_timed_operations = 4096;
+constexpr std::size_t benchmark_default_timed_operations = 4096;
+
+std::size_t session_churn_count() {
+  constexpr std::size_t default_count = 64;
+  const char* value = std::getenv("ORCHFS_SESSION_CHURN_COUNT");
+  if (value == nullptr || *value == '\0') {
+    return default_count;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long parsed = std::strtoull(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || parsed == 0 ||
+      parsed > 10000) {
+    throw std::runtime_error("invalid ORCHFS_SESSION_CHURN_COUNT");
+  }
+  return static_cast<std::size_t>(parsed);
+}
+
+bool ipc_hugepages_requested() noexcept {
+  const char* value = std::getenv("ORCHFS_IPC_HUGEPAGES");
+  return value != nullptr &&
+         (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0);
+}
 
 void record_legacy_call() {
   legacy_call_count.fetch_add(1, std::memory_order_relaxed);
@@ -143,6 +167,42 @@ bool file_path_is(int fd, std::string_view expected) {
   std::lock_guard lock(file_handle_mutex);
   const auto found = file_handle_paths.find(fd);
   return found != file_handle_paths.end() && found->second == expected;
+}
+
+bool file_path_starts_with(int fd, std::string_view prefix) {
+  std::lock_guard lock(file_handle_mutex);
+  const auto found = file_handle_paths.find(fd);
+  return found != file_handle_paths.end() &&
+         found->second.starts_with(prefix);
+}
+
+void delay_adapter_lifecycle_race(int fd) {
+  if (file_path_starts_with(fd, "/adapter-concurrency-") &&
+      !delayed_adapter_concurrency_once.exchange(true,
+                                                 std::memory_order_acq_rel)) {
+    // Keep one server operation resident long enough for all 64 application
+    // threads to enter the adapter. This makes the concurrency assertion
+    // deterministic even on the in-memory host test double.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return;
+  }
+  const char* marker_name = nullptr;
+  if (file_path_is(fd, "/adapter-close-race")) {
+    marker_name = ".adapter-close-race-active";
+  } else if (file_path_is(fd, "/adapter-shutdown-race")) {
+    marker_name = ".adapter-shutdown-race-active";
+  }
+  if (marker_name == nullptr) {
+    return;
+  }
+
+  const std::string marker_path = root_path + "/" + marker_name;
+  const int marker = ::open(marker_path.c_str(),
+                            O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+  if (marker >= 0) {
+    (void)::close(marker);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
 bool fail_this_close_once(int fd) {
@@ -280,6 +340,7 @@ class HostAsyncFilesystem final : public orchfs::async::AsyncFilesystem {
     if (fd < 0) {
       co_return failure<orchfs::async::WriteResult>(EBADF);
     }
+    delay_adapter_lifecycle_race(fd);
     struct stat value {};
     if (orchfs_fstat(fd, &value) != 0) {
       co_return failure<orchfs::async::WriteResult>(current_error(EIO));
@@ -729,18 +790,52 @@ std::size_t benchmark_spin_count() {
   return static_cast<std::size_t>(count);
 }
 
-std::size_t benchmark_coroutine_count() {
-  const char* value = std::getenv("ORCHFS_ASYNC_BENCHMARK_COROUTINES");
+std::size_t benchmark_timed_operations() {
+  const char* value = std::getenv("ORCHFS_ASYNC_BENCHMARK_OPERATIONS");
   if (value == nullptr || *value == '\0') {
-    return 64;
+    return benchmark_default_timed_operations;
   }
   errno = 0;
   char* end = nullptr;
   const unsigned long long count = std::strtoull(value, &end, 10);
   require(end != value && *end == '\0' && errno == 0 && count != 0 &&
-              count <= benchmark_stream_count * benchmark_timed_operations &&
+              count <= 1'000'000,
+          "invalid ORCHFS_ASYNC_BENCHMARK_OPERATIONS");
+  return static_cast<std::size_t>(count);
+}
+
+std::size_t benchmark_repetitions() {
+  const char* value = std::getenv("ORCHFS_ASYNC_BENCHMARK_REPETITIONS");
+  if (value == nullptr || *value == '\0') {
+    return 1;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long count = std::strtoull(value, &end, 10);
+  require(end != value && *end == '\0' && errno == 0 && count != 0 &&
+              count <= 1000,
+          "invalid ORCHFS_ASYNC_BENCHMARK_REPETITIONS");
+  return static_cast<std::size_t>(count);
+}
+
+std::size_t benchmark_coroutine_count(std::size_t timed_operations) {
+  const char* value = std::getenv("ORCHFS_ASYNC_BENCHMARK_COROUTINES");
+  if (value == nullptr || *value == '\0') {
+    constexpr std::size_t default_count = 64;
+    require(default_count <= benchmark_stream_count * timed_operations &&
+                (benchmark_stream_count * timed_operations) % default_count ==
+                    0,
+            "benchmark operation count is incompatible with the default "
+            "coroutine count");
+    return default_count;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long count = std::strtoull(value, &end, 10);
+  require(end != value && *end == '\0' && errno == 0 && count != 0 &&
+              count <= benchmark_stream_count * timed_operations &&
               count % benchmark_stream_count == 0 &&
-              (benchmark_stream_count * benchmark_timed_operations) % count ==
+              (benchmark_stream_count * timed_operations) % count ==
                   0,
           "invalid ORCHFS_ASYNC_BENCHMARK_COROUTINES");
   return static_cast<std::size_t>(count);
@@ -856,6 +951,8 @@ BenchmarkSample run_benchmark_phase(orchfs::async::Runtime& runtime,
 void print_benchmark_sample(std::string_view phase,
                             const BenchmarkSample& sample,
                             std::size_t coroutine_count,
+                            std::size_t operations_per_stream,
+                            std::size_t run_index,
                             const std::vector<std::vector<
                                 std::chrono::nanoseconds>>& latencies) {
   const double seconds = sample.elapsed.count();
@@ -878,12 +975,13 @@ void print_benchmark_sample(std::string_view phase,
   }
   std::printf(
       "orchfs_layered_benchmark layer=client_shm_rpc_kfs_e2e "
-      "phase=%.*s block_size=%zu streams=%zu qd=%zu coroutines=%zu "
+      "run=%zu phase=%.*s block_size=%zu streams=%zu qd=%zu coroutines=%zu "
       "operations_per_stream=%zu bytes=%llu seconds=%.6f MiB_per_s=%.2f "
       "IOPS=%.2f p99_us=%.2f latency_samples=%zu\n",
+      run_index,
       static_cast<int>(phase.size()), phase.data(), benchmark_block_size,
       benchmark_stream_count, coroutine_count, coroutine_count,
-      benchmark_timed_operations,
+      operations_per_stream,
       static_cast<unsigned long long>(sample.bytes), seconds,
       mebibytes / seconds, operations / seconds, p99_microseconds,
       flattened.size());
@@ -1313,9 +1411,9 @@ int run_wrapper_client(const std::string& endpoint) {
             "wrapper client timed out waiting for server");
     require(::setenv("ORCHFS_ASYNC_ENDPOINT", endpoint.c_str(), 1) == 0,
             "setenv(ORCHFS_ASYNC_ENDPOINT) failed");
-    require(::setenv("ORCHFS_CLIENT_WORKERS", "1", 1) == 0,
+    require(::setenv("ORCHFS_CLIENT_WORKERS", "4", 1) == 0,
             "setenv(ORCHFS_CLIENT_WORKERS) failed");
-    require(::setenv("ORCHFS_IPC_RING_CAPACITY", "8", 1) == 0,
+    require(::setenv("ORCHFS_IPC_RING_CAPACITY", "64", 1) == 0,
             "setenv(ORCHFS_IPC_RING_CAPACITY) failed");
     require(::setenv("ORCHFS_IPC_DATA_SLOT_SIZE", "4096", 1) == 0,
             "setenv(ORCHFS_IPC_DATA_SLOT_SIZE) failed");
@@ -1330,17 +1428,33 @@ int run_wrapper_client(const std::string& endpoint) {
     using Open = int (*)(const char*, int, ...);
     using OpenAt = int (*)(int, const char*, int, ...);
     using Close = int (*)(int);
+    using Pread = ssize_t (*)(int, void*, std::size_t, off_t);
+    using Pwrite = ssize_t (*)(int, const void*, std::size_t, off_t);
+    using Read = ssize_t (*)(int, void*, std::size_t);
+    using Write = ssize_t (*)(int, const void*, std::size_t);
+    using Lseek = off_t (*)(int, off_t, int);
     using Mkdir = int (*)(const char*, mode_t);
     using Unlink = int (*)(const char*);
     using Rmdir = int (*)(const char*);
     using Rename = int (*)(const char*, const char*);
+    using AdapterShutdown = void (*)();
+    using AdapterPeakInflight = std::size_t (*)();
     const auto wrapped_open = wrapper_symbol<Open>(loaded, "open");
     const auto wrapped_openat = wrapper_symbol<OpenAt>(loaded, "openat");
     const auto wrapped_close = wrapper_symbol<Close>(loaded, "close");
+    const auto wrapped_pread = wrapper_symbol<Pread>(loaded, "pread");
+    const auto wrapped_pwrite = wrapper_symbol<Pwrite>(loaded, "pwrite");
+    const auto wrapped_read = wrapper_symbol<Read>(loaded, "read");
+    const auto wrapped_write = wrapper_symbol<Write>(loaded, "write");
+    const auto wrapped_lseek = wrapper_symbol<Lseek>(loaded, "lseek");
     const auto wrapped_mkdir = wrapper_symbol<Mkdir>(loaded, "mkdir");
     const auto wrapped_unlink = wrapper_symbol<Unlink>(loaded, "unlink");
     const auto wrapped_rmdir = wrapper_symbol<Rmdir>(loaded, "rmdir");
     const auto wrapped_rename = wrapper_symbol<Rename>(loaded, "rename");
+    const auto adapter_shutdown = wrapper_symbol<AdapterShutdown>(
+        loaded, "orchfs_async_adapter_shutdown");
+    const auto adapter_peak_inflight = wrapper_symbol<AdapterPeakInflight>(
+        loaded, "orchfs_async_adapter_peak_inflight");
 
     require(wrapped_mkdir("\\/adapter-openat-directory", 0755) == 0,
             "wrapper mkdir fixture failed");
@@ -1407,6 +1521,328 @@ int run_wrapper_client(const std::string& endpoint) {
             "failed OrchFS rename mutated the host namespace");
     require(::unlink(source) == 0, "host rename fixture cleanup failed");
 
+    constexpr std::size_t adapter_thread_count = 64;
+    constexpr std::size_t adapter_block_size = 4096;
+    auto run_parallel = [](auto operation) {
+      std::atomic<std::size_t> ready{0};
+      std::atomic<bool> start{false};
+      std::vector<std::thread> threads;
+      threads.reserve(adapter_thread_count);
+      for (std::size_t index = 0; index < adapter_thread_count; ++index) {
+        threads.emplace_back([&, index] {
+          ready.fetch_add(1, std::memory_order_release);
+          start.wait(false, std::memory_order_acquire);
+          operation(index);
+        });
+      }
+      while (ready.load(std::memory_order_acquire) != adapter_thread_count) {
+        std::this_thread::yield();
+      }
+      start.store(true, std::memory_order_release);
+      start.notify_all();
+      for (auto& thread : threads) {
+        thread.join();
+      }
+    };
+
+    std::array<int, adapter_thread_count> parallel_fds{};
+    std::array<std::string, adapter_thread_count> parallel_paths{};
+    for (std::size_t index = 0; index < adapter_thread_count; ++index) {
+      parallel_paths[index] =
+          "\\/adapter-concurrency-" + std::to_string(index);
+      parallel_fds[index] =
+          wrapped_open(parallel_paths[index].c_str(),
+                       O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+      require(parallel_fds[index] >= 1048576,
+              "parallel adapter fixture open failed");
+    }
+    std::array<std::vector<std::byte>, adapter_thread_count> parallel_blocks;
+    std::array<ssize_t, adapter_thread_count> parallel_results{};
+    std::array<int, adapter_thread_count> parallel_errors{};
+    for (std::size_t index = 0; index < adapter_thread_count; ++index) {
+      parallel_blocks[index].assign(
+          adapter_block_size,
+          static_cast<std::byte>(static_cast<unsigned char>(index + 1)));
+    }
+    run_parallel([&](std::size_t index) {
+      parallel_results[index] =
+          wrapped_pwrite(parallel_fds[index], parallel_blocks[index].data(),
+                         parallel_blocks[index].size(), 0);
+      parallel_errors[index] = errno;
+    });
+    require(adapter_peak_inflight() >= adapter_thread_count,
+            "POSIX adapter serialized parallel positioned writes");
+    for (std::size_t index = 0; index < adapter_thread_count; ++index) {
+      require(parallel_results[index] ==
+                  static_cast<ssize_t>(parallel_blocks[index].size()),
+              std::string("parallel adapter pwrite failed: ") +
+                  std::strerror(parallel_errors[index]));
+      std::vector<std::byte> contents(adapter_block_size);
+      require(wrapped_pread(parallel_fds[index], contents.data(), contents.size(),
+                            0) == static_cast<ssize_t>(contents.size()) &&
+                  contents == parallel_blocks[index],
+              "parallel adapter pwrite readback mismatch");
+      require(wrapped_close(parallel_fds[index]) == 0,
+              "parallel adapter fixture close failed");
+      require(wrapped_unlink(parallel_paths[index].c_str()) == 0,
+              "parallel adapter fixture cleanup failed");
+    }
+
+    constexpr char positioned_path[] = "\\/adapter-positioned-shared-fd";
+    const int positioned_fd =
+        wrapped_open(positioned_path,
+                     O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+    require(positioned_fd >= 1048576,
+            "shared positioned adapter fixture open failed");
+    std::vector<std::byte> positioned_seed(
+        adapter_thread_count * adapter_block_size, std::byte{0});
+    require(wrapped_pwrite(positioned_fd, positioned_seed.data(),
+                           positioned_seed.size(), 0) ==
+                static_cast<ssize_t>(positioned_seed.size()),
+            "shared positioned adapter fixture seed failed");
+    std::array<std::vector<std::byte>, adapter_thread_count> positioned_blocks;
+    std::array<ssize_t, adapter_thread_count> positioned_results{};
+    for (std::size_t index = 0; index < adapter_thread_count; ++index) {
+      positioned_blocks[index].assign(
+          adapter_block_size,
+          static_cast<std::byte>(static_cast<unsigned char>(index + 17)));
+    }
+    run_parallel([&](std::size_t index) {
+      positioned_results[index] = wrapped_pwrite(
+          positioned_fd, positioned_blocks[index].data(),
+          positioned_blocks[index].size(),
+          static_cast<off_t>(index * adapter_block_size));
+    });
+    for (std::size_t index = 0; index < adapter_thread_count; ++index) {
+      require(positioned_results[index] ==
+                  static_cast<ssize_t>(positioned_blocks[index].size()),
+              "same-fd concurrent pwrite failed");
+    }
+    std::array<std::vector<std::byte>, adapter_thread_count> positioned_reads;
+    run_parallel([&](std::size_t index) {
+      positioned_reads[index].resize(adapter_block_size);
+      positioned_results[index] = wrapped_pread(
+          positioned_fd, positioned_reads[index].data(),
+          positioned_reads[index].size(),
+          static_cast<off_t>(index * adapter_block_size));
+    });
+    for (std::size_t index = 0; index < adapter_thread_count; ++index) {
+      require(positioned_results[index] ==
+                      static_cast<ssize_t>(positioned_reads[index].size()) &&
+                  positioned_reads[index] == positioned_blocks[index],
+              "same-fd concurrent pread readback mismatch");
+    }
+    require(wrapped_close(positioned_fd) == 0 &&
+                wrapped_unlink(positioned_path) == 0,
+            "shared positioned adapter fixture cleanup failed");
+
+    constexpr char append_path[] = "\\/adapter-implicit-append";
+    const int append_fd = wrapped_open(
+        append_path, O_CREAT | O_TRUNC | O_RDWR | O_APPEND | O_CLOEXEC, 0644);
+    require(append_fd >= 1048576 && wrapped_write(append_fd, "S", 1) == 1,
+            "implicit append adapter fixture seed failed");
+    std::array<ssize_t, 2> append_results{};
+    std::array<std::thread, 2> append_threads;
+    for (std::size_t index = 0; index < append_threads.size(); ++index) {
+      append_threads[index] = std::thread([&, index] {
+        const char value = index == 0 ? 'L' : 'R';
+        ssize_t completed = 0;
+        for (std::size_t write_index = 0; write_index < 64; ++write_index) {
+          const ssize_t result = wrapped_write(append_fd, &value, 1);
+          if (result != 1) {
+            completed = -1;
+            break;
+          }
+          ++completed;
+        }
+        append_results[index] = completed;
+      });
+    }
+    for (auto& thread : append_threads) {
+      thread.join();
+    }
+    require(append_results[0] == 64 && append_results[1] == 64,
+            "same-fd concurrent append failed");
+    require(wrapped_lseek(append_fd, 0, SEEK_SET) == 0,
+            "implicit append rewind failed");
+    std::array<char, 129> append_contents{};
+    require(wrapped_read(append_fd, append_contents.data(),
+                         append_contents.size()) ==
+                static_cast<ssize_t>(append_contents.size()),
+            "implicit append readback failed");
+    require(append_contents[0] == 'S' &&
+                std::count(append_contents.begin() + 1, append_contents.end(),
+                           'L') == 64 &&
+                std::count(append_contents.begin() + 1, append_contents.end(),
+                           'R') == 64,
+            "implicit append ordering lost data");
+    require(wrapped_close(append_fd) == 0 &&
+                wrapped_unlink(append_path) == 0,
+            "implicit append adapter fixture cleanup failed");
+
+    const auto wait_for_marker = [](const std::string& marker) {
+      for (int retry = 0; retry < 500 && ::access(marker.c_str(), F_OK) != 0;
+           ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(::access(marker.c_str(), F_OK) == 0,
+              "adapter lifecycle race did not reach the server");
+    };
+
+    constexpr char close_race_path[] = "\\/adapter-close-race";
+    const std::string close_marker =
+        root_path + "/.adapter-close-race-active";
+    const int close_race_fd = wrapped_open(
+        close_race_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+    std::vector<std::byte> race_block(adapter_block_size, std::byte{0x5a});
+    require(close_race_fd >= 1048576 &&
+                wrapped_pwrite(close_race_fd, race_block.data(),
+                               race_block.size(), 0) ==
+                    static_cast<ssize_t>(race_block.size()),
+            "close-race adapter fixture seed failed");
+    (void)::unlink(close_marker.c_str());
+    ssize_t close_race_write = -1;
+    int close_race_write_error = 0;
+    std::thread close_race_thread([&] {
+      close_race_write = wrapped_pwrite(close_race_fd, race_block.data(),
+                                        race_block.size(), 0);
+      close_race_write_error = errno;
+    });
+    wait_for_marker(close_marker);
+    const int close_race_result = wrapped_close(close_race_fd);
+    const int close_race_close_error = errno;
+    close_race_thread.join();
+    require(close_race_write == static_cast<ssize_t>(race_block.size()) &&
+                close_race_result == 0,
+            std::string("close did not drain an in-flight positioned write: ") +
+                "write=" + std::to_string(close_race_write) + " (" +
+                std::strerror(close_race_write_error) + "), close=" +
+                std::to_string(close_race_result) + " (" +
+                std::strerror(close_race_close_error) + ")");
+    require(wrapped_unlink(close_race_path) == 0,
+            "close-race adapter fixture cleanup failed");
+    (void)::unlink(close_marker.c_str());
+
+    const char* skip_adapter_fork =
+        std::getenv("ORCHFS_SKIP_ADAPTER_FORK_TEST");
+    if (skip_adapter_fork == nullptr ||
+        std::strcmp(skip_adapter_fork, "0") == 0) {
+      constexpr char fork_parent_path[] = "\\/adapter-fork-parent";
+      const int fork_parent_fd = wrapped_open(
+          fork_parent_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+      require(fork_parent_fd >= 1048576 &&
+                  wrapped_pwrite(fork_parent_fd, race_block.data(),
+                                 race_block.size(), 0) ==
+                      static_cast<ssize_t>(race_block.size()),
+              "fork adapter parent fixture setup failed");
+      const pid_t adapter_child = ::fork();
+      require(adapter_child >= 0, "fork adapter child failed");
+      if (adapter_child == 0) {
+        std::byte inherited_byte{};
+        errno = 0;
+        const bool inherited_rejected =
+            wrapped_pread(fork_parent_fd, &inherited_byte, 1, 0) == -1 &&
+            errno == EBADF;
+        const int child_fd = wrapped_open(
+            "\\/adapter-fork-child",
+            O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+        const bool child_session_works =
+            child_fd >= 1048576 &&
+            wrapped_pwrite(child_fd, race_block.data(), race_block.size(), 0) ==
+                static_cast<ssize_t>(race_block.size()) &&
+            wrapped_close(child_fd) == 0;
+        _exit(inherited_rejected && child_session_works ? 0 : 1);
+      }
+      int adapter_child_status = 0;
+      require(::waitpid(adapter_child, &adapter_child_status, 0) ==
+                      adapter_child &&
+                  WIFEXITED(adapter_child_status) &&
+                  WEXITSTATUS(adapter_child_status) == 0,
+              "forked adapter did not establish an isolated session");
+      require(wrapped_close(fork_parent_fd) == 0 &&
+                  wrapped_unlink(fork_parent_path) == 0 &&
+                  wrapped_unlink("\\/adapter-fork-child") == 0,
+              "fork adapter fixture cleanup failed");
+    }
+
+    constexpr char reconnect_old_path[] = "\\/adapter-reconnect-old";
+    const int reconnect_old_fd = wrapped_open(
+        reconnect_old_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+    require(reconnect_old_fd >= 1048576 &&
+                wrapped_pwrite(reconnect_old_fd, "R", 1, 0) == 1,
+            "adapter reconnect fixture setup failed");
+    const std::string reconnect_ready =
+        root_path + "/.adapter-reconnect-ready";
+    const std::string reconnect_continue =
+        root_path + "/.adapter-reconnect-continue";
+    const int reconnect_marker = ::open(
+        reconnect_ready.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+    require(reconnect_marker >= 0 && ::close(reconnect_marker) == 0,
+            "adapter reconnect ready marker failed");
+    for (int retry = 0;
+         retry < 5000 && ::access(reconnect_continue.c_str(), F_OK) != 0;
+         ++retry) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    require(::access(reconnect_continue.c_str(), F_OK) == 0,
+            "adapter reconnect server restart timed out");
+
+    bool old_epoch_failed = false;
+    for (int retry = 0; retry < 5000 && !old_epoch_failed; ++retry) {
+      char value = 0;
+      errno = 0;
+      old_epoch_failed = wrapped_pread(reconnect_old_fd, &value, 1, 0) == -1;
+      if (!old_epoch_failed) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    require(old_epoch_failed,
+            "adapter retained an inherited handle after its session died");
+
+    constexpr char reconnect_new_path[] = "\\/adapter-reconnect-new";
+    int reconnect_new_fd = -1;
+    for (int retry = 0; retry < 5000 && reconnect_new_fd < 0; ++retry) {
+      reconnect_new_fd = wrapped_open(
+          reconnect_new_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+      if (reconnect_new_fd < 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    require(reconnect_new_fd >= 1048576 &&
+                wrapped_pwrite(reconnect_new_fd, "N", 1, 0) == 1,
+            "adapter did not establish a replacement SessionEpoch");
+    require(wrapped_close(reconnect_old_fd) == 0 &&
+                wrapped_close(reconnect_new_fd) == 0 &&
+                wrapped_unlink(reconnect_old_path) == 0 &&
+                wrapped_unlink(reconnect_new_path) == 0,
+            "adapter reconnect fixture cleanup failed");
+
+    constexpr char shutdown_race_path[] = "\\/adapter-shutdown-race";
+    const std::string shutdown_marker =
+        root_path + "/.adapter-shutdown-race-active";
+    const int shutdown_race_fd = wrapped_open(
+        shutdown_race_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+    require(shutdown_race_fd >= 1048576 &&
+                wrapped_pwrite(shutdown_race_fd, race_block.data(),
+                               race_block.size(), 0) ==
+                    static_cast<ssize_t>(race_block.size()),
+            "shutdown-race adapter fixture seed failed");
+    (void)::unlink(shutdown_marker.c_str());
+    ssize_t shutdown_race_write = -1;
+    std::thread shutdown_race_thread([&] {
+      shutdown_race_write = wrapped_pwrite(
+          shutdown_race_fd, race_block.data(), race_block.size(), 0);
+    });
+    wait_for_marker(shutdown_marker);
+    adapter_shutdown();
+    shutdown_race_thread.join();
+    require(shutdown_race_write == static_cast<ssize_t>(race_block.size()),
+            "adapter shutdown did not drain an in-flight positioned write");
+    errno = 0;
+    require(wrapped_pread(shutdown_race_fd, race_block.data(), 1, 0) == -1 &&
+                errno == ESHUTDOWN,
+            "stopped adapter accepted a new file lease");
+
     return 0;
   } catch (const std::exception& error) {
     std::fprintf(stderr, "wrapper client failure: %s\n", error.what());
@@ -1414,7 +1850,7 @@ int run_wrapper_client(const std::string& endpoint) {
   }
 }
 
-int run_benchmark_client(const std::string& endpoint) {
+int run_benchmark_client(const std::string& endpoint, std::size_t run_index) {
   try {
     for (int retry = 0; retry < 200 && ::access(endpoint.c_str(), F_OK) != 0;
          ++retry) {
@@ -1476,8 +1912,9 @@ int run_benchmark_client(const std::string& endpoint) {
 
     const std::uint64_t timed_offset =
         benchmark_warmup_operations * benchmark_block_size;
+    const std::size_t timed_operations = benchmark_timed_operations();
     const std::uint64_t timed_end =
-        timed_offset + benchmark_timed_operations * benchmark_block_size;
+        timed_offset + timed_operations * benchmark_block_size;
     // The legacy OrchFS core does not create sparse holes with pwrite: an
     // offset beyond the current end returns a short write. Preallocate outside
     // the sample so strided coroutine lanes measure steady-state data writes
@@ -1493,12 +1930,12 @@ int run_benchmark_client(const std::string& endpoint) {
             "ORCHFS_ASYNC_BENCHMARK_PHASE must be write, read, or both");
     const bool measure_write = phase != "read";
     const bool measure_read = phase != "write";
-    const std::size_t coroutine_count = benchmark_coroutine_count();
+    const std::size_t coroutine_count =
+        benchmark_coroutine_count(timed_operations);
     const std::size_t coroutines_per_stream =
         coroutine_count / benchmark_stream_count;
     const std::size_t operations_per_coroutine =
-        benchmark_stream_count * benchmark_timed_operations /
-        coroutine_count;
+        benchmark_stream_count * timed_operations / coroutine_count;
     const std::uint64_t coroutine_stride =
         coroutines_per_stream * benchmark_block_size;
     std::vector<std::vector<std::byte>> read_buffers(
@@ -1567,13 +2004,12 @@ int run_benchmark_client(const std::string& endpoint) {
     }
 
     const std::uint64_t expected_bytes =
-        benchmark_stream_count * benchmark_timed_operations *
-        benchmark_block_size;
+        benchmark_stream_count * timed_operations * benchmark_block_size;
     if (measure_write) {
       require(write_sample.bytes == expected_bytes,
               "benchmark write phase was incomplete");
       print_benchmark_sample("write+sync", write_sample, coroutine_count,
-                             write_latencies);
+                             timed_operations, run_index, write_latencies);
     }
     if (measure_read) {
       require(read_sample.bytes == expected_bytes,
@@ -1591,7 +2027,7 @@ int run_benchmark_client(const std::string& endpoint) {
                 "benchmark read data mismatch");
       }
       print_benchmark_sample("read", read_sample, coroutine_count,
-                             read_latencies);
+                             timed_operations, run_index, read_latencies);
     }
 
     for (std::size_t stream = 0; stream < benchmark_stream_count; ++stream) {
@@ -1951,6 +2387,45 @@ int run_client(const std::string& endpoint) {
                 std::errc::no_such_file_or_directory,
             "missing opendir did not return ENOENT");
 
+    const std::size_t baseline_client_pollers =
+        runtime->poller_stats().active_pollers;
+    for (std::size_t iteration = 0; iteration < session_churn_count();
+         ++iteration) {
+      orchfs::async::Client churn_client;
+      try {
+        churn_client = run(
+            *runtime,
+            orchfs::async::Client::connect(*runtime, client_options));
+      } catch (const std::exception& error) {
+        throw std::runtime_error(
+            "session churn connect iteration " + std::to_string(iteration) +
+            " failed: " + error.what());
+      }
+      try {
+        run(*runtime, churn_client.shutdown());
+      } catch (const std::exception& error) {
+        throw std::runtime_error(
+            "session churn shutdown iteration " +
+            std::to_string(iteration) + " failed: " + error.what());
+      }
+    }
+    orchfs::async::RuntimePollerStats client_poller_stats;
+    for (int retry = 0; retry < 1000; ++retry) {
+      client_poller_stats = runtime->poller_stats();
+      if (client_poller_stats.generations <= runtime->worker_count() &&
+          client_poller_stats.active_pollers == baseline_client_pollers) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    require(client_poller_stats.generations <= runtime->worker_count(),
+            "client Runtime retained historical poller generations");
+    require(client_poller_stats.active_pollers == baseline_client_pollers,
+            "client session churn leaked active pollers: active=" +
+                std::to_string(client_poller_stats.active_pollers) +
+                " generations=" +
+                std::to_string(client_poller_stats.generations));
+
     auto cleanup_on_shutdown = run(
         *runtime, client.open("/cleanup-on-shutdown", O_CREAT | O_RDWR, 0644));
     run(*runtime, client.shutdown());
@@ -2129,8 +2604,17 @@ int orchfs_device_unregister_dma_region(void* address, size_t length) {
 }  // extern "C"
 
 int main(int argc, char* argv[]) {
-  if (argc == 3 && std::strcmp(argv[1], "--benchmark-client") == 0) {
-    return run_benchmark_client(argv[2]);
+  if (argc == 4 && std::strcmp(argv[1], "--benchmark-client") == 0) {
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long run_index = std::strtoull(argv[3], &end, 10);
+    if (errno != 0 || end == argv[3] || *end != '\0' || run_index == 0 ||
+        run_index > std::numeric_limits<std::size_t>::max()) {
+      std::fprintf(stderr, "invalid benchmark run index\n");
+      return 1;
+    }
+    return run_benchmark_client(argv[2],
+                                static_cast<std::size_t>(run_index));
   }
 
   const char* benchmark_value = std::getenv("ORCHFS_RUN_ASYNC_BENCHMARK");
@@ -2190,7 +2674,7 @@ int main(int argc, char* argv[]) {
     orchfs::async::ServerOptions server_options;
     server_options.endpoint = endpoint;
     server_options.lane_count = 4;
-    server_options.ring_capacity = run_benchmark ? 64 : 8;
+    server_options.ring_capacity = 64;
     server_options.data_slot_size =
         run_benchmark
             ? benchmark_block_size + sizeof(orchfs::async::RpcRequest)
@@ -2204,7 +2688,52 @@ int main(int argc, char* argv[]) {
     require(::waitpid(child, &status, 0) == child, "waitpid failed");
     require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
             "client process failed");
+    orchfs::async::ServerSessionStats prior_session_stats;
     if (!skip_wrapper) {
+      const std::string reconnect_ready =
+          root_path + "/.adapter-reconnect-ready";
+      const std::string reconnect_continue =
+          root_path + "/.adapter-reconnect-continue";
+      for (int retry = 0;
+           retry < 60000 && ::access(reconnect_ready.c_str(), F_OK) != 0;
+           ++retry) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(::access(reconnect_ready.c_str(), F_OK) == 0,
+              "wrapper client did not reach the reconnect fixture");
+
+      for (int retry = 0; retry < 5000; ++retry) {
+        prior_session_stats = server->session_stats();
+        if (prior_session_stats.retired >= session_churn_count() &&
+            prior_session_stats.active <= 1) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(prior_session_stats.retired >= session_churn_count() &&
+                  prior_session_stats.active <= 1,
+              "server did not retire direct-client sessions before restart");
+      server->request_stop();
+      require(static_cast<bool>(server->join()),
+              "Server::join failed during adapter reconnect fixture");
+      prior_session_stats = server->session_stats();
+      require(prior_session_stats.active == 0 &&
+                  prior_session_stats.dma_regions == 0 &&
+                  prior_session_stats.dma_registrations ==
+                      prior_session_stats.dma_unregistrations,
+              "server restart left prior session resources active");
+      server.reset();
+
+      auto restarted =
+          orchfs::async::Server::start(*runtime, server_options);
+      require(static_cast<bool>(restarted),
+              "Server::start failed during adapter reconnect fixture");
+      server = std::move(restarted).value();
+      const int reconnect_marker = ::open(
+          reconnect_continue.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+      require(reconnect_marker >= 0 && ::close(reconnect_marker) == 0,
+              "adapter reconnect continue marker failed");
+
       int wrapper_status = 0;
       require(::waitpid(wrapper_child, &wrapper_status, 0) == wrapper_child,
               "waitpid wrapper client failed");
@@ -2212,22 +2741,79 @@ int main(int argc, char* argv[]) {
               "wrapper client process failed");
     }
 
-    if (run_benchmark) {
-      const pid_t benchmark_child = ::fork();
-      require(benchmark_child >= 0, "fork benchmark client failed");
-      if (benchmark_child == 0) {
-        ::execl("/proc/self/exe", argv[0], "--benchmark-client",
-                endpoint.c_str(), static_cast<char*>(nullptr));
-        std::perror("exec benchmark client");
-        _exit(127);
+    orchfs::async::ServerSessionStats session_stats;
+    orchfs::async::RuntimePollerStats server_poller_stats;
+    for (int retry = 0; retry < 5000; ++retry) {
+      session_stats = server->session_stats();
+      server_poller_stats = runtime->poller_stats();
+      if (session_stats.active == 0 &&
+          server_poller_stats.generations <= runtime->worker_count()) {
+        break;
       }
-      int benchmark_status = 0;
-      require(::waitpid(benchmark_child, &benchmark_status, 0) ==
-                  benchmark_child,
-              "waitpid benchmark client failed");
-      require(WIFEXITED(benchmark_status) &&
-                  WEXITSTATUS(benchmark_status) == 0,
-              "benchmark client process failed");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    require(session_stats.active == 0,
+            "session churn left active server sessions");
+    require(prior_session_stats.retired + session_stats.retired >=
+                session_churn_count(),
+            "server lost session retirement events");
+    require(prior_session_stats.dma_regions + session_stats.dma_regions == 0,
+            "session churn leaked active DMA regions");
+    require(prior_session_stats.dma_registrations +
+                session_stats.dma_registrations ==
+                prior_session_stats.dma_unregistrations +
+                    session_stats.dma_unregistrations,
+            "session churn left DMA registrations unbalanced");
+    if (ipc_hugepages_requested()) {
+      require(prior_session_stats.dma_registrations +
+                      session_stats.dma_registrations >=
+                  session_churn_count(),
+              "hugepage session churn did not exercise DMA registration");
+    }
+    require(server_poller_stats.generations <= runtime->worker_count(),
+            "server Runtime retained historical poller generations");
+    require(server_poller_stats.active_pollers == 1,
+            "session churn leaked active server pollers");
+
+    if (run_benchmark) {
+      const std::size_t repetitions = benchmark_repetitions();
+      const std::size_t retired_before_benchmark = session_stats.retired;
+      for (std::size_t run_index = 1; run_index <= repetitions; ++run_index) {
+        const std::string run_text = std::to_string(run_index);
+        const pid_t benchmark_child = ::fork();
+        require(benchmark_child >= 0, "fork benchmark client failed");
+        if (benchmark_child == 0) {
+          ::execl("/proc/self/exe", argv[0], "--benchmark-client",
+                  endpoint.c_str(), run_text.c_str(),
+                  static_cast<char*>(nullptr));
+          std::perror("exec benchmark client");
+          _exit(127);
+        }
+        int benchmark_status = 0;
+        require(::waitpid(benchmark_child, &benchmark_status, 0) ==
+                    benchmark_child,
+                "waitpid benchmark client failed");
+        require(WIFEXITED(benchmark_status) &&
+                    WEXITSTATUS(benchmark_status) == 0,
+                "benchmark client process failed");
+      }
+      for (int retry = 0; retry < 5000; ++retry) {
+        session_stats = server->session_stats();
+        server_poller_stats = runtime->poller_stats();
+        if (session_stats.active == 0 &&
+            server_poller_stats.generations <= runtime->worker_count()) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      require(session_stats.active == 0,
+              "repeated benchmark left active server sessions");
+      require(session_stats.retired >=
+                  retired_before_benchmark + repetitions,
+              "repeated benchmark lost session retirement events");
+      require(server_poller_stats.generations <= runtime->worker_count() &&
+                  server_poller_stats.active_pollers == 1,
+              "repeated benchmark leaked server pollers");
     }
 
     const auto cleanup_deadline =

@@ -368,13 +368,25 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
   };
 
  public:
+  using RetirementCallback = void (*)(void*, ServerSession*) noexcept;
+
   ServerSession(Runtime& runtime, ServerTransport transport,
-                std::shared_ptr<AsyncFilesystem> filesystem)
+                std::shared_ptr<AsyncFilesystem> filesystem,
+                void* retirement_context,
+                RetirementCallback retirement_callback,
+                std::atomic<std::size_t>& active_dma_regions,
+                std::atomic<std::size_t>& dma_registrations,
+                std::atomic<std::size_t>& dma_unregistrations)
       : runtime_(&runtime),
         transport_(std::move(transport)),
         config_(transport_.config()),
         filesystem_(std::move(filesystem)),
-        control_owner_(runtime.owner_for(transport_.client_id())) {
+        control_owner_(runtime.owner_for(transport_.client_id())),
+        retirement_context_(retirement_context),
+        retirement_callback_(retirement_callback),
+        active_dma_regions_(&active_dma_regions),
+        dma_registrations_(&dma_registrations),
+        dma_unregistrations_(&dma_unregistrations) {
     lanes_.reserve(config_.lane_count);
     for (std::uint32_t lane = 0; lane < config_.lane_count; ++lane) {
       lanes_.push_back(std::make_unique<LaneState>(
@@ -396,6 +408,8 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
         return {error, std::generic_category()};
       }
       dma_registered_.store(true, std::memory_order_release);
+      active_dma_regions_->fetch_add(1, std::memory_order_relaxed);
+      dma_registrations_->fetch_add(1, std::memory_order_relaxed);
     }
     for (auto& lane : lanes_) {
       auto registration = runtime_->register_poller(
@@ -461,6 +475,14 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
                       : std::error_code(error, std::generic_category());
   }
 
+  void set_retirement_next(ServerSession* next) noexcept {
+    retirement_next_.store(next, std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] ServerSession* retirement_next() const noexcept {
+    return retirement_next_.load(std::memory_order_relaxed);
+  }
+
   void unregister_dma_region() noexcept {
     if (!dma_registered_.exchange(false, std::memory_order_acq_rel)) {
       return;
@@ -471,7 +493,10 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       int expected = 0;
       (void)cleanup_error_.compare_exchange_strong(
           expected, error, std::memory_order_acq_rel);
+      return;
     }
+    active_dma_regions_->fetch_sub(1, std::memory_order_relaxed);
+    dma_unregistrations_->fetch_add(1, std::memory_order_relaxed);
   }
 
   Task<Completion> dispatch(Incoming incoming) {
@@ -688,6 +713,9 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
   }
 
   bool drain_completion_inbox(LaneState& lane) noexcept {
+    if (lane.completion_inbox.load(std::memory_order_acquire) == nullptr) {
+      return false;
+    }
     CompletionNode* stack =
         lane.completion_inbox.exchange(nullptr, std::memory_order_acquire);
     const bool progress = stack != nullptr;
@@ -1739,9 +1767,16 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
         progress |= pump_completions(lane);
       }
       if (forced_stop || completions_empty(lane)) {
-        lane.drained.store(true, std::memory_order_release);
+        // Retirement can remove the registry owner as soon as control sees
+        // drained. Pin only this one terminal callback; steady polling remains
+        // free of shared_ptr traffic.
+        auto self = shared_from_this();
         lane.registration.reset();
+        // Publish drained only after the owner has cleared the registration
+        // member. join() may run on worker 0 as soon as control observes this
+        // flag, so the release/acquire edge also protects that member.
         (void)runtime_->notify(control_owner_);
+        lane.drained.store(true, std::memory_order_release);
         return Runtime::PollState::progress;
       }
     }
@@ -1792,9 +1827,18 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
       return Runtime::PollState::busy;
     }
     transport_.mark_dead();
+    // The retirement event may immediately release the registry's last owner.
+    // Keep the object alive until this terminal poll callback has returned.
+    auto self = shared_from_this();
+    control_registration_.reset();
+    if (retirement_callback_ != nullptr) {
+      retirement_callback_(retirement_context_, this);
+    }
+    // Publish completion only after the callback stops using its raw Impl
+    // context. Server::Impl::join() may otherwise return and destroy that
+    // context while this worker is still publishing the retirement event.
     finished_.store(true, std::memory_order_release);
     finished_.notify_all();
-    control_registration_.reset();
     return Runtime::PollState::progress;
   }
 
@@ -1803,6 +1847,12 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
   TransportConfig config_;
   std::shared_ptr<AsyncFilesystem> filesystem_;
   std::size_t control_owner_{};
+  void* retirement_context_{};
+  RetirementCallback retirement_callback_{};
+  std::atomic<std::size_t>* active_dma_regions_{};
+  std::atomic<std::size_t>* dma_registrations_{};
+  std::atomic<std::size_t>* dma_unregistrations_{};
+  std::atomic<ServerSession*> retirement_next_{nullptr};
   Runtime::PollRegistration control_registration_;
   std::vector<std::unique_ptr<LaneState>> lanes_;
   SharedMemoryRegion dma_region_{};
@@ -1881,36 +1931,56 @@ class Server::Impl {
 
   void request_stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
-    const auto sessions = sessions_.load(std::memory_order_acquire);
-    for (const auto& session : *sessions) {
-      session->request_stop();
-    }
+    (void)runtime_->notify(0);
   }
 
   void request_drain() noexcept {
     drain_requested_.store(true, std::memory_order_release);
     stop_requested_.store(true, std::memory_order_release);
+    (void)runtime_->notify(0);
   }
 
   Result<void> join() noexcept {
-    if (drain_requested_.load(std::memory_order_acquire)) {
+    const bool drain = drain_requested_.load(std::memory_order_acquire);
+    if (drain) {
       request_drain();
     } else {
       request_stop();
     }
     accept_poll_registration_.reset();
-    auto sessions = sessions_.exchange(
-        std::make_shared<const SessionList>(), std::memory_order_acq_rel);
-    for (const auto& session : *sessions) {
+    SessionList sessions = std::move(sessions_);
+    sessions_.clear();
+    active_sessions_.store(0, std::memory_order_release);
+    if (!drain) {
+      for (const auto& session : sessions) {
+        session->request_stop();
+      }
+    }
+    for (const auto& session : sessions) {
       session->join();
       record_cleanup_error(session->cleanup_error());
     }
+    // Completion callbacks may publish while join() drains the stable owner
+    // snapshot. No accept poller remains to consume those intrusive links.
+    retired_sessions_.store(nullptr, std::memory_order_release);
     const int cleanup_error = cleanup_error_.load(std::memory_order_acquire);
     if (cleanup_error != 0) {
       return Result<void>::failure(
           std::error_code(cleanup_error, std::generic_category()));
     }
     return Result<void>::success();
+  }
+
+  [[nodiscard]] ServerSessionStats session_stats() const noexcept {
+    return {
+        .active = active_sessions_.load(std::memory_order_acquire),
+        .retired = retired_sessions_count_.load(std::memory_order_acquire),
+        .dma_regions = active_dma_regions_.load(std::memory_order_acquire),
+        .dma_registrations =
+            dma_registrations_.load(std::memory_order_acquire),
+        .dma_unregistrations =
+            dma_unregistrations_.load(std::memory_order_acquire),
+    };
   }
 
  private:
@@ -1923,36 +1993,53 @@ class Server::Impl {
         expected, error.value(), std::memory_order_acq_rel);
   }
 
-  void reap_finished_sessions() noexcept {
-    for (;;) {
-      auto current = sessions_.load(std::memory_order_acquire);
-      const auto found = std::find_if(
-          current->begin(), current->end(),
-          [](const auto& candidate) { return candidate->finished(); });
-      if (found == current->end()) {
-        return;
-      }
-      const auto retired = *found;
-      try {
-        auto updated = std::make_shared<SessionList>();
-        updated->reserve(current->size() - 1);
-        for (const auto& candidate : *current) {
-          if (candidate != retired) {
-            updated->push_back(candidate);
-          }
-        }
-        std::shared_ptr<const SessionList> published = std::move(updated);
-        if (!sessions_.compare_exchange_weak(
-                current, std::move(published), std::memory_order_release,
-                std::memory_order_acquire)) {
-          continue;
-        }
-      } catch (...) {
-        std::terminate();
-      }
-      retired->join();
-      record_cleanup_error(retired->cleanup_error());
+  static void publish_retirement_entry(void* context,
+                                       ServerSession* session) noexcept {
+    auto& self = *static_cast<Impl*>(context);
+    ServerSession* head =
+        self.retired_sessions_.load(std::memory_order_relaxed);
+    do {
+      session->set_retirement_next(head);
+    } while (!self.retired_sessions_.compare_exchange_weak(
+        head, session, std::memory_order_release, std::memory_order_relaxed));
+    (void)self.runtime_->notify(0);
+  }
+
+  bool drain_retired_sessions() noexcept {
+    ServerSession* retired =
+        retired_sessions_.exchange(nullptr, std::memory_order_acquire);
+    if (retired == nullptr) {
+      return false;
     }
+
+    ServerSession* ordered = nullptr;
+    while (retired != nullptr) {
+      ServerSession* next = retired->retirement_next();
+      retired->set_retirement_next(ordered);
+      ordered = retired;
+      retired = next;
+    }
+
+    while (ordered != nullptr) {
+      ServerSession* current = ordered;
+      ordered = current->retirement_next();
+      current->set_retirement_next(nullptr);
+      const auto found = std::find_if(
+          sessions_.begin(), sessions_.end(),
+          [current](const auto& candidate) {
+            return candidate.get() == current;
+          });
+      if (found == sessions_.end()) {
+        continue;
+      }
+      auto session = std::move(*found);
+      sessions_.erase(found);
+      active_sessions_.fetch_sub(1, std::memory_order_release);
+      retired_sessions_count_.fetch_add(1, std::memory_order_relaxed);
+      session->join();
+      record_cleanup_error(session->cleanup_error());
+    }
+    return true;
   }
 
   static Runtime::PollState poll_accept_entry(void* context) noexcept {
@@ -1960,15 +2047,26 @@ class Server::Impl {
   }
 
   Runtime::PollState poll_accept() noexcept {
+    const bool retired = drain_retired_sessions();
     if (stop_requested_.load(std::memory_order_acquire)) {
-      return Runtime::PollState::idle;
+      bool progress = retired;
+      if (!drain_requested_.load(std::memory_order_acquire) &&
+          !session_stop_propagated_) {
+        for (const auto& session : sessions_) {
+          session->request_stop();
+        }
+        session_stop_propagated_ = true;
+        progress = true;
+      }
+      return progress ? Runtime::PollState::progress
+                      : Runtime::PollState::idle;
     }
-    reap_finished_sessions();
     constexpr std::uint32_t kAcceptPollMask = 1023;
     if ((++accept_poll_ticks_ & kAcceptPollMask) != 0) {
-      return Runtime::PollState::busy;
+      return retired ? Runtime::PollState::progress
+                     : Runtime::PollState::busy;
     }
-    bool progress = false;
+    bool progress = retired;
     constexpr std::size_t kAcceptBudget = 8;
     for (std::size_t accepted = 0; accepted < kAcceptBudget; ++accepted) {
       std::error_code error;
@@ -1983,34 +2081,28 @@ class Server::Impl {
       progress = true;
       try {
         auto session = std::make_shared<ServerSession>(
-            *runtime_, std::move(transport), options_.filesystem);
+            *runtime_, std::move(transport), options_.filesystem, this,
+            &Impl::publish_retirement_entry, active_dma_regions_,
+            dma_registrations_, dma_unregistrations_);
+        sessions_.push_back(session);
         if (const auto start_error = session->start(); start_error) {
           session->request_stop();
+          sessions_.pop_back();
           continue;
         }
-        auto current = sessions_.load(std::memory_order_acquire);
-        for (;;) {
-          if (stop_requested_.load(std::memory_order_acquire)) {
-            session->request_stop();
-            session->join();
-            return Runtime::PollState::progress;
-          }
-          auto updated = std::make_shared<SessionList>(*current);
-          updated->push_back(session);
-          std::shared_ptr<const SessionList> published = std::move(updated);
-          if (sessions_.compare_exchange_weak(
-                  current, std::move(published), std::memory_order_release,
-                  std::memory_order_acquire)) {
-            break;
-          }
+        active_sessions_.fetch_add(1, std::memory_order_release);
+        if (stop_requested_.load(std::memory_order_acquire)) {
+          session->request_stop();
+          return Runtime::PollState::progress;
         }
       } catch (...) {
         // Keep accepting independent clients after an allocation failure.
       }
     }
-    // Listener readiness is likewise external to the Runtime wake word.
-    return progress ? Runtime::PollState::progress
-                    : Runtime::PollState::busy;
+    if (progress) {
+      return Runtime::PollState::progress;
+    }
+    return Runtime::PollState::busy;
   }
 
   Runtime* runtime_;
@@ -2020,9 +2112,15 @@ class Server::Impl {
   std::atomic<bool> drain_requested_{false};
   std::atomic<int> cleanup_error_{0};
   std::uint32_t accept_poll_ticks_{1023};
+  bool session_stop_propagated_{false};
   Runtime::PollRegistration accept_poll_registration_;
-  std::atomic<std::shared_ptr<const SessionList>> sessions_{
-      std::make_shared<const SessionList>()};
+  SessionList sessions_;
+  std::atomic<ServerSession*> retired_sessions_{nullptr};
+  std::atomic<std::size_t> active_sessions_{0};
+  std::atomic<std::size_t> retired_sessions_count_{0};
+  std::atomic<std::size_t> active_dma_regions_{0};
+  std::atomic<std::size_t> dma_registrations_{0};
+  std::atomic<std::size_t> dma_unregistrations_{0};
 };
 
 Server::Server(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -2091,6 +2189,10 @@ void Server::request_drain() noexcept {
 
 Result<void> Server::join() {
   return impl_ ? impl_->join() : Result<void>::success();
+}
+
+ServerSessionStats Server::session_stats() const noexcept {
+  return impl_ ? impl_->session_stats() : ServerSessionStats{};
 }
 
 }  // namespace orchfs::async

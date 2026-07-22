@@ -72,6 +72,7 @@ done
 printf -v core_mask_hex '0x%x' "${core_mask}"
 raw_qd=$((coroutines / worker_count))
 raw_ios=$((operations / worker_count))
+client_operations=$((operations / worker_count))
 
 timestamp=$(date +%Y%m%d-%H%M%S)
 result_dir=${ORCHFS_LAYERED_BENCHMARK_RESULT_DIR:-${repo_root}/benchmark-results/layered-${timestamp}}
@@ -196,10 +197,11 @@ for run in 1 2 3 4 5; do
   e2e_output=$(env \
     "ORCHFS_ASYNC_BENCHMARK_CLIENT_CPUS=${client_cpus}" \
     "ORCHFS_ASYNC_BENCHMARK_COROUTINES=${coroutines}" \
+    "ORCHFS_ASYNC_BENCHMARK_OPERATIONS=${client_operations}" \
     "ORCHFS_ASYNC_BENCHMARK_SPIN=${ORCHFS_ASYNC_BENCHMARK_SPIN:-256}" \
     "ORCHFS_ASYNC_BENCHMARK_PHASE=both" \
     taskset -c "${client_cpus}" "${build_dir}/async_client_server_test" \
-      --benchmark-client "${endpoint}" 2>&1)
+      --benchmark-client "${endpoint}" "${run}" 2>&1)
   printf '%s\n' "${e2e_output}" >> "${output_file}"
   while IFS= read -r line; do
     [[ ${line} == orchfs_layered_benchmark\ layer=client_shm_rpc_kfs_e2e* ]] || continue

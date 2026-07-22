@@ -19,7 +19,21 @@ struct RuntimeOptions {
     std::size_t worker_count{0};
     std::vector<unsigned> cpu_set;
     std::size_t spin_before_park{256};
+    // External block_on callers may briefly spin before entering the futex
+    // wait. Zero keeps the general Runtime default fully blocking.
+    std::size_t blocking_spin_count{0};
+    // At most this many concurrent block_on callers spin. Additional callers
+    // sleep immediately so deep queues do not steal CPUs from Runtime workers.
+    std::size_t blocking_spin_limit{0};
+    // Observe this many completed calls before enabling adaptive spinning.
+    // A deeper queue seen during the warmup permanently selects the sleep path.
+    std::size_t blocking_spin_warmup{64};
     std::function<void(std::error_code)> on_unobserved_error;
+};
+
+struct RuntimePollerStats {
+    std::size_t active_pollers{};
+    std::size_t generations{};
 };
 
 class Runtime final {
@@ -94,6 +108,40 @@ public:
         return Result<JoinHandle<T>>::success(JoinHandle<T>(std::move(state)));
     }
 
+    // Submit a root and synchronously consume it without allocating a shared
+    // completion or entering the global root registry.  This is the blocking
+    // compatibility bridge used at external ABIs such as POSIX/LD_PRELOAD;
+    // coroutine code should continue to use structured co_await or submit().
+    template <typename T>
+    [[nodiscard]] Result<T> block_on(Task<T>&& task) noexcept(
+        std::is_nothrow_move_constructible_v<T>) {
+        if (!task.valid()) {
+            return Result<T>::failure(Errc::invalid_task);
+        }
+        if (current() != nullptr) {
+            return Result<T>::failure(current() == this
+                                          ? Errc::join_from_worker
+                                          : Errc::wrong_runtime);
+        }
+
+        detail::CompletionState<T> state(this, {}, true);
+        if (!state.begin_consume()) {
+            std::terminate();
+        }
+        auto coroutine = task.release();
+        coroutine.promise().attach_root(&state);
+        state.set_root(coroutine);
+
+        auto submitted = submit_blocking_root(coroutine);
+        if (!submitted) {
+            return Result<T>::failure(submitted.error());
+        }
+        const std::size_t spin_count = begin_blocking_wait();
+        state.wait(spin_count);
+        end_blocking_wait();
+        return state.take();
+    }
+
     // Stop accepting new roots. Already submitted roots and their completions
     // are drained before worker shutdown.
     void request_stop() noexcept;
@@ -105,6 +153,7 @@ public:
     [[nodiscard]] std::size_t worker_count() const noexcept;
     [[nodiscard]] Result<unsigned> worker_cpu(std::size_t worker) const noexcept;
     [[nodiscard]] std::size_t owner_for(std::uint64_t key) const noexcept;
+    [[nodiscard]] RuntimePollerStats poller_stats() const noexcept;
 
     // Wake a worker so an owner-local poller can drain work published through
     // an external MPSC queue. No coroutine is created or scheduled.
@@ -181,8 +230,12 @@ private:
     [[nodiscard]] Result<void> submit_root(
         std::shared_ptr<detail::CompletionStateBase> state,
         std::coroutine_handle<> coroutine) noexcept;
+    [[nodiscard]] Result<void> submit_blocking_root(
+        std::coroutine_handle<> coroutine) noexcept;
     [[nodiscard]] detail::UnobservedErrorHandler
     unobserved_error_handler() const;
+    [[nodiscard]] std::size_t begin_blocking_wait() noexcept;
+    void end_blocking_wait() noexcept;
 
     [[nodiscard]] bool schedule_internal(std::coroutine_handle<> coroutine,
                                          std::size_t worker,
@@ -194,6 +247,8 @@ private:
                       std::coroutine_handle<> continuation) noexcept;
     void unregister_pin(std::coroutine_handle<> coroutine) noexcept;
     void on_root_completed(detail::CompletionStateBase* state) noexcept;
+    void on_blocking_root_completed(
+        detail::CompletionStateBase* state) noexcept;
 
     std::unique_ptr<Impl> impl_;
 
@@ -202,6 +257,8 @@ private:
                                         bool) noexcept;
     friend void detail::root_completed(Runtime*,
                                        detail::CompletionStateBase*) noexcept;
+    friend void detail::blocking_root_completed(
+        Runtime*, detail::CompletionStateBase*) noexcept;
     friend void detail::pin_current(std::coroutine_handle<>) noexcept;
     friend void detail::register_pin(std::coroutine_handle<>,
                                      detail::ResumeTarget) noexcept;

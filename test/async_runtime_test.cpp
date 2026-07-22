@@ -10,6 +10,7 @@
 #include <string_view>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 #include <pthread.h>
 #include <sys/wait.h>
@@ -406,6 +407,28 @@ int main() {
     check(static_cast<bool>(answer), "answer submit");
     auto answer_result = std::move(answer.value()).join();
     check(answer_result && answer_result.value() == 42, "answer join");
+
+    auto blocked_answer = runtime->block_on(answer_task());
+    check(blocked_answer && blocked_answer.value() == 42,
+          "blocking root bridge");
+    std::atomic<unsigned> blocking_failures{0};
+    std::vector<std::thread> blocking_callers;
+    for (unsigned caller = 0; caller < 8; ++caller) {
+        blocking_callers.emplace_back([&] {
+            for (unsigned call = 0; call < 128; ++call) {
+                auto result = runtime->block_on(answer_task());
+                if (!result || result.value() != 42) {
+                    blocking_failures.fetch_add(1,
+                                                std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& caller : blocking_callers) {
+        caller.join();
+    }
+    check(blocking_failures.load(std::memory_order_relaxed) == 0,
+          "concurrent blocking root bridge");
 
     const std::size_t owner = runtime->owner_for(0x12345678U);
     auto owned = runtime->submit(owner_task(*runtime, owner));

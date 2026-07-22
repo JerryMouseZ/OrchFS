@@ -4,7 +4,6 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
-#include <climits>
 #include <deque>
 #include <immintrin.h>
 #include <new>
@@ -201,13 +200,19 @@ void futex_wait_for(std::atomic<std::uint32_t>& epoch,
 
 struct Runtime::PollRegistration::State {
     static constexpr std::uint8_t kActive = 1U << 0U;
-    static constexpr std::uint8_t kInvoking = 1U << 1U;
+
+    struct Quiescence {
+        std::atomic<std::uint64_t> poll_epoch{0};
+        std::atomic<bool> exited{false};
+        std::atomic<std::uint32_t> wake_epoch{0};
+    };
 
     Runtime* runtime{};
     std::size_t worker{detail::no_worker};
     PollFunction function{};
     void* context{};
     std::atomic<std::uint8_t> lifecycle{kActive};
+    std::shared_ptr<Quiescence> quiescence;
 };
 
 Runtime::PollRegistration::PollRegistration(PollRegistration&& other) noexcept
@@ -231,7 +236,7 @@ void Runtime::PollRegistration::reset() noexcept {
     if (!state) {
         return;
     }
-    const std::uint8_t previous = state->lifecycle.fetch_and(
+    state->lifecycle.fetch_and(
         static_cast<std::uint8_t>(~State::kActive),
         std::memory_order_acq_rel);
     if (Runtime::current() == state->runtime &&
@@ -240,11 +245,19 @@ void Runtime::PollRegistration::reset() noexcept {
         // Waiting here would deadlock if reset was requested from that callback.
         return;
     }
-    if ((previous & State::kInvoking) == 0U) {
+    const auto quiescence = state->quiescence;
+    if (!quiescence) {
         return;
     }
-    while ((state->lifecycle.load(std::memory_order_acquire) &
-            State::kInvoking) != 0U) {
+    const std::uint64_t observed =
+        quiescence->poll_epoch.load(std::memory_order_acquire);
+    if (quiescence->exited.load(std::memory_order_acquire)) {
+        return;
+    }
+    quiescence->wake_epoch.fetch_add(1, std::memory_order_release);
+    futex_wake(quiescence->wake_epoch, 1);
+    while (quiescence->poll_epoch.load(std::memory_order_acquire) == observed &&
+           !quiescence->exited.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
 }
@@ -379,10 +392,16 @@ struct Runtime::Impl {
 
         std::thread thread;
         std::deque<detail::CompletionStateBase*> deferred_completed;
+        std::deque<detail::CompletionStateBase*> deferred_blocking_completed;
 
         std::atomic_flag poller_update = ATOMIC_FLAG_INIT;
         std::vector<std::unique_ptr<const PollerList>> poller_generations;
         std::atomic<const PollerList*> pollers{nullptr};
+        std::atomic<bool> poller_generations_dirty{false};
+        // Shared with registrations so reset remains safe when a poller object
+        // outlives a Runtime whose worker has already stopped.
+        std::shared_ptr<PollRegistration::State::Quiescence> quiescence{
+            std::make_shared<PollRegistration::State::Quiescence>()};
 
         Worker()
             : work_node_pool(
@@ -487,7 +506,9 @@ struct Runtime::Impl {
     std::atomic<std::size_t> root_submitters{0};
     std::atomic<std::size_t> scheduled_items{0};
     std::atomic<std::size_t> round_robin{0};
-    std::atomic<std::uint32_t> wake_epoch{0};
+    std::atomic<std::size_t> blocking_waiters{0};
+    std::atomic<std::size_t> blocking_completions{0};
+    std::atomic<bool> blocking_spin_disabled{false};
 
     std::atomic<bool> scheduling_closed{false};
 
@@ -500,18 +521,28 @@ struct Runtime::Impl {
     std::atomic<bool> abort_start{false};
     std::atomic<bool> join_started{false};
 
-    void wake_one() noexcept {
-        wake_epoch.fetch_add(1, std::memory_order_release);
-        futex_wake(wake_epoch, 1);
+    void wake_worker(std::size_t worker_index) noexcept {
+        auto& epoch = workers[worker_index]->quiescence->wake_epoch;
+        epoch.fetch_add(1, std::memory_order_release);
+        futex_wake(epoch, 1);
     }
 
     void wake_all() noexcept {
-        wake_epoch.fetch_add(1, std::memory_order_release);
-        futex_wake(wake_epoch, INT_MAX);
+        for (std::size_t worker_index = 0; worker_index < workers.size();
+             ++worker_index) {
+            wake_worker(worker_index);
+        }
     }
 
     void drain_inbox(std::size_t worker_index) noexcept {
         auto& worker = *workers[worker_index];
+        // Remote publications are sparse compared with the busy-poll rate.
+        // Avoid an unconditional atomic exchange (and cache-line ownership)
+        // on every empty iteration.  wake_epoch still closes the load/park
+        // race when a producer publishes immediately after this check.
+        if (worker.inbox.load(std::memory_order_acquire) == nullptr) {
+            return;
+        }
         WorkNode* stack =
             worker.inbox.exchange(nullptr, std::memory_order_acquire);
         if (stack == nullptr) {
@@ -576,21 +607,37 @@ struct Runtime::Impl {
             scheduling_closed.store(false, std::memory_order_seq_cst);
             return false;
         }
+        // Worker 0 is the only closer. Other workers may already be parked
+        // after consuming request_stop()'s wake, so publish the terminal
+        // decision with a fresh wake for every worker.
+        wake_all();
         return true;
     }
 
     void publish_deferred_completions(std::size_t worker_index) noexcept {
-        auto& deferred = workers[worker_index]->deferred_completed;
-        if (deferred.empty()) {
-            return;
-        }
-        {
-            AtomicFlagGuard guard(roots_update);
-            for (auto* completed : deferred) {
-                roots.erase(completed);
+        auto& worker = *workers[worker_index];
+        auto& deferred = worker.deferred_completed;
+        if (!deferred.empty()) {
+            {
+                AtomicFlagGuard guard(roots_update);
+                for (auto* completed : deferred) {
+                    roots.erase(completed);
+                }
             }
+            deferred.clear();
         }
-        deferred.clear();
+
+        auto& blocking = worker.deferred_blocking_completed;
+        for (auto* completed : blocking) {
+            // resume() has returned, so the root frame is no longer executing.
+            // Finish every Runtime-side access before publishing readiness;
+            // the external waiter owns the stack completion after that point.
+            completed->destroy_blocking_root();
+            pending_roots.fetch_sub(1, std::memory_order_acq_rel);
+            wake_all();
+            completed->publish_blocking_ready();
+        }
+        blocking.clear();
     }
 
     [[nodiscard]] PollState poll_services(std::size_t worker_index) noexcept {
@@ -598,21 +645,11 @@ struct Runtime::Impl {
         const auto* pollers = workers[worker_index]->pollers.load(
             std::memory_order_acquire);
         for (const auto& poller : *pollers) {
-            std::uint8_t expected = PollRegistration::State::kActive;
-            if (!poller->lifecycle.compare_exchange_strong(
-                    expected,
-                    static_cast<std::uint8_t>(
-                        PollRegistration::State::kActive |
-                        PollRegistration::State::kInvoking),
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
+            if ((poller->lifecycle.load(std::memory_order_acquire) &
+                 PollRegistration::State::kActive) == 0U) {
                 continue;
             }
             const PollState state = poller->function(poller->context);
-            poller->lifecycle.fetch_and(
-                static_cast<std::uint8_t>(
-                    ~PollRegistration::State::kInvoking),
-                std::memory_order_release);
             if (state == PollState::progress) {
                 aggregate = PollState::progress;
             } else if (state == PollState::busy &&
@@ -623,11 +660,35 @@ struct Runtime::Impl {
         return aggregate;
     }
 
+    void reclaim_poller_generations(std::size_t worker_index) noexcept {
+        auto& worker = *workers[worker_index];
+        // Registration changes are rare, while this runs on every busy-poll
+        // iteration.  Keep the steady-state path read-only so it does not
+        // acquire exclusive ownership of the cache line on every pass.
+        if (!worker.poller_generations_dirty.load(std::memory_order_acquire) ||
+            !worker.poller_generations_dirty.exchange(
+                false, std::memory_order_acq_rel)) {
+            return;
+        }
+        AtomicFlagGuard guard(worker.poller_update);
+        const auto* current = worker.pollers.load(std::memory_order_acquire);
+        auto& generations = worker.poller_generations;
+        generations.erase(
+            std::remove_if(generations.begin(), generations.end(),
+                           [current](const auto& generation) {
+                               return generation.get() != current;
+                           }),
+            generations.end());
+    }
+
     void worker_loop(std::size_t worker_index) noexcept {
         while (!start_gate.load(std::memory_order_acquire)) {
             start_gate.wait(false, std::memory_order_acquire);
         }
         if (abort_start.load(std::memory_order_acquire)) {
+            workers[worker_index]->quiescence->exited.store(
+                true, std::memory_order_release);
+            workers[worker_index]->quiescence->exited.notify_all();
             return;
         }
 
@@ -638,11 +699,19 @@ struct Runtime::Impl {
         tls_frame_pool = &workers[worker_index]->coroutine_frames;
 
         std::size_t spins = 0;
-        std::uint32_t observed_epoch =
-            wake_epoch.load(std::memory_order_acquire);
-
+        std::uint64_t poll_epoch = 0;
         for (;;) {
+            auto& worker = *workers[worker_index];
+            const std::uint32_t observed_wake =
+                worker.quiescence->wake_epoch.load(std::memory_order_acquire);
             const PollState service_state = poll_services(worker_index);
+            worker.quiescence->poll_epoch.store(++poll_epoch,
+                                                 std::memory_order_release);
+            // Poller lists are immutable generations. Only their owning worker
+            // reads the published raw pointer, so the owner can reclaim every
+            // older generation immediately after an iteration. Publishers
+            // serialize with this short section and never free generations.
+            reclaim_poller_generations(worker_index);
             WorkItem item;
             if (pop_local(worker_index, item)) {
                 spins = 0;
@@ -681,13 +750,7 @@ struct Runtime::Impl {
             }
 
             spins = 0;
-            // request_stop() advances wake_epoch before notifying.  Do not use
-            // stop_requested itself as a wake predicate: a stopped Runtime may
-            // still have roots suspended on external I/O, and a permanently
-            // true predicate would make every idle worker busy-spin while the
-            // completion is outstanding.
-            futex_wait_for(wake_epoch, observed_epoch);
-            observed_epoch = wake_epoch.load(std::memory_order_acquire);
+            futex_wait_for(worker.quiescence->wake_epoch, observed_wake);
         }
 
         tls_pin_depth = 0;
@@ -695,6 +758,9 @@ struct Runtime::Impl {
         tls_frame_pool = nullptr;
         tls_worker = detail::no_worker;
         tls_runtime = nullptr;
+        workers[worker_index]->quiescence->exited.store(
+            true, std::memory_order_release);
+        workers[worker_index]->quiescence->exited.notify_all();
     }
 };
 
@@ -896,8 +962,6 @@ Result<void> Runtime::submit_root(
     }
     impl_->pending_roots.fetch_add(1, std::memory_order_release);
     impl_->root_submitters.fetch_sub(1, std::memory_order_release);
-    impl_->wake_all();
-
     const std::size_t worker =
         impl_->round_robin.fetch_add(1, std::memory_order_relaxed) %
         impl_->workers.size();
@@ -908,6 +972,27 @@ Result<void> Runtime::submit_root(
             impl_->roots.erase(state.get());
         }
         impl_->pending_roots.fetch_sub(1, std::memory_order_release);
+        return Result<void>::failure(Errc::runtime_stopping);
+    }
+    return Result<void>::success();
+}
+
+Result<void> Runtime::submit_blocking_root(
+    std::coroutine_handle<> coroutine) noexcept {
+    impl_->root_submitters.fetch_add(1, std::memory_order_acq_rel);
+    if (!impl_->accepting.load(std::memory_order_acquire)) {
+        impl_->root_submitters.fetch_sub(1, std::memory_order_release);
+        return Result<void>::failure(Errc::runtime_stopping);
+    }
+
+    impl_->pending_roots.fetch_add(1, std::memory_order_release);
+    impl_->root_submitters.fetch_sub(1, std::memory_order_release);
+    const std::size_t worker =
+        impl_->round_robin.fetch_add(1, std::memory_order_relaxed) %
+        impl_->workers.size();
+    if (!schedule_internal(coroutine, worker, 0, false)) {
+        impl_->pending_roots.fetch_sub(1, std::memory_order_release);
+        impl_->wake_all();
         return Result<void>::failure(Errc::runtime_stopping);
     }
     return Result<void>::success();
@@ -982,6 +1067,7 @@ Result<Runtime::PollRegistration> Runtime::register_poller(
         state->context = context;
 
         auto& target = *impl_->workers[worker];
+        state->quiescence = target.quiescence;
         {
             AtomicFlagGuard guard(target.poller_update);
             const auto* current = target.pollers.load(std::memory_order_acquire);
@@ -997,8 +1083,10 @@ Result<Runtime::PollRegistration> Runtime::register_poller(
             const auto* published = updated.get();
             target.poller_generations.push_back(std::move(updated));
             target.pollers.store(published, std::memory_order_release);
+            target.poller_generations_dirty.store(true,
+                                                  std::memory_order_release);
         }
-        impl_->wake_all();
+        impl_->wake_worker(worker);
         return Result<PollRegistration>::success(
             PollRegistration(std::move(state)));
     } catch (const std::bad_alloc&) {
@@ -1020,15 +1108,32 @@ std::size_t Runtime::owner_for(std::uint64_t key) const noexcept {
     return static_cast<std::size_t>(key % impl_->workers.size());
 }
 
+RuntimePollerStats Runtime::poller_stats() const noexcept {
+    RuntimePollerStats stats;
+    for (const auto& worker_ptr : impl_->workers) {
+        auto& worker = *worker_ptr;
+        AtomicFlagGuard guard(worker.poller_update);
+        stats.generations += worker.poller_generations.size();
+        const auto* pollers = worker.pollers.load(std::memory_order_acquire);
+        for (const auto& poller : *pollers) {
+            if ((poller->lifecycle.load(std::memory_order_acquire) &
+                 PollRegistration::State::kActive) != 0U) {
+                ++stats.active_pollers;
+            }
+        }
+    }
+    return stats;
+}
+
 bool Runtime::notify(std::size_t worker) noexcept {
     if (worker >= impl_->workers.size() ||
         !impl_->running.load(std::memory_order_acquire) ||
         impl_->joined.load(std::memory_order_acquire)) {
         return false;
     }
-    // The futex epoch is process-wide. Waking all avoids relying on a parked
-    // worker consuming a wake intended for another owner's poller.
-    impl_->wake_all();
+    // Each worker has its own futex epoch, so an owner-local publication wakes
+    // exactly the worker that can consume it.
+    impl_->wake_worker(worker);
     return true;
 }
 
@@ -1113,7 +1218,7 @@ bool Runtime::schedule_internal(std::coroutine_handle<> coroutine,
             head, node, std::memory_order_release,
             std::memory_order_relaxed));
     }
-    impl_->wake_one();
+    impl_->wake_worker(worker);
     return true;
 }
 
@@ -1166,8 +1271,41 @@ void Runtime::on_root_completed(detail::CompletionStateBase* state) noexcept {
     impl_->wake_all();
 }
 
+void Runtime::on_blocking_root_completed(
+    detail::CompletionStateBase* state) noexcept {
+    if (tls_runtime != this || tls_worker >= impl_->workers.size() ||
+        state == nullptr) {
+        std::terminate();
+    }
+    impl_->workers[tls_worker]->deferred_blocking_completed.push_back(state);
+}
+
 detail::UnobservedErrorHandler Runtime::unobserved_error_handler() const {
     return impl_->options.on_unobserved_error;
+}
+
+std::size_t Runtime::begin_blocking_wait() noexcept {
+    const std::size_t waiters =
+        impl_->blocking_waiters.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (waiters > impl_->options.blocking_spin_limit) {
+        impl_->blocking_spin_disabled.store(true, std::memory_order_release);
+        return 0;
+    }
+    if (impl_->blocking_spin_disabled.load(std::memory_order_acquire) ||
+        impl_->blocking_completions.load(std::memory_order_relaxed) <
+            impl_->options.blocking_spin_warmup) {
+        return 0;
+    }
+    return impl_->options.blocking_spin_count;
+}
+
+void Runtime::end_blocking_wait() noexcept {
+    const std::size_t previous =
+        impl_->blocking_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    if (previous == 0) {
+        std::terminate();
+    }
+    impl_->blocking_completions.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool Runtime::ScheduleOnAwaiter::await_suspend(
@@ -1315,6 +1453,14 @@ void root_completed(Runtime* runtime, CompletionStateBase* state) noexcept {
         std::terminate();
     }
     runtime->on_root_completed(state);
+}
+
+void blocking_root_completed(Runtime* runtime,
+                             CompletionStateBase* state) noexcept {
+    if (runtime == nullptr || state == nullptr) {
+        std::terminate();
+    }
+    runtime->on_blocking_root_completed(state);
 }
 
 } // namespace detail
