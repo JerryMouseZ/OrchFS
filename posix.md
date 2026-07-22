@@ -8,6 +8,35 @@
 
 本轮同时解除进程级 I/O 串行化，落地零共享完成态的同步快速桥、单 client worker/多 SHM lane、Runtime/poller 热路径减负和低并发自适应短自旋。QD1 相对优化前的 POSIX no-spin 基线，吞吐写/读提高 **5.64%/10.54%**，p99 降低 **38.54%/4.73%**；因此 QD1“吞吐和 p99 回退不超过5%”门槛通过。native QD1 p99 仍比 POSIX 好 6.14%/23.69%，这是后续优化空间，不把它误报为已经达到 native p99 parity。
 
+## 2026-07-22 读路径后续
+
+已完成 `goal.md` 中优先级最高的同步边界调整：positioned I/O 不再创建并等待 root coroutine。外部调用线程现在直接向 Client session 发布同协议 pending；client worker 只取得 completion slot lease 并发布完成，原 `pread` 调用线程负责把 SHM payload 复制到用户 buffer，并在 lease 析构时释放 CQ slot。Runtime 的自适应阻塞等待策略仍封装在 Runtime/Session 内部，没有扩散到 POSIX Adapter 接口。
+
+同一机器、同一 SPDK namespace 上，以优化前 `HEAD=32f6cf0` 编译出的独立二进制为基线，做五组交替顺序、fresh-server、64 KiB、QD64、每轮4 GiB的配对 A/B：
+
+| 版本 | 读 MiB/s 中位数 | p99 µs 中位数 |
+| --- | ---: | ---: |
+| 优化前 root-coroutine POSIX 路径 | 5797.63 | 3000.00 |
+| **调用线程 copy + 直接同步 pending** | **6073.83** | **3082.05** |
+| 变化 | **+4.76%** | **+2.74%** |
+
+配对原始数据见[`metrics.tsv`](/mnt/home/jz/Projects/OrchFS/benchmark-results/direct-pending-ab-20260722-092032/metrics.tsv)。相对前一日 native SHM-RPC 的6593.27 MiB/s，这个长窗口结果为92.12%；由于 native 数值不是同一时段的配对样本，只把它用于剩余差距定位，不把7.88%的差距当成严格 A/B 结论。
+
+profile 也与所有权变化一致：client 侧 `memmove` cycles 从4.04%降到0.89%，root coroutine 调度符号退出主要热点，剩余热点转为 completion ring acquire、client worker loop和poll lane。新旧 profile 分别见[`posix-direct-pending-profile-20260722-091727`](/mnt/home/jz/Projects/OrchFS/benchmark-results/posix-direct-pending-profile-20260722-091727/)和[`posix-profile-finalpath-20260721-222319`](/mnt/home/jz/Projects/OrchFS/benchmark-results/posix-profile-finalpath-20260721-222319/)。
+
+最终代码的独立五轮短窗口回归为：QD64写/读3818.04/5623.40 MiB/s、p99 3111.95/3008.57 µs；QD1写/读3679.23/1864.43 MiB/s、p99 119.39/260.81 µs。QD1相对前一轮接受值的吞吐变化为-2.64%/+2.71%，两项p99均改善，因此“不回退超过5%”门槛继续通过。样本见[`QD64`](/mnt/home/jz/Projects/OrchFS/benchmark-results/posix-direct-pending-qd64-20260722-091544/samples.log)和[`QD1`](/mnt/home/jz/Projects/OrchFS/benchmark-results/posix-direct-pending-qd1-20260722-091823/samples.log)。
+
+后两个建议均做了可运行原型和配对 A/B，但没有留下无收益复杂度：
+
+| 原型 | 吞吐变化 | p99变化 | 处理 |
+| --- | ---: | ---: | --- |
+| Runtime 每轮批量执行8个 WorkItem | +0.46% | +0.54% | 噪声范围，完整回滚 |
+| idle-poller ready bitmap + 按需 quiescence | -0.56% | -0.08% | 无吞吐收益，完整回滚 |
+| 仅按需 quiescence | -0.62% | +0.62% | 无收益，完整回滚 |
+| aligned SSD read 按物理 block 分散到 data worker | -0.16% | +1.31% | 多一次 worker hop 未换来吞吐，完整回滚 |
+
+对应数据见[`work batch`](/mnt/home/jz/Projects/OrchFS/benchmark-results/runtime-work-batch-ab-20260722-092859/metrics.tsv)、[`ready bitmap`](/mnt/home/jz/Projects/OrchFS/benchmark-results/runtime-ready-bitmap-ab-20260722-094022/metrics.tsv)、[`quiescence`](/mnt/home/jz/Projects/OrchFS/benchmark-results/runtime-quiescence-ab-20260722-094356/metrics.tsv)和[`read sharding`](/mnt/home/jz/Projects/OrchFS/benchmark-results/kfs-read-sharding-ab-20260722-095427/metrics.tsv)。这些结果说明当前4-stream/QD64口径下，固定轮询和inode owner并不是再加一层调度就能兑现的瓶颈；后续若重做，应先增加按poller/worker/queue的负载计数，再设计无需额外跨worker往返的数据面。
+
 ## 执行状态
 
 | 优先级 | 状态 | 本轮结果 |

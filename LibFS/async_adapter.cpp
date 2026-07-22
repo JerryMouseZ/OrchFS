@@ -1112,10 +1112,9 @@ extern "C" ssize_t orchfs_async_pread(int fd, void *buffer, size_t length,
   if (!lease) {
     return -1;
   }
-  auto result = run(
-      lease->epoch(),
-      lease->slot().file.read_at(static_cast<std::uint64_t>(offset),
-                                 {static_cast<std::byte *>(buffer), length}));
+  auto result = lease->slot().file.read_at_blocking(
+      static_cast<std::uint64_t>(offset),
+      {static_cast<std::byte *>(buffer), length});
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }
@@ -1136,11 +1135,9 @@ extern "C" ssize_t orchfs_async_pwrite(int fd, const void *buffer,
   if (!lease) {
     return -1;
   }
-  auto result = run(
-      lease->epoch(),
-      lease->slot().file.write_at(
-          static_cast<std::uint64_t>(offset),
-          {static_cast<const std::byte *>(buffer), length}));
+  auto result = lease->slot().file.write_at_blocking(
+      static_cast<std::uint64_t>(offset),
+      {static_cast<const std::byte *>(buffer), length});
   if (!result) {
     return fail(result.error(), static_cast<ssize_t>(-1));
   }

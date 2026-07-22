@@ -231,6 +231,28 @@ class ConnectAwaiter {
 
 class Session final : public std::enable_shared_from_this<Session> {
  public:
+  struct BlockingCall {
+    std::atomic<bool> ready{false};
+    std::error_code error;
+    ReceivedIpcSlot completion;
+
+    void wait(std::size_t spin_count) noexcept {
+      bool completed = ready.load(std::memory_order_acquire);
+      while (!completed && spin_count-- != 0) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+        completed = ready.load(std::memory_order_acquire);
+      }
+      while (!completed) {
+        ready.wait(false, std::memory_order_acquire);
+        completed = ready.load(std::memory_order_acquire);
+      }
+    }
+  };
+
   struct Pending {
     IpcDescriptor descriptor;
     std::vector<std::byte> request_payload;
@@ -242,6 +264,7 @@ class Session final : public std::enable_shared_from_this<Session> {
     std::coroutine_handle<> continuation{};
     std::size_t resume_worker{};
     std::uint32_t lane{};
+    BlockingCall* blocking_call{};
     bool detached{};
     bool direct_response{};
     bool stop_after_completion{};
@@ -390,36 +413,46 @@ class Session final : public std::enable_shared_from_this<Session> {
       Opcode opcode, RpcRequest request, std::size_t data_size = 0,
       std::span<const std::byte> request_tail = {},
       std::span<std::byte> response_target = {}) {
-    if (sizeof(RpcRequest) > config_.data_slot_size ||
-        data_size != request_tail.size() ||
-        data_size > config_.data_slot_size - sizeof(RpcRequest) ||
-        data_size > std::numeric_limits<std::uint32_t>::max()) {
-      co_return Result<RpcReply>::failure(
-          std::make_error_code(std::errc::message_size));
+    auto created = make_header_pending(opcode, request, data_size, request_tail,
+                                       response_target);
+    if (!created) {
+      co_return Result<RpcReply>::failure(created.error());
     }
-    request.schema_version = kRpcSchemaVersion;
-    request.path1_length = 0;
-    request.path2_length = 0;
-    request.data_length = static_cast<std::uint32_t>(data_size);
-
-    std::shared_ptr<Pending> pending;
-    try {
-      pending = make_pending();
-      std::memcpy(pending->inline_request.data(), &request, sizeof(request));
-      pending->uses_inline_request = true;
-      pending->descriptor.opcode = opcode;
-      pending->descriptor.flags = DescriptorFlag::request |
-                                  DescriptorFlag::has_payload;
-      pending->descriptor.payload_length =
-          static_cast<std::uint32_t>(sizeof(RpcRequest) + data_size);
-      pending->request_tail = request_tail;
-      pending->response_target = response_target;
-      pending->direct_response = !response_target.empty();
-    } catch (const std::bad_alloc&) {
-      co_return Result<RpcReply>::failure(
-          std::make_error_code(std::errc::not_enough_memory));
-    }
+    auto pending = std::move(created).value();
     co_return co_await PendingAwaiter(shared_from_this(), pending);
+  }
+
+  Result<ReceivedIpcSlot> rpc_header_blocking(
+      Opcode opcode, RpcRequest request, std::size_t data_size = 0,
+      std::span<const std::byte> request_tail = {}) {
+    if (Runtime::current() != nullptr) {
+      return Result<ReceivedIpcSlot>::failure(
+          Runtime::current() == runtime_ ? Errc::join_from_worker
+                                         : Errc::wrong_runtime);
+    }
+
+    auto created =
+        make_header_pending(opcode, request, data_size, request_tail, {});
+    if (!created) {
+      return Result<ReceivedIpcSlot>::failure(created.error());
+    }
+    auto pending = std::move(created).value();
+    BlockingCall call;
+    pending->blocking_call = &call;
+    pending->lane = next_lane_.fetch_add(1, std::memory_order_relaxed) %
+                    static_cast<std::uint32_t>(lanes_.size());
+    pending->resume_worker = lanes_[pending->lane]->owner;
+    if (!enqueue(pending)) {
+      return Result<ReceivedIpcSlot>::failure(pending->error);
+    }
+
+    const std::size_t spin_count = runtime_->begin_blocking_wait();
+    call.wait(spin_count);
+    runtime_->end_blocking_wait();
+    if (call.error) {
+      return Result<ReceivedIpcSlot>::failure(call.error);
+    }
+    return Result<ReceivedIpcSlot>::success(std::move(call.completion));
   }
 
   [[nodiscard]] std::size_t max_payload() const noexcept {
@@ -467,6 +500,43 @@ class Session final : public std::enable_shared_from_this<Session> {
   }
 
  private:
+  Result<std::shared_ptr<Pending>> make_header_pending(
+      Opcode opcode, RpcRequest request, std::size_t data_size,
+      std::span<const std::byte> request_tail,
+      std::span<std::byte> response_target) {
+    if (sizeof(RpcRequest) > config_.data_slot_size ||
+        data_size != request_tail.size() ||
+        data_size > config_.data_slot_size - sizeof(RpcRequest) ||
+        data_size > std::numeric_limits<std::uint32_t>::max()) {
+      return Result<std::shared_ptr<Pending>>::failure(
+          std::make_error_code(std::errc::message_size));
+    }
+    request.schema_version = kRpcSchemaVersion;
+    request.path1_length = 0;
+    request.path2_length = 0;
+    request.data_length = static_cast<std::uint32_t>(data_size);
+
+    try {
+      auto pending = make_pending();
+      std::memcpy(pending->inline_request.data(), &request, sizeof(request));
+      pending->uses_inline_request = true;
+      pending->descriptor.opcode = opcode;
+      pending->descriptor.flags = DescriptorFlag::request |
+                                  DescriptorFlag::has_payload;
+      pending->descriptor.payload_length =
+          static_cast<std::uint32_t>(sizeof(RpcRequest) + data_size);
+      pending->request_tail = request_tail;
+      pending->response_target = response_target;
+      pending->direct_response = !response_target.empty();
+      return Result<std::shared_ptr<Pending>>::success(std::move(pending));
+    } catch (const std::bad_alloc&) {
+      return Result<std::shared_ptr<Pending>>::failure(
+          std::make_error_code(std::errc::not_enough_memory));
+    } catch (...) {
+      std::terminate();
+    }
+  }
+
   std::shared_ptr<Pending> make_pending() {
     if (Runtime::current() == runtime_) {
       const std::size_t worker = Runtime::current_worker();
@@ -678,6 +748,10 @@ class Session final : public std::enable_shared_from_this<Session> {
                       std::error_code error, IpcDescriptor descriptor = {},
                       std::vector<std::byte> payload = {},
                       std::size_t direct_payload_size = 0) noexcept {
+    if (pending->blocking_call != nullptr) {
+      finish_blocking_pending(pending, error, {});
+      return;
+    }
     pending->error = error;
     pending->reply.descriptor = descriptor;
     pending->reply.payload = std::move(payload);
@@ -694,6 +768,26 @@ class Session final : public std::enable_shared_from_this<Session> {
     if (pending->stop_after_completion) {
       request_stop();
     }
+  }
+
+  void finish_blocking_pending(const std::shared_ptr<Pending>& pending,
+                               std::error_code error,
+                               ReceivedIpcSlot completion) noexcept {
+    BlockingCall* call = std::exchange(pending->blocking_call, nullptr);
+    if (call == nullptr) {
+      std::terminate();
+    }
+    call->error = error;
+    call->completion = std::move(completion);
+    outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+    (void)runtime_->notify(control_owner_);
+    if (pending->stop_after_completion) {
+      request_stop();
+    }
+    // Publish last: after this store the external thread may destroy both its
+    // stack call cell and the Pending owner immediately.
+    call->ready.store(true, std::memory_order_release);
+    call->ready.notify_one();
   }
 
   void fail_lane(LaneState& lane, std::error_code error) noexcept {
@@ -813,6 +907,10 @@ class Session final : public std::enable_shared_from_this<Session> {
       }
       auto pending = std::move(found->second);
       lane.pending.erase(found);
+      if (pending->blocking_call != nullptr) {
+        finish_blocking_pending(pending, {}, std::move(completion));
+        continue;
+      }
       if (pending->direct_response) {
         if (received_payload.size() > pending->response_target.size()) {
           finish_pending(
@@ -1410,6 +1508,55 @@ Task<Result<std::size_t>> File::read_at(std::uint64_t offset,
   co_return Result<std::size_t>::success(completed);
 }
 
+Result<std::size_t> File::read_at_blocking(
+    std::uint64_t offset, std::span<std::byte> buffer) {
+  if (!valid()) {
+    return Result<std::size_t>::failure(Errc::invalid_handle);
+  }
+  if (offset >
+          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+      buffer.size() >
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::int64_t>::max()) - offset) {
+    return Result<std::size_t>::failure(
+        std::make_error_code(std::errc::value_too_large));
+  }
+
+  std::size_t completed = 0;
+  const std::size_t max_chunk = session_->max_payload() - sizeof(RpcRequest);
+  while (completed < buffer.size()) {
+    const std::size_t chunk = std::min(max_chunk, buffer.size() - completed);
+    RpcRequest request;
+    request.handle = handle_;
+    request.offset = static_cast<std::int64_t>(offset + completed);
+    request.length = chunk;
+    auto received =
+        session_->rpc_header_blocking(Opcode::read_at, request);
+    if (!received) {
+      return Result<std::size_t>::failure(received.error());
+    }
+    auto completion = std::move(received).value();
+    const auto descriptor = completion.descriptor();
+    const auto payload = completion.payload();
+    if (auto error = status_error(descriptor.status)) {
+      return Result<std::size_t>::failure(error);
+    }
+    const std::size_t bytes = descriptor.result_length;
+    if (bytes > chunk || payload.size() != bytes) {
+      return Result<std::size_t>::failure(
+          std::make_error_code(std::errc::protocol_error));
+    }
+    if (!payload.empty()) {
+      std::memcpy(buffer.data() + completed, payload.data(), payload.size());
+    }
+    completed += bytes;
+    if (bytes != chunk) {
+      break;
+    }
+  }
+  return Result<std::size_t>::success(completed);
+}
+
 Task<Result<std::size_t>> File::write_at(
     std::uint64_t offset, std::span<const std::byte> buffer) {
   if (!valid()) {
@@ -1449,6 +1596,52 @@ Task<Result<std::size_t>> File::write_at(
     }
   }
   co_return Result<std::size_t>::success(completed);
+}
+
+Result<std::size_t> File::write_at_blocking(
+    std::uint64_t offset, std::span<const std::byte> buffer) {
+  if (!valid()) {
+    return Result<std::size_t>::failure(Errc::invalid_handle);
+  }
+  if (offset >
+          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+      buffer.size() >
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::int64_t>::max()) - offset) {
+    return Result<std::size_t>::failure(
+        std::make_error_code(std::errc::value_too_large));
+  }
+
+  std::size_t completed = 0;
+  const std::size_t max_chunk = session_->max_payload() - sizeof(RpcRequest);
+  while (completed < buffer.size()) {
+    const std::size_t chunk = std::min(max_chunk, buffer.size() - completed);
+    RpcRequest request;
+    request.handle = handle_;
+    request.offset = static_cast<std::int64_t>(offset + completed);
+    request.length = chunk;
+    request.flags = static_cast<std::uint32_t>(RpcRequestFlag::data_follows);
+    auto received = session_->rpc_header_blocking(
+        Opcode::write_at, request, chunk, buffer.subspan(completed, chunk));
+    if (!received) {
+      return Result<std::size_t>::failure(received.error());
+    }
+    auto completion = std::move(received).value();
+    const auto descriptor = completion.descriptor();
+    if (auto error = status_error(descriptor.status)) {
+      return Result<std::size_t>::failure(error);
+    }
+    const std::size_t bytes = descriptor.result_length;
+    if (bytes > chunk) {
+      return Result<std::size_t>::failure(
+          std::make_error_code(std::errc::protocol_error));
+    }
+    completed += bytes;
+    if (bytes != chunk) {
+      break;
+    }
+  }
+  return Result<std::size_t>::success(completed);
 }
 
 Task<Result<std::uint64_t>> File::seek(std::int64_t offset, int whence) {

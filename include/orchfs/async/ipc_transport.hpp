@@ -105,7 +105,9 @@ class CompletionReservation final {
 };
 
 // ClientTransport is a process-local view of one KFS-owned session. Each lane
-// is SPSC: exactly one LibFS worker submits and consumes completions on it.
+// is SPSC: exactly one LibFS worker publishes submissions and acquires
+// completions. A completion-slot lease may then move to the blocking caller;
+// releasing that lease only publishes the already-consumed slot generation.
 // An inherited object is deliberately invalid after fork; the child must
 // connect a new session. Destroying that inherited object does not affect the
 // parent's session.

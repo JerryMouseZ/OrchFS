@@ -87,6 +87,14 @@ class File {
                                     std::span<std::byte> buffer);
   Task<Result<std::size_t>> write_at(std::uint64_t offset,
                                      std::span<const std::byte> buffer);
+  // Blocking compatibility seam for external syscall threads. These methods
+  // submit directly to the Client session, so the caller consumes a leased CQ
+  // slot and performs the read copy itself instead of resuming a root
+  // coroutine on the client worker. Calling them from a Runtime worker fails.
+  Result<std::size_t> read_at_blocking(std::uint64_t offset,
+                                       std::span<std::byte> buffer);
+  Result<std::size_t> write_at_blocking(
+      std::uint64_t offset, std::span<const std::byte> buffer);
   Task<Result<std::uint64_t>> seek(std::int64_t offset, int whence);
   Task<Result<FileStat>> stat();
   Task<Result<FileSystemStat>> statfs();

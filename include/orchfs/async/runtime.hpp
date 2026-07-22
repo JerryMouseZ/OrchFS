@@ -13,6 +13,8 @@
 
 namespace orchfs::async {
 
+class Session;
+
 struct RuntimeOptions {
     // Zero selects one worker for every CPU in cpu_set (or the current process
     // affinity mask when cpu_set is empty).
@@ -265,6 +267,10 @@ private:
     friend void detail::transfer_pin_to_continuation(
         std::coroutine_handle<>, std::coroutine_handle<>) noexcept;
     friend void detail::unpin_current(std::coroutine_handle<>) noexcept;
+    // Session owns the direct blocking Client path. Keep Runtime's adaptive
+    // wait policy behind this internal seam rather than exposing it to POSIX
+    // callers.
+    friend class Session;
 };
 
 } // namespace orchfs::async
