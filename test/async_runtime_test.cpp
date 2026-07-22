@@ -1,4 +1,5 @@
 #include "orchfs/async/detail/concurrency.hpp"
+#include "orchfs/async/detail/range_lock.hpp"
 #include "orchfs/async/range_arbiter.hpp"
 #include "orchfs/async/runtime.hpp"
 
@@ -445,6 +446,22 @@ int main() {
     static_assert(!std::is_copy_constructible_v<JoinHandle<int>>);
 
     test_mpsc_inbox();
+
+    const auto release_error =
+        std::make_error_code(std::errc::operation_canceled);
+    auto successful_operation = Result<int>::success(42);
+    orchfs::async::detail::fold_range_lock_release(
+        successful_operation, Result<void>::failure(release_error));
+    check(!successful_operation &&
+              successful_operation.error() == release_error,
+          "range release overrides successful operation");
+    const auto operation_error =
+        std::make_error_code(std::errc::permission_denied);
+    auto failed_operation = Result<int>::failure(operation_error);
+    orchfs::async::detail::fold_range_lock_release(
+        failed_operation, Result<void>::failure(release_error));
+    check(!failed_operation && failed_operation.error() == operation_error,
+          "range release preserves failed operation");
 
     auto transformed = Result<int>::success(6).transform(
         [](int value) { return value * 7; });

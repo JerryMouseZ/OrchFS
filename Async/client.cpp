@@ -1,6 +1,7 @@
 #include "orchfs/async/client.hpp"
 
 #include "orchfs/async/detail/concurrency.hpp"
+#include "orchfs/async/detail/range_lock.hpp"
 #include "orchfs/async/detail/stat_conversion.hpp"
 #include "orchfs/async/ipc_transport.hpp"
 #include "orchfs/async/runtime.hpp"
@@ -1253,10 +1254,8 @@ Task<Result<std::size_t>> File::read(std::span<std::byte> buffer) {
   if (!valid()) {
     co_return Result<std::size_t>::failure(Errc::invalid_handle);
   }
-  ORCHFS_TRY(permit,
-             co_await offset_gate_.acquire(0, 1, RangeMode::write));
-  auto result = co_await read_unlocked(buffer);
-  ORCHFS_TRYV(co_await permit.release());
+  ORCHFS_WITH_RANGE_LOCK(result, offset_gate_, 0, 1, RangeMode::write,
+                         read_unlocked(buffer));
   co_return result;
 }
 
@@ -1295,10 +1294,8 @@ Task<Result<std::size_t>> File::write(std::span<const std::byte> buffer) {
   if (!valid()) {
     co_return Result<std::size_t>::failure(Errc::invalid_handle);
   }
-  ORCHFS_TRY(permit,
-             co_await offset_gate_.acquire(0, 1, RangeMode::write));
-  auto result = co_await write_unlocked(buffer);
-  ORCHFS_TRYV(co_await permit.release());
+  ORCHFS_WITH_RANGE_LOCK(result, offset_gate_, 0, 1, RangeMode::write,
+                         write_unlocked(buffer));
   co_return result;
 }
 
@@ -1493,10 +1490,8 @@ Task<Result<std::uint64_t>> File::seek(std::int64_t offset, int whence) {
   if (!valid()) {
     co_return Result<std::uint64_t>::failure(Errc::invalid_handle);
   }
-  ORCHFS_TRY(permit,
-             co_await offset_gate_.acquire(0, 1, RangeMode::write));
-  auto result = co_await seek_unlocked(offset, whence);
-  ORCHFS_TRYV(co_await permit.release());
+  ORCHFS_WITH_RANGE_LOCK(result, offset_gate_, 0, 1, RangeMode::write,
+                         seek_unlocked(offset, whence));
   co_return result;
 }
 
