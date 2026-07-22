@@ -1,6 +1,7 @@
 #include "orchfs/async/server.hpp"
 
 #include "orchfs/async/block_device.hpp"
+#include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/filesystem.hpp"
 #include "orchfs/async/ipc_transport.hpp"
 #include "orchfs/async/range_arbiter.hpp"
@@ -668,14 +669,14 @@ class ServerSession final : public std::enable_shared_from_this<ServerSession> {
 
  private:
   static void fail(Completion& completion, int error) noexcept {
-    completion.descriptor.status = -(error > 0 ? error : EIO);
+    completion.descriptor.status = -detail::errno_error(error).value();
     completion.descriptor.result_length = 0;
     completion.payload.clear();
     completion.filled_payload_size = 0;
   }
 
   static int error_number(std::error_code error) noexcept {
-    return error.value() > 0 ? error.value() : EIO;
+    return detail::errno_error(error.value()).value();
   }
 
   Runtime::ScheduleOnAwaiter schedule_handle_owner(

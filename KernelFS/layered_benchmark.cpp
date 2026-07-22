@@ -3,6 +3,7 @@
 #include "spdk_device_service.h"
 
 #include "orchfs/async/block_device.hpp"
+#include "orchfs/async/detail/concurrency.hpp"
 #include "orchfs/async/kfs_coroutine_core.hpp"
 #include "orchfs/async/runtime.hpp"
 
@@ -52,7 +53,7 @@ int error_number(std::error_code error) noexcept {
   if (!error) {
     return 0;
   }
-  return error.value() > 0 ? error.value() : EIO;
+  return orchfs::async::detail::errno_error(error.value()).value();
 }
 
 template <typename Integer>

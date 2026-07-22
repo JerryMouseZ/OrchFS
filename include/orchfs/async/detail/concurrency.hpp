@@ -1,10 +1,29 @@
 #pragma once
 
+#include "orchfs/async/result.hpp"
+
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <immintrin.h>
+#include <system_error>
 
 namespace orchfs::async::detail {
+
+template <bool kNormalize = true>
+[[nodiscard, gnu::always_inline]] inline std::error_code
+errno_error(int error) noexcept {
+    if constexpr (kNormalize) {
+        error = error > 0 ? error : EIO;
+    }
+    return {error, std::generic_category()};
+}
+
+template <typename T>
+[[nodiscard, gnu::always_inline]] inline Result<T>
+errno_failure(int error) noexcept {
+    return Result<T>::failure(errno_error(error));
+}
 
 // Some fixed-size tables historically use only the first mixing round. The
 // template keeps those indices bit-for-bit stable while sharing the sequence.

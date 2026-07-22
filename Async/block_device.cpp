@@ -1,5 +1,6 @@
 #include "orchfs/async/block_device.hpp"
 
+#include "orchfs/async/detail/concurrency.hpp"
 #include "../KernelFS/async_device.h"
 
 #include <cerrno>
@@ -139,7 +140,7 @@ public:
             break;
         }
         if (error != 0) {
-            error_ = std::error_code(error, std::generic_category());
+            error_ = detail::errno_error<false>(error);
             continuation_ = {};
             return false;
         }
@@ -170,8 +171,7 @@ private:
             error_number = EIO;
         }
         if (error_number != 0) {
-            awaiter.error_ =
-                std::error_code(error_number, std::generic_category());
+            awaiter.error_ = detail::errno_error<false>(error_number);
         }
         awaiter.bytes_ = bytes;
         const auto previous = awaiter.submission_state_.exchange(
@@ -301,7 +301,7 @@ public:
         const int error = error_.load(std::memory_order_acquire);
         if (error != 0) {
             return Result<std::size_t>::failure(
-                std::error_code(error, std::generic_category()));
+                detail::errno_error<false>(error));
         }
         return Result<std::size_t>::success(
             bytes_.load(std::memory_order_acquire));

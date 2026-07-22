@@ -54,16 +54,7 @@ constexpr int kSsdBlockExtent = 6;
 static_assert(ORCHFS_CORE_PAGE_COUNT == kBlockSize / kPageSize);
 static_assert(sizeof(orchfs_core_dirent) == ORCHFS_CORE_DIRENT_SIZE);
 
-template <typename T>
-Result<T> errno_failure(int error) {
-  return Result<T>::failure(std::error_code(error > 0 ? error : EIO,
-                                            std::generic_category()));
-}
-
-Result<void> errno_failure_void(int error) {
-  return Result<void>::failure(std::error_code(error > 0 ? error : EIO,
-                                               std::generic_category()));
-}
+using detail::errno_failure;
 
 NodeType node_type(int type) noexcept {
   switch (type) {
@@ -515,7 +506,7 @@ class KfsCoroutineCore::Impl {
 
   Task<Result<void>> schedule_inode_owner(InodeNumber inode) {
     if (inode < 0) {
-      co_return errno_failure_void(EINVAL);
+      co_return errno_failure<void>(EINVAL);
     }
     const auto owner = runtime_->owner_for(static_cast<std::uint64_t>(inode));
     // Call schedule_on even when already on owner: it marks this nested frame
@@ -827,7 +818,7 @@ class KfsCoroutineCore::Impl {
       ++open_references_[inode];
       return Result<void>::success();
     } catch (const std::bad_alloc&) {
-      return errno_failure_void(ENOMEM);
+      return errno_failure<void>(ENOMEM);
     }
   }
 
@@ -838,7 +829,7 @@ class KfsCoroutineCore::Impl {
     }
     auto found = open_references_.find(node.inode);
     if (found == open_references_.end() || found->second == 0) {
-      co_return errno_failure_void(EBADF);
+      co_return errno_failure<void>(EBADF);
     }
     if (found->second > 1) {
       --found->second;
@@ -857,7 +848,7 @@ class KfsCoroutineCore::Impl {
     const int error = transaction->invoke(
         [&] { return orchfs_core_delete_inode(node.inode); });
     if (error != 0) {
-      co_return errno_failure_void(error);
+      co_return errno_failure<void>(error);
     }
     auto committed = co_await journal_.commit(transaction->release());
     if (!committed) {
@@ -1049,7 +1040,7 @@ class KfsCoroutineCore::Impl {
     }
     co_return written.value().bytes == sizeof(entry)
                   ? Result<void>::success()
-                  : errno_failure_void(EIO);
+                  : errno_failure<void>(EIO);
   }
 
   Task<Result<std::uint64_t>> free_directory_slot(InodeNumber directory) {
@@ -1216,7 +1207,7 @@ class KfsCoroutineCore::Impl {
       });
       Result<void> committed = error == 0
           ? co_await journal_.commit(transaction->release())
-          : errno_failure_void(error);
+          : errno_failure<void>(error);
       auto released = co_await range_permit.release();
       if (error != 0) {
         co_return errno_failure<OpenedNode>(error);
@@ -1283,10 +1274,10 @@ class KfsCoroutineCore::Impl {
       co_return Result<void>::failure(child.error());
     }
     if (child.value().inode.inode == orchfs_core_root_inode()) {
-      co_return errno_failure_void(EBUSY);
+      co_return errno_failure<void>(EBUSY);
     }
     if (child.value().inode.type != expected_type) {
-      co_return errno_failure_void(
+      co_return errno_failure<void>(
           expected_type == ORCHFS_CORE_DIRECTORY ? ENOTDIR : EISDIR);
     }
     if (expected_type == ORCHFS_CORE_DIRECTORY) {
@@ -1295,7 +1286,7 @@ class KfsCoroutineCore::Impl {
         co_return Result<void>::failure(empty.error());
       }
       if (!empty.value()) {
-        co_return errno_failure_void(ENOTEMPTY);
+        co_return errno_failure<void>(ENOTEMPTY);
       }
     }
     child.value().entry.type = 0;
@@ -1310,7 +1301,7 @@ class KfsCoroutineCore::Impl {
       try {
         orphaned_.insert(child.value().inode.inode);
       } catch (const std::bad_alloc&) {
-        co_return errno_failure_void(ENOMEM);
+        co_return errno_failure<void>(ENOMEM);
       }
     }
     auto removed = co_await write_directory_entry(
@@ -1327,7 +1318,7 @@ class KfsCoroutineCore::Impl {
         return orchfs_core_delete_inode(child.value().inode.inode);
       });
       if (error != 0) {
-        co_return errno_failure_void(error);
+        co_return errno_failure<void>(error);
       }
     }
     auto committed = co_await journal_.commit(transaction->release());
@@ -1358,7 +1349,7 @@ class KfsCoroutineCore::Impl {
       co_return Result<void>::failure(new_parent.error());
     }
     if (old_parent.value().parent != new_parent.value().parent) {
-      co_return errno_failure_void(EXDEV);
+      co_return errno_failure<void>(EXDEV);
     }
     auto source = co_await find_child(old_parent.value().parent,
                                       old_parent.value().name);
@@ -1371,7 +1362,7 @@ class KfsCoroutineCore::Impl {
     auto destination = co_await find_child(new_parent.value().parent,
                                            new_parent.value().name);
     if (destination) {
-      co_return errno_failure_void(EEXIST);
+      co_return errno_failure<void>(EEXIST);
     }
     if (destination.error().value() != ENOENT) {
       co_return Result<void>::failure(destination.error());
@@ -1982,7 +1973,7 @@ Task<Result<OpenedNode>> KfsCoroutineCore::open_at(
 
 Task<Result<void>> KfsCoroutineCore::close(OpenedNode node) {
   if (node.inode < 0 || node.type == NodeType::unknown) {
-    co_return errno_failure_void(EBADF);
+    co_return errno_failure<void>(EBADF);
   }
   co_return co_await impl_->release(node);
 }
@@ -2181,7 +2172,7 @@ Task<Result<void>> KfsCoroutineCore::truncate(std::string path,
 Task<Result<void>> KfsCoroutineCore::truncate(InodeNumber inode,
                                                std::uint64_t size) {
   if (size > kMaximumFileSize) {
-    co_return errno_failure_void(EFBIG);
+    co_return errno_failure<void>(EFBIG);
   }
   auto scheduled = co_await impl_->schedule_inode_owner(inode);
   if (!scheduled) {
@@ -2200,12 +2191,12 @@ Task<Result<void>> KfsCoroutineCore::truncate(InodeNumber inode,
   orchfs_core_inode snapshot{};
   int error = orchfs_core_snapshot(inode, &snapshot);
   Result<void> result = error == 0 ? Result<void>::success()
-                                   : errno_failure_void(error);
+                                   : errno_failure<void>(error);
   if (result && snapshot.size < 0) {
-    result = errno_failure_void(EIO);
+    result = errno_failure<void>(EIO);
   }
   if (result && snapshot.type != ORCHFS_CORE_REGULAR) {
-    result = errno_failure_void(EISDIR);
+    result = errno_failure<void>(EISDIR);
   }
   const std::uint64_t old_extent_size = snapshot.size > 0
       ? static_cast<std::uint64_t>(snapshot.size)
@@ -2221,7 +2212,7 @@ Task<Result<void>> KfsCoroutineCore::truncate(InodeNumber inode,
       if (!written) {
         result = Result<void>::failure(written.error());
       } else if (written.value().bytes != chunk) {
-        result = errno_failure_void(EIO);
+        result = errno_failure<void>(EIO);
       } else {
         cursor += chunk;
       }
@@ -2235,7 +2226,7 @@ Task<Result<void>> KfsCoroutineCore::truncate(InodeNumber inode,
       error = transaction->invoke(
           [&] { return orchfs_core_set_size(inode, size); });
       if (error != 0) {
-        result = errno_failure_void(error);
+        result = errno_failure<void>(error);
       } else {
         result = co_await impl_->journal_.commit(transaction->release());
       }
@@ -2274,7 +2265,7 @@ Task<Result<void>> KfsCoroutineCore::sync(InodeNumber inode) {
   const int metadata_error = orchfs_core_sync_inode(inode);
   Result<void> result = metadata_error == 0
       ? co_await impl_->device_.flush()
-      : errno_failure_void(metadata_error);
+      : errno_failure<void>(metadata_error);
   auto released = co_await permit.release();
   if (!released && result) {
     co_return Result<void>::failure(released.error());
@@ -2615,7 +2606,7 @@ Task<Result<bool>> KfsCoroutineCore::migrate(std::size_t max_operations) {
 
 Task<Result<void>> KfsCoroutineCore::close_directory(OpenedNode node) {
   if (node.type != NodeType::directory) {
-    co_return errno_failure_void(EBADF);
+    co_return errno_failure<void>(EBADF);
   }
   co_return co_await impl_->release(node);
 }
