@@ -244,6 +244,52 @@ public:
     }
 };
 
+template <typename T>
+class TaskPromiseStorage {
+public:
+    template <typename U>
+        requires std::constructible_from<T, U&&>
+    void return_value(U&& value) noexcept(
+        std::is_nothrow_constructible_v<T, U&&>) {
+        value_.emplace(std::forward<U>(value));
+    }
+
+    void publish(CompletionState<T>* completion) noexcept(
+        std::is_nothrow_move_constructible_v<T>) {
+        if (!completion || !value_) {
+            std::terminate();
+        }
+        completion->complete(std::move(*value_));
+        value_.reset();
+    }
+
+    [[nodiscard]] T take() noexcept(
+        std::is_nothrow_move_constructible_v<T>) {
+        if (!value_) {
+            std::terminate();
+        }
+        return std::move(*value_);
+    }
+
+private:
+    std::optional<T> value_;
+};
+
+template <>
+class TaskPromiseStorage<void> {
+public:
+    void return_void() noexcept {}
+
+    void publish(CompletionState<void>* completion) noexcept {
+        if (!completion) {
+            std::terminate();
+        }
+        completion->complete();
+    }
+
+    void take() const noexcept {}
+};
+
 struct TaskFinalAwaiter {
     [[nodiscard]] bool await_ready() const noexcept {
         return false;
@@ -364,7 +410,7 @@ private:
 template <typename T>
 class [[nodiscard]] Task {
 public:
-    struct promise_type {
+    struct promise_type : detail::TaskPromiseStorage<T> {
         static void* operator new(std::size_t size) {
             return detail::allocate_coroutine_frame(size);
         }
@@ -389,13 +435,6 @@ public:
             return {};
         }
 
-        template <typename U>
-            requires std::constructible_from<T, U&&>
-        void return_value(U&& value) noexcept(
-            std::is_nothrow_constructible_v<T, U&&>) {
-            value_.emplace(std::forward<U>(value));
-        }
-
         [[noreturn]] void unhandled_exception() const noexcept {
             std::terminate();
         }
@@ -405,15 +444,11 @@ public:
             completion_ = completion;
         }
 
-        void publish_root() noexcept(std::is_nothrow_move_constructible_v<T>) {
-            if (!completion_ || !value_) {
-                std::terminate();
-            }
-            completion_->complete(std::move(*value_));
-            value_.reset();
+        void publish_root() noexcept(
+            std::is_void_v<T> || std::is_nothrow_move_constructible_v<T>) {
+            this->publish(completion_);
         }
 
-        std::optional<T> value_;
         std::coroutine_handle<> continuation_{};
         detail::CompletionState<T>* completion_{nullptr};
         friend class Task;
@@ -480,153 +515,17 @@ public:
         }
 
         [[nodiscard]] T await_resume() noexcept(
-            std::is_nothrow_move_constructible_v<T>) {
-            if (!coroutine_.promise().value_) {
-                std::terminate();
-            }
-            T value = std::move(*coroutine_.promise().value_);
-            coroutine_.destroy();
-            coroutine_ = {};
-            return value;
-        }
-
-    private:
-        std::coroutine_handle<promise_type> coroutine_{};
-    };
-
-    [[nodiscard]] Awaiter operator co_await() && noexcept {
-        return Awaiter(std::exchange(coroutine_, {}));
-    }
-
-    Awaiter operator co_await() & = delete;
-
-private:
-    explicit Task(std::coroutine_handle<promise_type> coroutine) noexcept
-        : coroutine_(coroutine) {}
-
-    [[nodiscard]] std::coroutine_handle<promise_type> release() noexcept {
-        return std::exchange(coroutine_, {});
-    }
-
-    std::coroutine_handle<promise_type> coroutine_{};
-
-    friend class Runtime;
-};
-
-template <>
-class [[nodiscard]] Task<void> {
-public:
-    struct promise_type {
-        static void* operator new(std::size_t size) {
-            return detail::allocate_coroutine_frame(size);
-        }
-
-        static void operator delete(void* frame) noexcept {
-            detail::deallocate_coroutine_frame(frame);
-        }
-
-        static void operator delete(void* frame, std::size_t) noexcept {
-            detail::deallocate_coroutine_frame(frame);
-        }
-
-        [[nodiscard]] Task get_return_object() noexcept {
-            return Task(std::coroutine_handle<promise_type>::from_promise(*this));
-        }
-
-        [[nodiscard]] std::suspend_always initial_suspend() const noexcept {
-            return {};
-        }
-
-        [[nodiscard]] detail::TaskFinalAwaiter final_suspend() const noexcept {
-            return {};
-        }
-
-        void return_void() noexcept {}
-
-        [[noreturn]] void unhandled_exception() const noexcept {
-            std::terminate();
-        }
-
-    private:
-        void attach_root(detail::CompletionState<void>* completion) noexcept {
-            completion_ = completion;
-        }
-
-        void publish_root() noexcept {
-            if (!completion_) {
-                std::terminate();
-            }
-            completion_->complete();
-        }
-
-        std::coroutine_handle<> continuation_{};
-        detail::CompletionState<void>* completion_{nullptr};
-        friend class Task;
-        friend class Runtime;
-        friend struct detail::TaskFinalAwaiter;
-    };
-
-    Task() = default;
-    Task(const Task&) = delete;
-    Task& operator=(const Task&) = delete;
-
-    Task(Task&& other) noexcept
-        : coroutine_(std::exchange(other.coroutine_, {})) {}
-
-    Task& operator=(Task&& other) noexcept {
-        if (this != &other) {
-            if (coroutine_) {
+            std::is_void_v<T> || std::is_nothrow_move_constructible_v<T>) {
+            if constexpr (std::is_void_v<T>) {
+                coroutine_.promise().take();
                 coroutine_.destroy();
-            }
-            coroutine_ = std::exchange(other.coroutine_, {});
-        }
-        return *this;
-    }
-
-    ~Task() {
-        if (coroutine_) {
-            coroutine_.destroy();
-        }
-    }
-
-    [[nodiscard]] bool valid() const noexcept {
-        return static_cast<bool>(coroutine_);
-    }
-
-    class Awaiter {
-    public:
-        explicit Awaiter(std::coroutine_handle<promise_type> coroutine) noexcept
-            : coroutine_(coroutine) {}
-
-        Awaiter(const Awaiter&) = delete;
-        Awaiter& operator=(const Awaiter&) = delete;
-
-        Awaiter(Awaiter&& other) noexcept
-            : coroutine_(std::exchange(other.coroutine_, {})) {}
-
-        ~Awaiter() {
-            if (coroutine_) {
+                coroutine_ = {};
+            } else {
+                T value = coroutine_.promise().take();
                 coroutine_.destroy();
+                coroutine_ = {};
+                return value;
             }
-        }
-
-        [[nodiscard]] bool await_ready() const noexcept {
-            return false;
-        }
-
-        [[nodiscard]] std::coroutine_handle<> await_suspend(
-            std::coroutine_handle<> continuation) noexcept {
-            coroutine_.promise().continuation_ = continuation;
-            const auto target = detail::current_resume_target();
-            if (target.pin_depth != 0) {
-                detail::register_pin(coroutine_, target);
-            }
-            return coroutine_;
-        }
-
-        void await_resume() noexcept {
-            coroutine_.destroy();
-            coroutine_ = {};
         }
 
     private:
