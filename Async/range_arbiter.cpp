@@ -55,6 +55,11 @@ struct RangeRequest {
 }
 
 struct RangeState {
+    RangeState() = default;
+
+    RangeState(Runtime& runtime, std::size_t worker) noexcept
+        : owner_runtime(&runtime), owner_worker(worker) {}
+
     enum class AcquireResult : std::uint8_t {
         granted,
         waiting,
@@ -513,6 +518,9 @@ Result<void> RangePermit::ReleaseAwaiter::await_resume() const noexcept {
 
 RangeArbiter::RangeArbiter()
     : state_(std::make_shared<detail::RangeState>()) {}
+
+RangeArbiter::RangeArbiter(Runtime& runtime, std::size_t owner_worker)
+    : state_(std::make_shared<detail::RangeState>(runtime, owner_worker)) {}
 
 RangeAcquireAwaiter RangeArbiter::acquire(std::uint64_t offset,
                                           std::uint64_t length,

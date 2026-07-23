@@ -105,7 +105,8 @@ target_link_libraries(orchfs_async_device PUBLIC
 target_link_libraries(orchfs_async_server PUBLIC orchfs_async_device)
 
 add_library(orchfs_kfs_coroutine_core STATIC
-  Async/kfs_coroutine_core.cpp)
+  Async/kfs_coroutine_core.cpp
+  Async/namespace_coordinator.cpp)
 target_compile_features(orchfs_kfs_coroutine_core PUBLIC cxx_std_20)
 target_include_directories(orchfs_kfs_coroutine_core PUBLIC
   "${ORCHFS_PUBLIC_INCLUDE_DIR}")
@@ -500,6 +501,14 @@ if(BUILD_TESTING)
   add_test(NAME kfs_coroutine_core COMMAND kfs_coroutine_core_test)
   set_tests_properties(kfs_coroutine_core PROPERTIES
     TIMEOUT 30 LABELS "async;kfs;unit")
+
+  add_executable(namespace_coordinator_test
+    test/namespace_coordinator_test.cpp)
+  target_link_libraries(namespace_coordinator_test PRIVATE
+    orchfs_kfs_coroutine_core orchfs_async_runtime)
+  add_test(NAME namespace_coordinator COMMAND namespace_coordinator_test)
+  set_tests_properties(namespace_coordinator PROPERTIES
+    TIMEOUT 30 LABELS "async;kfs;namespace;unit")
 
   add_executable(journal_recovery_test
     test/journal_recovery_test.c LibFS/lib_log.c)

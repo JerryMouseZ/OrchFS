@@ -10,6 +10,8 @@
 
 namespace orchfs::async {
 
+class Runtime;
+
 enum class RangeMode {
     read,
     write,
@@ -119,6 +121,9 @@ public:
     static constexpr std::uint64_t granularity = 32U * 1024U;
 
     RangeArbiter();
+    // Bind arbitration before the first acquire when ownership is part of the
+    // surrounding module's invariant (for example, inode-owned namespace).
+    RangeArbiter(Runtime& runtime, std::size_t owner_worker);
     RangeArbiter(const RangeArbiter&) = delete;
     RangeArbiter& operator=(const RangeArbiter&) = delete;
     RangeArbiter(RangeArbiter&&) noexcept = default;
