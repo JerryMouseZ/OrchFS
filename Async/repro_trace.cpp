@@ -144,6 +144,18 @@ const char* stage_name(std::uint32_t stage) noexcept {
       return "spdk_write";
     case ORCHFS_TRACE_SPDK_FLUSH:
       return "spdk_flush";
+    case ORCHFS_TRACE_JOURNAL_COMMIT:
+      return "journal_commit";
+    case ORCHFS_TRACE_CORE_PREPARE_WRITE:
+      return "core_prepare_write";
+    case ORCHFS_TRACE_CORE_ENSURE_STRATA:
+      return "core_ensure_strata";
+    case ORCHFS_TRACE_CORE_PUBLISH_EXTENT:
+      return "core_publish_extent";
+    case ORCHFS_TRACE_STRATA_ALLOCATE:
+      return "strata_allocate";
+    case ORCHFS_TRACE_STRATA_INSERT:
+      return "strata_insert";
   }
   return "unknown";
 }

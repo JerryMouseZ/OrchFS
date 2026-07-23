@@ -46,6 +46,7 @@ constexpr std::size_t kBufferMetadataEntries =
     kBufferMetadataSize / sizeof(std::int16_t);
 constexpr std::int16_t kMaximumBufferSegments = 12;
 constexpr std::size_t kStrataSsdPageThreshold = 6;
+constexpr std::size_t kPipelinedWriteThreshold = 256U * 1024U;
 constexpr std::uint64_t kMaximumFileSize =
     std::uint64_t{1} << (42U + 15U);
 constexpr std::uint64_t kWholeFile =
@@ -128,6 +129,14 @@ struct MergePage {
   std::int64_t ssd_offset{};
   std::int64_t nvm_offset{};
   std::array<std::int16_t, kBufferMetadataEntries> metadata{};
+};
+
+struct DirectSsdMerge {
+  std::vector<std::byte> block;
+  std::uint64_t ssd_offset{};
+  std::size_t inside{};
+  const std::byte* source{};
+  std::size_t length{};
 };
 
 struct CachedExtent {
@@ -367,7 +376,10 @@ class JournalService final {
 
     CommitAwaiter(JournalService& service,
                   orchfs_log_transaction* transaction) noexcept
-        : service_(&service), transaction_(transaction) {
+        : service_(&service), transaction_(transaction),
+          trace_started_ns_(transaction != nullptr
+                                ? orchfs_repro_trace_begin()
+                                : 0) {
       if (transaction_ != nullptr &&
           orchfs_log_transaction_is_empty(transaction_) != 0) {
         const int error = orchfs_log_transaction_commit(
@@ -375,8 +387,11 @@ class JournalService final {
         if (error != 0) {
           error_ = std::error_code(error, std::generic_category());
         }
+        finish_trace(error);
       }
     }
+
+    ~CommitAwaiter() { finish_trace(error_ ? error_.value() : ECANCELED); }
 
     bool await_ready() const noexcept { return transaction_ == nullptr; }
 
@@ -386,6 +401,7 @@ class JournalService final {
         error_ = make_error_code(Errc::not_in_runtime);
         orchfs_log_transaction_abort(
             std::exchange(transaction_, nullptr));
+        finish_trace(error_.value());
         return false;
       }
       continuation_ = continuation;
@@ -420,6 +436,7 @@ class JournalService final {
       if (error != 0) {
         error_ = std::error_code(error, std::generic_category());
       }
+      finish_trace(error);
       const auto previous = state_.exchange(
           State::completed, std::memory_order_acq_rel);
       if (previous == State::submitting) {
@@ -436,12 +453,22 @@ class JournalService final {
       }
     }
 
+    void finish_trace(int error) noexcept {
+      if (trace_started_ns_ == 0) {
+        return;
+      }
+      orchfs_repro_trace_end(ORCHFS_TRACE_JOURNAL_COMMIT, 0,
+                             trace_started_ns_, 0, 1, error);
+      trace_started_ns_ = 0;
+    }
+
     JournalService* service_{};
     orchfs_log_transaction* transaction_{};
     CommitAwaiter* next_{};
     std::size_t worker_{detail::no_worker};
     std::coroutine_handle<> continuation_{};
     std::error_code error_;
+    std::uint64_t trace_started_ns_{};
     std::atomic<State> state_{State::submitting};
 
     friend class JournalService;
@@ -754,21 +781,52 @@ class KfsCoroutineCore::Impl {
       const std::uint64_t replace_end = first_block + replacements.size();
       const std::uint64_t new_block_count =
           (new_size + kBlockSize - 1U) / kBlockSize;
-      std::vector<CachedExtent> candidates;
-      candidates.reserve(current->extents.size() + replacements.size() + 2U);
+      auto updated = std::make_shared<ExtentSnapshot>();
+      updated->file_size = new_size;
+      updated->extents.reserve(
+          current->extents.size() + replacements.size() + 2U);
+
+      const auto append_clipped = [&](CachedExtent extent) {
+        if (extent.first_block >= new_block_count) {
+          return;
+        }
+        extent.block_count = std::min(
+            extent.block_count, new_block_count - extent.first_block);
+        append_cached_extent(updated->extents, std::move(extent));
+      };
+      bool inserted_replacements = replacements.empty();
+      const auto insert_replacements = [&] {
+        if (inserted_replacements) {
+          return;
+        }
+        for (std::size_t index = 0; index < replacements.size(); ++index) {
+          append_clipped(CachedExtent{
+              .first_block = first_block + index,
+              .block_count = 1,
+              .mapping = replacements[index],
+          });
+        }
+        inserted_replacements = true;
+      };
+
       for (const auto& extent : current->extents) {
         const std::uint64_t extent_end =
             extent.first_block + extent.block_count;
-        if (replacements.empty() || extent_end <= first_block ||
-            extent.first_block >= replace_end) {
-          candidates.push_back(extent);
+        if (replacements.empty() || extent_end <= first_block) {
+          append_clipped(extent);
+          continue;
+        }
+        if (extent.first_block >= replace_end) {
+          insert_replacements();
+          append_clipped(extent);
           continue;
         }
         if (extent.first_block < first_block) {
           auto prefix = extent;
           prefix.block_count = first_block - extent.first_block;
-          candidates.push_back(std::move(prefix));
+          append_clipped(std::move(prefix));
         }
+        insert_replacements();
         if (extent_end > replace_end) {
           auto suffix = extent;
           const std::uint64_t delta = replace_end - extent.first_block;
@@ -779,32 +837,10 @@ class KfsCoroutineCore::Impl {
                 static_cast<std::int64_t>(delta * kBlockSize);
             suffix.mapping.file_block += static_cast<std::int64_t>(delta);
           }
-          candidates.push_back(std::move(suffix));
+          append_clipped(std::move(suffix));
         }
       }
-      for (std::size_t index = 0; index < replacements.size(); ++index) {
-        candidates.push_back(CachedExtent{
-            .first_block = first_block + index,
-            .block_count = 1,
-            .mapping = replacements[index],
-        });
-      }
-      std::sort(candidates.begin(), candidates.end(),
-                [](const CachedExtent& left, const CachedExtent& right) {
-                  return left.first_block < right.first_block;
-                });
-
-      auto updated = std::make_shared<ExtentSnapshot>();
-      updated->file_size = new_size;
-      updated->extents.reserve(candidates.size());
-      for (auto extent : candidates) {
-        if (extent.first_block >= new_block_count) {
-          continue;
-        }
-        extent.block_count = std::min(
-            extent.block_count, new_block_count - extent.first_block);
-        append_cached_extent(updated->extents, std::move(extent));
-      }
+      insert_replacements();
       (void)publish_extent_snapshot(inode, std::move(updated));
     } catch (const std::bad_alloc&) {
       erase_extents(inode);
@@ -1662,9 +1698,11 @@ class KfsCoroutineCore::Impl {
     boost::container::small_vector<orchfs_core_block, 4> blocks;
     boost::container::small_vector<BlockRead, 4> merge_reads;
     boost::container::small_vector<BlockWrite, 4> writes;
+    boost::container::small_vector<BlockWrite, 4> pipelined_write_storage;
     boost::container::small_vector<PmemWrite, 8> pmem_writes;
     boost::container::small_vector<MetadataWrite, 8> metadata_writes;
     boost::container::small_vector<MergePage, 1> merges;
+    boost::container::small_vector<DirectSsdMerge, 2> direct_ssd_merges;
     try {
       const auto block_count =
           static_cast<std::size_t>(last_block - first_block + 1);
@@ -1675,17 +1713,52 @@ class KfsCoroutineCore::Impl {
 
     std::unique_ptr<LogTransaction> owned_transaction;
     LogTransaction* transaction = external_transaction;
-    bool stable_overwrite = transaction == nullptr && !allow_directory &&
-                            !append && offset % kBlockSize == 0 &&
-                            source.size() % kBlockSize == 0 &&
-                            end <= current_size;
+    const bool block_aligned_overwrite =
+        offset % kBlockSize == 0 && source.size() % kBlockSize == 0;
+    // A write into an already allocated virtual block only changes its PMEM
+    // payload, regardless of page alignment.  Keep sub-block overwrites on the
+    // immutable extent snapshot as well: otherwise every 4 KiB overwrite
+    // creates an empty journal transaction and republishes the whole extent
+    // vector even though no mapping metadata changes.  Larger unaligned writes
+    // deliberately stay on the mutable index path; copying a large file's
+    // immutable extent vector after every metadata-changing overwrite is much
+    // more expensive than querying the few blocks touched by the request.
+    const bool cached_partial_overwrite = source.size() <= kBlockSize;
+    // For larger requests, partial SSD boundary blocks use the asynchronous
+    // device backend's LBA read-modify-write path.  This keeps the mapping
+    // unchanged and avoids allocating and journaling STRATA metadata merely
+    // for the head and tail of an otherwise device-sized overwrite.
+    const bool direct_ssd_partial_overwrite = source.size() > kBlockSize;
+    bool stable_overwrite =
+        transaction == nullptr && !allow_directory && !append &&
+        end <= current_size &&
+        (block_aligned_overwrite || cached_partial_overwrite ||
+         direct_ssd_partial_overwrite);
     if (stable_overwrite) {
-      ORCHFS_TRY(extent_snapshot, extents_for(inode, snapshot));
+      std::shared_ptr<const ExtentSnapshot> extent_snapshot;
+      if (!direct_ssd_partial_overwrite || block_aligned_overwrite) {
+        ORCHFS_TRY(cached, extents_for(inode, snapshot));
+        extent_snapshot = std::move(cached);
+      }
       for (std::size_t index = 0; index < blocks.size(); ++index) {
-        if (!mapping_from_snapshot(*extent_snapshot, first_block + index,
-                                   blocks[index]) ||
-            (blocks[index].type != ORCHFS_CORE_SSD_BLOCK &&
-             blocks[index].type != ORCHFS_CORE_VIRTUAL_BLOCK)) {
+        const std::uint64_t logical_start =
+            (first_block + index) * kBlockSize;
+        const std::size_t inside = static_cast<std::size_t>(
+            std::max(offset, logical_start) - logical_start);
+        const std::size_t chunk = static_cast<std::size_t>(
+            std::min<std::uint64_t>(end, logical_start + kBlockSize) -
+            std::max(offset, logical_start));
+        const bool mapped = extent_snapshot != nullptr
+            ? mapping_from_snapshot(*extent_snapshot, first_block + index,
+                                    blocks[index])
+            : orchfs_core_query_block(
+                  inode, static_cast<std::int64_t>(first_block + index),
+                  &blocks[index]) == 0;
+        if (!mapped ||
+            (blocks[index].type != ORCHFS_CORE_VIRTUAL_BLOCK &&
+             (blocks[index].type != ORCHFS_CORE_SSD_BLOCK ||
+              ((inside != 0 || chunk != kBlockSize) &&
+               !direct_ssd_partial_overwrite)))) {
           stable_overwrite = false;
           break;
         }
@@ -1697,12 +1770,16 @@ class KfsCoroutineCore::Impl {
         owned_transaction = std::move(created);
         transaction = owned_transaction.get();
       }
+      repro_trace::Span prepare_trace(
+          ORCHFS_TRACE_CORE_PREPARE_WRITE, 0, source.size(),
+          static_cast<std::uint32_t>(blocks.size()));
       error = transaction->invoke([&] {
         return orchfs_core_prepare_write_blocks(
             inode, static_cast<std::int64_t>(first_block),
             static_cast<std::int64_t>(last_block),
             static_cast<std::int64_t>((end - 1) % kBlockSize), blocks.data());
       });
+      prepare_trace.finish(source.size(), error);
       if (error != 0) {
         co_return errno_failure<WriteResult>(error);
       }
@@ -1721,27 +1798,53 @@ class KfsCoroutineCore::Impl {
 
       if ((block.type == ORCHFS_CORE_SSD_BLOCK ||
            block.type == ORCHFS_CORE_STRATA_BLOCK) &&
-          (inside != 0 || chunk != kBlockSize)) {
+          (inside != 0 || chunk != kBlockSize) &&
+          !(stable_overwrite && block.type == ORCHFS_CORE_SSD_BLOCK)) {
+        repro_trace::Span strata_trace(
+            ORCHFS_TRACE_CORE_ENSURE_STRATA, 0, chunk, 1);
         error = transaction->invoke([&] {
           return orchfs_core_ensure_strata(
               inode, static_cast<std::int64_t>(block_index),
               static_cast<std::int64_t>(inside),
               static_cast<std::int64_t>(chunk), &block);
         });
+        strata_trace.finish(chunk, error);
         if (error != 0) {
           co_return errno_failure<WriteResult>(error);
         }
       }
 
       if (block.type == ORCHFS_CORE_SSD_BLOCK) {
-        if (inside != 0 || chunk != kBlockSize ||
-            block.ssd_device_offset < 0) {
+        if (block.ssd_device_offset < 0 ||
+            static_cast<std::uint64_t>(block.ssd_device_offset) >
+                std::numeric_limits<std::uint64_t>::max() - inside) {
           co_return errno_failure<WriteResult>(EIO);
         }
-        writes.push_back(BlockWrite{
-            .offset = static_cast<std::uint64_t>(block.ssd_device_offset),
-            .source = std::span<const std::byte>(input, chunk),
-        });
+        const auto ssd_offset =
+            static_cast<std::uint64_t>(block.ssd_device_offset);
+        if (inside == 0 && chunk == kBlockSize) {
+          writes.push_back(BlockWrite{
+              .offset = ssd_offset,
+              .source = std::span<const std::byte>(input, chunk),
+          });
+        } else {
+          try {
+            direct_ssd_merges.push_back(DirectSsdMerge{
+                .block = std::vector<std::byte>(kBlockSize),
+                .ssd_offset = ssd_offset,
+                .inside = inside,
+                .source = input,
+                .length = chunk,
+            });
+          } catch (const std::bad_alloc&) {
+            co_return errno_failure<WriteResult>(ENOMEM);
+          }
+          auto& merge = direct_ssd_merges.back();
+          merge_reads.push_back(BlockRead{
+              .offset = merge.ssd_offset,
+              .destination = merge.block,
+          });
+        }
       } else if (block.type == ORCHFS_CORE_VIRTUAL_BLOCK) {
         std::size_t page_consumed = 0;
         while (page_consumed < chunk) {
@@ -1862,10 +1965,51 @@ class KfsCoroutineCore::Impl {
       consumed += chunk;
     }
 
+    std::size_t initial_write_bytes = 0;
+    for (const auto& request : writes) {
+      initial_write_bytes += request.source.size();
+    }
+    std::optional<JoinHandle<Result<std::size_t>>> pipelined_writes;
+    if (!merge_reads.empty() &&
+        initial_write_bytes >= kPipelinedWriteThreshold) {
+      pipelined_write_storage = std::move(writes);
+      writes.clear();
+      auto submitted = runtime_->submit(device_.write_batch(
+          std::span<const BlockWrite>(pipelined_write_storage.data(),
+                                      pipelined_write_storage.size())));
+      if (!submitted) {
+        co_return Result<WriteResult>::failure(submitted.error());
+      }
+      pipelined_writes.emplace(std::move(submitted).value());
+    }
+
     if (!merge_reads.empty()) {
-      ORCHFS_TRY(bytes_read, co_await device_.read_batch(
-          std::span<const BlockRead>(merge_reads.data(), merge_reads.size())));
-      if (bytes_read != merge_reads.size() * kPageSize) {
+      auto read_result = co_await device_.read_batch(
+          std::span<const BlockRead>(merge_reads.data(), merge_reads.size()));
+      if (pipelined_writes) {
+        auto joined = co_await std::move(*pipelined_writes);
+        if (!read_result) {
+          co_return Result<WriteResult>::failure(read_result.error());
+        }
+        if (!joined) {
+          co_return Result<WriteResult>::failure(joined.error());
+        }
+        auto write_result = std::move(joined).value();
+        if (!write_result) {
+          co_return Result<WriteResult>::failure(write_result.error());
+        }
+        if (write_result.value() != initial_write_bytes) {
+          co_return errno_failure<WriteResult>(EIO);
+        }
+      } else if (!read_result) {
+        co_return Result<WriteResult>::failure(read_result.error());
+      }
+      const auto bytes_read = read_result.value();
+      std::size_t expected = 0;
+      for (const auto& request : merge_reads) {
+        expected += request.destination.size();
+      }
+      if (bytes_read != expected) {
         co_return errno_failure<WriteResult>(EIO);
       }
       for (auto& merge : merges) {
@@ -1876,6 +2020,14 @@ class KfsCoroutineCore::Impl {
         writes.push_back(BlockWrite{
             .offset = static_cast<std::uint64_t>(merge.ssd_offset),
             .source = merge.page,
+        });
+      }
+      for (auto& merge : direct_ssd_merges) {
+        std::memcpy(merge.block.data() + merge.inside, merge.source,
+                    merge.length);
+        writes.push_back(BlockWrite{
+            .offset = merge.ssd_offset,
+            .source = merge.block,
         });
       }
     }
@@ -1942,11 +2094,19 @@ class KfsCoroutineCore::Impl {
         publish(snapshot);
         if (!allow_directory && snapshot.type == ORCHFS_CORE_REGULAR &&
             snapshot.size >= 0) {
-          publish_extent_update(
-              inode, current_size, static_cast<std::uint64_t>(snapshot.size),
-              first_block,
-              std::span<const orchfs_core_block>(blocks.data(),
-                                                 blocks.size()));
+          if (block_aligned_overwrite || cached_partial_overwrite) {
+            repro_trace::Span publish_trace(
+                ORCHFS_TRACE_CORE_PUBLISH_EXTENT, 0, source.size(),
+                static_cast<std::uint32_t>(blocks.size()));
+            publish_extent_update(
+                inode, current_size, static_cast<std::uint64_t>(snapshot.size),
+                first_block,
+                std::span<const orchfs_core_block>(blocks.data(),
+                                                   blocks.size()));
+            publish_trace.finish(source.size(), 0);
+          } else {
+            erase_extents(inode);
+          }
         }
       } else {
         erase_extents(inode);

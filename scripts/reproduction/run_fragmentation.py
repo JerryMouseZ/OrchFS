@@ -230,7 +230,7 @@ def main() -> int:
                         "async-current", case, run_dir,
                         extra_environment=extra)
                     environment = runner.client_environment(
-                        "async-current", endpoint, run_dir) | extra
+                        "async-current", endpoint, run_dir, case) | extra
                     deadline = time.monotonic() + 10
                     while not load_snapshots(snapshot_path):
                         if time.monotonic() >= deadline:

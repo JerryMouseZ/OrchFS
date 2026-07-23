@@ -154,7 +154,8 @@ def run_sample(runner: Runner, args: argparse.Namespace,
     try:
         runner.format(version, run_dir)
         process, endpoint = runner.start_server(version, case, run_dir)
-        environment = runner.client_environment(version, endpoint, run_dir)
+        environment = runner.client_environment(
+            version, endpoint, run_dir, case)
         if version == "async-current":
             environment["ORCHFS_REPRO_LEVELDB_LOCK_NOOP"] = "1"
         measured_operations = records if phase == "load" else operations

@@ -141,8 +141,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--async-build", type=pathlib.Path, default=ROOT / "build-repro")
     value.add_argument("--async-trace-build", type=pathlib.Path,
                        default=ROOT / "build-repro-trace")
-    value.add_argument("--client-workers", type=int, default=1)
-    value.add_argument("--client-lanes", type=int, default=4)
+    value.add_argument("--client-workers", type=int, default=0)
+    value.add_argument("--client-lanes", type=int, default=0)
+    value.add_argument("--ipc-ring-capacity", type=int, default=16)
     value.add_argument("--trace-sample-every", type=int, default=1)
     value.add_argument("--case-timeout", type=float, default=600)
     value.add_argument(
@@ -163,7 +164,7 @@ def run_sample(runner: Runner, args: argparse.Namespace, filebench_bin: str,
     name = f"{workload}-t{thread_count}"
     run_dir = runner.raw / version / "fig16" / name / f"run-{repeat}"
     run_dir.mkdir(parents=True, exist_ok=False)
-    case = Case("16", name, workers=16)
+    case = Case("16", name, threads=thread_count, workers=16)
     process = None
     exit_code = 125
     try:
@@ -174,7 +175,8 @@ def run_sample(runner: Runner, args: argparse.Namespace, filebench_bin: str,
         workload_path.write_text(
             generate(workload, directory, thread_count, args.scale),
             encoding="utf-8")
-        environment = runner.client_environment(version, endpoint, run_dir)
+        environment = runner.client_environment(
+            version, endpoint, run_dir, case)
         create = runner.logged_run(
             runner.sudo_env(environment, [
                 str(args.async_build / "orchfs_repro_mkdir"), directory]),
@@ -196,7 +198,8 @@ def run_sample(runner: Runner, args: argparse.Namespace, filebench_bin: str,
             runner.stop_server(version, process)
         process = None
         process, endpoint = runner.start_server(version, case, run_dir)
-        environment = runner.client_environment(version, endpoint, run_dir)
+        environment = runner.client_environment(
+            version, endpoint, run_dir, case)
         # Put LD_PRELOAD after setarch. If it is applied to setarch itself,
         # the legacy wrapper registers a throw-away LibFS client before
         # exec(2), so FILEBENCH's parent-only metadata writeback is skipped.

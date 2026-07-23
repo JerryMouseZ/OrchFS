@@ -2,6 +2,7 @@
 #include "libspace.h"
 #include "meta_cache.h"
 #include "migrate.h"
+#include "../include/orchfs/repro_trace.h"
 
 #include "../KernelFS/device.h"
 #include "../config/config.h"
@@ -22,24 +23,54 @@ int create_strata_structure(root_id_t root_id, int64_t inode,
     else if(block->ndtype != STRATA_NODE)
         return EINVAL;
 
+    int64_t missing_pages[VLN_SLOT_SUM];
+    int64_t nvm_pages[VLN_SLOT_SUM];
+    int64_t metadata_ids[VLN_SLOT_SUM];
+    int missing_count = 0;
     for(int64_t page = first_page; page <= last_page; ++page)
     {
-        if(block->nvm_page_id[page] != EMPTY_BLKID)
-            continue;
-        const int64_t nvm_page = require_nvm_page_id();
-        const int64_t metadata = require_buffer_metadata_id();
-        if(nvm_page < 0 || metadata < 0)
-            return ENOSPC;
+        if(block->nvm_page_id[page] == EMPTY_BLKID)
+            missing_pages[missing_count++] = page;
+    }
+    const uint64_t allocation_started = orchfs_repro_trace_begin();
+    int allocation_error = require_nvm_page_ids(missing_count, nvm_pages);
+    if(allocation_error != 0)
+    {
+        orchfs_repro_trace_end(ORCHFS_TRACE_STRATA_ALLOCATE, 0,
+            allocation_started, 0, (uint32_t)missing_count, allocation_error);
+        return allocation_error;
+    }
+    allocation_error = require_buffer_metadata_ids(
+        missing_count, metadata_ids);
+    orchfs_repro_trace_end(ORCHFS_TRACE_STRATA_ALLOCATE, 0,
+        allocation_started, (uint64_t)missing_count, (uint32_t)missing_count,
+        allocation_error);
+    if(allocation_error != 0)
+        return allocation_error;
+
+    const uint64_t insert_started = orchfs_repro_trace_begin();
+    for(int index = 0; index < missing_count; ++index)
+    {
+        const int64_t page = missing_pages[index];
+        const int64_t nvm_page = nvm_pages[index];
+        const int64_t metadata = metadata_ids[index];
         const int insert_error = insert_strata_page_and_metabuf(
             root_id, inode, file_block, page, nvm_page, metadata);
         if(insert_error != 0)
+        {
+            orchfs_repro_trace_end(ORCHFS_TRACE_STRATA_INSERT, 0,
+                insert_started, (uint64_t)index, (uint32_t)missing_count,
+                insert_error > 0 ? insert_error : EIO);
             return insert_error > 0 ? insert_error : EIO;
+        }
         block->nvm_page_id[page] = nvmpage_to_devaddr(nvm_page);
         block->buf_meta_id[page] = bufmetaid_to_devaddr(metadata);
         int16_t initial[ORCH_BUFMETA_SIZE / sizeof(int16_t)];
         memset(initial, 0, sizeof(initial));
         nvm_write(initial, sizeof(initial), block->buf_meta_id[page]);
     }
+    orchfs_repro_trace_end(ORCHFS_TRACE_STRATA_INSERT, 0, insert_started,
+        (uint64_t)missing_count, (uint32_t)missing_count, 0);
     return 0;
 }
 

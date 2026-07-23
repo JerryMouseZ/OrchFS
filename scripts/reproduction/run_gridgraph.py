@@ -111,7 +111,8 @@ def run_sample(runner: Runner, args: argparse.Namespace,
         runner.format(version, run_dir)
         process, endpoint = runner.start_server(
             version, case, run_dir, log_label="stage")
-        environment = runner.client_environment(version, endpoint, run_dir)
+        environment = runner.client_environment(
+            version, endpoint, run_dir, case)
         copy_command = [str(args.async_build / "orchfs_repro_copy")]
         for source in files:
             copy_command += [str(source), f"\\{source.name}"]
@@ -136,7 +137,8 @@ def run_sample(runner: Runner, args: argparse.Namespace,
             phase = "pagerank"
             process, endpoint = runner.start_server(
                 version, case, run_dir, log_label="restart")
-            environment = runner.client_environment(version, endpoint, run_dir)
+            environment = runner.client_environment(
+                version, endpoint, run_dir, case)
             command = [str(args.pagerank_bin), root, str(args.iterations),
                        str(args.memory_gib)]
             assignments = [f"{key}={value}" for key, value in environment.items()]

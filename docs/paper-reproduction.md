@@ -219,11 +219,18 @@ scripts/reproduction/plot_reproduction.py benchmark-results/paper-reproduction-T
 文件系统成绩当成 OrchFS；仅生成器自测可显式使用 `--allow-host-fs`。
 
 runner 不使用论文的硬编码 CPU 表。它读取当前进程允许的 CPU 和目标 NVMe 的
-NUMA node，按“本地物理核、本地 SMT sibling、远端物理核、远端 sibling”排序，
-先为 LibFS Runtime 保留 `--client-workers` 个 CPU，再为每个 case 分配互斥的
-KFS worker CPU。实际列表写入 `commands.log` 的 `ORCHFS_CLIENT_CPU_LIST` /
-`ORCHFS_KFS_CPU_LIST`，主微基准还逐行写入 `results.csv`。若二者所需 CPU 总数
-超过 runner 的 affinity，case 直接失败，不能退回到共享同一逻辑 CPU。
+NUMA node，按“本地物理核、远端物理核、本地 SMT sibling、远端 sibling”分层
+排序；先为每个 case 分配 KFS worker CPU，再为 LibFS Runtime 分配互斥 CPU，
+避免还有空闲物理核时让两个 busy poller 共用 SMT core。`--client-workers 0`
+按 benchmark thread 数自动选择 1--8 个 client worker，`--client-lanes 0` 自动
+选择 4--32 条 lane；显式正数仍覆盖自动值。实际 worker/lane 数和 CPU 列表写入
+`commands.log`，主微基准还逐行写入 `results.csv`。若二者所需 CPU 总数超过
+runner 的 affinity，case 直接失败，不能退回到共享同一逻辑 CPU。
+
+每个 IPC data slot 可容纳 2 MiB 请求再加协议头。默认 ring capacity 随 lane
+数从 64 缩到 16，使 SQ/CQ payload ring 总量保持在约 2 GiB 内；Filebench 的
+parent prepare 与 fork 后 worker 会同时持有 session，因此固定使用 16 lane、
+capacity 16，避免耗尽 runner 配置的 4 GiB hugepage pool。
 
 `run_fragmentation.py` 通过 `ORCHFS_REPRO_DISABLE_MIGRATION=1` 关闭 migration，
 并用 `SIGUSR1` 在 KFS 主线程安全点写 bitmap 快照。Upage 数取

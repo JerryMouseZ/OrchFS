@@ -129,7 +129,37 @@ int64_t require_buffer_metadata_id(void) { return reserve(BUFMETA_EXT); }
 int64_t require_nvm_page_id(void) { return reserve(PAGE_EXT); }
 int64_t require_ssd_block_id(void) { return reserve(BLOCK_EXT); }
 
-int require_ssd_block_ids(int64_t count, int64_t* blocks)
+static int request_many(int type, int64_t* response, int count)
+{
+    switch(type)
+    {
+        case BUFMETA_EXT:
+            return request_bufmeta_id_arr(response, count, RET_BLK_ID);
+        case PAGE_EXT:
+            return request_page_id_arr(response, count, RET_BLK_ID);
+        case BLOCK_EXT:
+            return request_block_id_arr(response, count, RET_BLK_ID);
+        default:
+            return EINVAL;
+    }
+}
+
+static int release_many(int type, int64_t* blocks, int count)
+{
+    switch(type)
+    {
+        case BUFMETA_EXT:
+            return send_dealloc_bufmeta_req(blocks, count, PAR_BLK_ID);
+        case PAGE_EXT:
+            return send_dealloc_page_req(blocks, count, PAR_BLK_ID);
+        case BLOCK_EXT:
+            return send_dealloc_block_req(blocks, count, PAR_BLK_ID);
+        default:
+            return EINVAL;
+    }
+}
+
+static int reserve_many(int type, int64_t count, int64_t* blocks)
 {
     if(count < 0 || (count != 0 && blocks == NULL))
         return EINVAL;
@@ -142,7 +172,7 @@ int require_ssd_block_ids(int64_t count, int64_t* blocks)
     int64_t* response = malloc(((size_t)count + 2) * sizeof(*response));
     if(response == NULL)
         return ENOMEM;
-    int error = request_block_id_arr(response, count, RET_BLK_ID);
+    int error = request_many(type, response, (int)count);
     if(error != 0)
     {
         free(response);
@@ -150,7 +180,8 @@ int require_ssd_block_ids(int64_t count, int64_t* blocks)
     }
     if(response[1] != count)
     {
-        (void)send_dealloc_block_req(response + 2, (int)count, PAR_BLK_ID);
+        if(response[1] > 0 && response[1] <= count)
+            (void)release_many(type, response + 2, (int)response[1]);
         free(response);
         return EIO;
     }
@@ -164,7 +195,7 @@ int require_ssd_block_ids(int64_t count, int64_t* blocks)
             error = EIO;
             break;
         }
-        error = orchfs_log_record_current_allocation(BLOCK_EXT, block);
+        error = orchfs_log_record_current_allocation(type, block);
         if(error != 0)
             break;
         blocks[recorded] = block;
@@ -173,11 +204,26 @@ int require_ssd_block_ids(int64_t count, int64_t* blocks)
     {
         /* Successfully journaled entries belong to the transaction and are
          * released by abort.  Entries not recorded must be returned here. */
-        (void)send_dealloc_block_req(response + 2 + recorded,
-                                     (int)(count - recorded), PAR_BLK_ID);
+        (void)release_many(type, response + 2 + recorded,
+                           (int)(count - recorded));
     }
     free(response);
     return error;
+}
+
+int require_buffer_metadata_ids(int64_t count, int64_t* blocks)
+{
+    return reserve_many(BUFMETA_EXT, count, blocks);
+}
+
+int require_nvm_page_ids(int64_t count, int64_t* blocks)
+{
+    return reserve_many(PAGE_EXT, count, blocks);
+}
+
+int require_ssd_block_ids(int64_t count, int64_t* blocks)
+{
+    return reserve_many(BLOCK_EXT, count, blocks);
 }
 
 void release_inode(int64_t block) { release(INODE_EXT, block); }

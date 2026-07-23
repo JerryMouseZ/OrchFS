@@ -30,12 +30,15 @@ from typing import Iterable
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MIB = 1024**2
 GIB = 1024**3
+IPC_DATA_SLOT_SIZE = 2 * MIB + 128
 SEED = 20260722
 RESULT_FIELDS = [
     "figure", "case", "version", "scale", "repeat", "status",
     "exit_code", "operation", "access", "size_mode", "fixed_size",
     "min_size", "max_size", "threads", "files", "kfs_workers",
-    "kfs_cpu_list", "client_cpu_list", "fsync",
+    "client_workers",
+    "kfs_cpu_list", "client_cpu_list", "client_lanes",
+    "ipc_ring_capacity", "fsync",
     "offset_alignment", "unaligned_to", "prepare_bytes",
     "bytes_per_thread", "duration_sec", "seconds", "MiB_per_s", "IOPS",
     "avg_latency_us", "p50_us", "p99_us", "error_stage", "error_number",
@@ -61,7 +64,11 @@ class Case:
     fsync: str = "each"
     offset_alignment: int = 1
     unaligned_to: int = 0
-    workers: int = 16
+    # Zero selects one KFS worker per benchmark thread, capped at the default
+    # 16-worker service width.  A single outstanding POSIX request otherwise
+    # pays two needless cross-worker handoffs between its SHM lane and inode
+    # owner; the worker-scaling figures set this field explicitly.
+    workers: int = 0
     series_ms: int = 0
     # Recreate the KFS/LibFS processes between prefill and measurement.  This
     # is the closest available equivalent of the paper's cache-clear boundary
@@ -85,6 +92,9 @@ def size_cases(scale: str, figures: set[str], *,
 
     def add(case: Case) -> None:
         if case.figure in figures:
+            if case.workers == 0:
+                case = dataclasses.replace(
+                    case, workers=max(1, min(16, case.threads)))
             cases.append(case)
 
     add(Case("01", "uniform_1B_2MiB_fsync_end", size_mode="uniform",
@@ -135,7 +145,8 @@ def size_cases(scale: str, figures: set[str], *,
                  prepare_bytes=prefill,
                  bytes_per_thread=max(32 * 1024, measured // split_threads),
                  threads=split_threads, files=1,
-                 offset_alignment=32 * 1024))
+                 offset_alignment=32 * 1024,
+                 workers=16 if split_threads >= 8 else split_threads))
 
     evaluation_sizes = ([1, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
                         if paper else [4, 64, 1024])
@@ -256,7 +267,7 @@ class Runner:
         return cpus
 
     @staticmethod
-    def physical_cores_first(cpus: Iterable[int]) -> list[int]:
+    def cpu_sibling_layers(cpus: Iterable[int]) -> list[list[int]]:
         groups: dict[tuple[int, int], list[int]] = {}
         for cpu in sorted(cpus):
             topology = pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
@@ -269,11 +280,11 @@ class Runner:
             groups.setdefault(key, []).append(cpu)
 
         siblings = sorted(groups.values(), key=lambda group: group[0])
-        ordered: list[int] = []
-        for index in range(max((len(group) for group in siblings), default=0)):
-            ordered.extend(group[index] for group in siblings
-                           if index < len(group))
-        return ordered
+        return [
+            [group[index] for group in siblings if index < len(group)]
+            for index in range(max((len(group) for group in siblings),
+                                   default=0))
+        ]
 
     def async_cpu_order(self) -> list[int]:
         if self._async_cpu_order is not None:
@@ -296,31 +307,72 @@ class Runner:
 
         # This is not the paper's hard-coded binding table.  Derive a stable
         # topology from the runner's actual affinity, prefer physical cores
-        # local to the selected NVMe controller, then use SMT siblings and
-        # remote CPUs only when the requested worker count requires them.
-        self._async_cpu_order = (
-            self.physical_cores_first(local) +
-            self.physical_cores_first(allowed - local)
-        )
+        # local to the selected NVMe controller, then remote physical cores,
+        # and only then use SMT siblings.  This avoids placing a client poller
+        # on the sibling of a busy KFS poller while idle cores still exist.
+        local_layers = self.cpu_sibling_layers(local)
+        remote_layers = self.cpu_sibling_layers(allowed - local)
+        self._async_cpu_order = []
+        for index in range(max(len(local_layers), len(remote_layers))):
+            if index < len(local_layers):
+                self._async_cpu_order.extend(local_layers[index])
+            if index < len(remote_layers):
+                self._async_cpu_order.extend(remote_layers[index])
         return self._async_cpu_order
 
-    def client_runtime_cpus(self) -> list[int]:
-        count = self.args.client_workers
-        ordered = self.async_cpu_order()
-        if count <= 0 or count > len(ordered):
-            raise RuntimeError(
-                f"client workers require {count} CPUs, only {len(ordered)} are allowed")
-        return ordered[:count]
+    def client_worker_count(self, case: Case) -> int:
+        configured = self.args.client_workers
+        if configured < 0:
+            raise RuntimeError("client worker count must be non-negative")
+        if configured > 0:
+            return configured
+        # Eight client pollers saturated the measured transport while leaving
+        # the NVMe-local physical cores available to the KFS workers.
+        return max(1, min(8, case.threads))
 
-    def kfs_runtime_cpus(self, worker_count: int) -> list[int]:
+    def client_runtime_cpus(self, case: Case) -> list[int]:
+        count = self.client_worker_count(case)
         ordered = self.async_cpu_order()
-        first = self.args.client_workers
-        last = first + worker_count
-        if worker_count <= 0 or first < 0 or last > len(ordered):
+        first = case.workers
+        last = first + count
+        if last > len(ordered):
             raise RuntimeError(
-                f"client+KFS workers require {last} CPUs, only "
+                f"KFS+client workers require {last} CPUs, only "
                 f"{len(ordered)} are allowed")
         return ordered[first:last]
+
+    def kfs_runtime_cpus(self, worker_count: int,
+                         client_workers: int) -> list[int]:
+        ordered = self.async_cpu_order()
+        total = worker_count + client_workers
+        if worker_count <= 0 or client_workers < 0 or total > len(ordered):
+            raise RuntimeError(
+                f"KFS+client workers require {total} CPUs, only "
+                f"{len(ordered)} are allowed")
+        return ordered[:worker_count]
+
+    def client_lane_count(self, case: Case) -> int:
+        configured = self.args.client_lanes
+        if configured < 0:
+            raise RuntimeError("client lane count must be non-negative")
+        if configured > 0:
+            return configured
+        # Blocking POSIX callers hold a transport lane until completion.  Give
+        # concurrent benchmark threads independent lanes, while retaining four
+        # lanes for the single-thread direct path and bounding SHM consumption.
+        return max(4, min(32, case.threads))
+
+    def ipc_ring_capacity(self, case: Case) -> int:
+        configured = getattr(self.args, "ipc_ring_capacity", 0)
+        if configured < 0 or configured == 1:
+            raise RuntimeError("IPC ring capacity must be zero or at least 2")
+        if configured > 0:
+            return configured
+        lanes = self.client_lane_count(case)
+        # Each lane owns an SQ and CQ data ring.  Keep high-lane runs near a
+        # 2 GiB payload budget with 2 MiB slots instead of exhausting the
+        # runner's 4 GiB hugepage pool.
+        return max(16, min(64, 512 // lanes))
 
     @staticmethod
     def format_cpu_list(cpus: Iterable[int]) -> str:
@@ -448,7 +500,8 @@ class Runner:
             "ORCHFS_SPDK_MAX_TRANSFER_SIZE": str(MIB),
             "ORCHFS_SPDK_HUGEPAGE_DIR": "/dev/hugepages",
             "ORCHFS_SPDK_SHM_ID": "-1",
-            "ORCHFS_SPDK_WRITE_DURABILITY": self.args.async_durability,
+            "ORCHFS_SPDK_WRITE_DURABILITY": getattr(
+                self.args, "async_durability", "auto"),
         }
 
     def format(self, version: str, run_dir: pathlib.Path,
@@ -459,7 +512,7 @@ class Runner:
         else:
             self.switch_driver("vfio-pci")
             build = self.args.async_trace_build if trace_build else self.args.async_build
-            formatter_cpu = self.kfs_runtime_cpus(1)[0]
+            formatter_cpu = self.kfs_runtime_cpus(1, 0)[0]
             env = self.spdk_environment() | {
                 "ORCHFS_SPDK_CPU_LIST": str(formatter_cpu),
                 "ORCHFS_SPDK_POLLER_COUNT": "1",
@@ -493,10 +546,12 @@ class Runner:
             env = self.spdk_environment() | {
                 "ORCHFS_KFS_WORKERS": str(case.workers),
                 "ORCHFS_KFS_CPU_LIST": self.format_cpu_list(
-                    self.kfs_runtime_cpus(case.workers)),
+                    self.kfs_runtime_cpus(
+                        case.workers, self.client_worker_count(case))),
                 "ORCHFS_IPC_HUGEPAGES": "1",
-                "ORCHFS_IPC_RING_CAPACITY": "64",
-                "ORCHFS_IPC_DATA_SLOT_SIZE": str(MIB + 128),
+                "ORCHFS_IPC_RING_CAPACITY": str(
+                    self.ipc_ring_capacity(case)),
+                "ORCHFS_IPC_DATA_SLOT_SIZE": str(IPC_DATA_SLOT_SIZE),
                 "ORCHFS_ASYNC_ENDPOINT": endpoint,
             }
             if traced:
@@ -567,19 +622,20 @@ class Runner:
                 stream.close()
 
     def client_environment(self, version: str, endpoint: str | None,
-                           run_dir: pathlib.Path, *, traced: bool = False) -> dict[str, str]:
+                           run_dir: pathlib.Path, case: Case, *,
+                           traced: bool = False) -> dict[str, str]:
         if version == "sync-fair":
             return {"LD_PRELOAD": str(self.args.sync_build / "libOrchFS.so")}
         build = self.args.async_trace_build if traced else self.args.async_build
         environment = {
             "LD_PRELOAD": str(build / "libOrchFS.so"),
             "ORCHFS_ASYNC_ENDPOINT": str(endpoint),
-            "ORCHFS_CLIENT_WORKERS": str(self.args.client_workers),
+            "ORCHFS_CLIENT_WORKERS": str(self.client_worker_count(case)),
             "ORCHFS_CLIENT_CPU_LIST": self.format_cpu_list(
-                self.client_runtime_cpus()),
-            "ORCHFS_CLIENT_LANES": str(self.args.client_lanes),
-            "ORCHFS_IPC_RING_CAPACITY": "64",
-            "ORCHFS_IPC_DATA_SLOT_SIZE": str(MIB + 128),
+                self.client_runtime_cpus(case)),
+            "ORCHFS_CLIENT_LANES": str(self.client_lane_count(case)),
+            "ORCHFS_IPC_RING_CAPACITY": str(self.ipc_ring_capacity(case)),
+            "ORCHFS_IPC_DATA_SLOT_SIZE": str(IPC_DATA_SLOT_SIZE),
         }
         if traced:
             environment |= {
@@ -639,8 +695,8 @@ class Runner:
         build = self.args.async_trace_build if traced else self.args.async_build
         benchmark = build / "orchfs_repro_bench"
         arguments = self.bench_arguments(case, repeat, run_dir, phase=phase)
-        environment = self.client_environment(version, endpoint, run_dir,
-                                              traced=traced)
+        environment = self.client_environment(
+            version, endpoint, run_dir, case, traced=traced)
         command = [str(benchmark), *arguments]
         log_path = run_dir / ("profile.log" if ebpf else
                               "prepare.log" if phase == "prepare" else
@@ -740,12 +796,19 @@ class Runner:
             "threads": case.threads,
             "files": case.files,
             "kfs_workers": case.workers,
+            "client_workers": (self.client_worker_count(case)
+                               if version == "async-current" else ""),
             "kfs_cpu_list": (self.format_cpu_list(
-                self.kfs_runtime_cpus(case.workers))
+                self.kfs_runtime_cpus(
+                    case.workers, self.client_worker_count(case)))
                 if version == "async-current" else ""),
             "client_cpu_list": (self.format_cpu_list(
-                self.client_runtime_cpus())
+                self.client_runtime_cpus(case))
                 if version == "async-current" else ""),
+            "client_lanes": (self.client_lane_count(case)
+                             if version == "async-current" else ""),
+            "ipc_ring_capacity": (self.ipc_ring_capacity(case)
+                                  if version == "async-current" else ""),
             "fsync": case.fsync,
             "offset_alignment": case.offset_alignment,
             "unaligned_to": case.unaligned_to,
@@ -849,8 +912,8 @@ def write_manifest(args: argparse.Namespace, output: pathlib.Path,
         "interleave": "per-case, direction reversed by case and repeat",
         "prefill_boundary": "restart KFS and LibFS before measurement",
         "async_cpu_policy": (
-            "derive from runner affinity; reserve client workers first; "
-            "KFS workers use a disjoint list; NVMe-local physical cores first"),
+            "derive from runner affinity; reserve KFS workers first; "
+            "client workers use a disjoint list; NVMe-local physical cores first"),
         "runner_affinity": ",".join(
             str(cpu) for cpu in sorted(os.sched_getaffinity(0))),
         "argv": shlex.join(sys.argv),
@@ -902,8 +965,15 @@ def parse_args() -> argparse.Namespace:
                         default=ROOT / "build-repro")
     parser.add_argument("--async-trace-build", type=pathlib.Path,
                         default=ROOT / "build-repro-trace")
-    parser.add_argument("--client-workers", type=int, default=1)
-    parser.add_argument("--client-lanes", type=int, default=4)
+    parser.add_argument(
+        "--client-workers", type=int, default=0,
+        help="0 chooses max(1, min(8, benchmark threads))")
+    parser.add_argument(
+        "--client-lanes", type=int, default=0,
+        help="0 chooses max(4, min(32, benchmark threads))")
+    parser.add_argument(
+        "--ipc-ring-capacity", type=int, default=0,
+        help="0 bounds total high-lane payload rings near 2 GiB")
     parser.add_argument("--async-durability",
                         choices=("auto", "completion", "fua", "flush"),
                         default="auto")
@@ -920,10 +990,12 @@ def parse_args() -> argparse.Namespace:
         args.repeats = 1 if args.scale == "smoke" else 3
     if args.repeats <= 0:
         parser.error("--repeats must be positive")
-    if args.client_workers <= 0:
-        parser.error("--client-workers must be positive")
-    if args.client_lanes <= 0:
-        parser.error("--client-lanes must be positive")
+    if args.client_workers < 0:
+        parser.error("--client-workers must be non-negative")
+    if args.client_lanes < 0:
+        parser.error("--client-lanes must be non-negative")
+    if args.ipc_ring_capacity != 0 and args.ipc_ring_capacity < 2:
+        parser.error("--ipc-ring-capacity must be zero or at least 2")
     if args.prefill_bytes is not None and args.prefill_bytes <= 0:
         parser.error("--prefill-bytes must be positive")
     if args.measured_bytes is not None and args.measured_bytes <= 0:

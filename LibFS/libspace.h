@@ -45,8 +45,12 @@ int64_t require_virindex_node_id(void);
 
 int64_t require_buffer_metadata_id(void);
 
+int require_buffer_metadata_ids(int64_t count, int64_t* buffer_ids);
+
 
 int64_t require_nvm_page_id(void);
+
+int require_nvm_page_ids(int64_t count, int64_t* page_ids);
 
 
 int64_t require_ssd_block_id(void);

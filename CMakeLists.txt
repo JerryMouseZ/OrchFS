@@ -299,7 +299,12 @@ if(ORCHFS_BUILD_KFS)
   orchfs_enable_project_options(orchfs_kfs_layout_core)
   target_compile_definitions(orchfs_kfs_layout_core PRIVATE
     ORCHFS_IN_PROCESS_DEVICE_IO=1)
-  target_include_directories(orchfs_kfs_layout_core PUBLIC LibFS KernelFS)
+  if(ORCHFS_REPRO_TRACE)
+    target_compile_definitions(orchfs_kfs_layout_core PRIVATE
+      ORCHFS_REPRO_TRACE_ENABLED=1)
+  endif()
+  target_include_directories(orchfs_kfs_layout_core PUBLIC
+    LibFS KernelFS "${ORCHFS_PUBLIC_INCLUDE_DIR}")
   target_link_libraries(orchfs_kfs_layout_core PUBLIC pmem dl)
 
   add_library(orchfs_kfs_service STATIC

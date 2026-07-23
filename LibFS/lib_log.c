@@ -64,7 +64,7 @@ struct journal_state
 static struct journal_state journal;
 static _Thread_local struct orchfs_log_transaction* current_transaction;
 
-static uint32_t crc32c(const void* bytes, size_t length)
+static uint32_t crc32c_software(const void* bytes, size_t length)
 {
     const uint8_t* input = bytes;
     uint32_t crc = UINT32_MAX;
@@ -76,6 +76,35 @@ static uint32_t crc32c(const void* bytes, size_t length)
                     (uint32_t)-(int32_t)(crc & 1U));
     }
     return ~crc;
+}
+
+#if defined(__x86_64__)
+__attribute__((target("sse4.2")))
+static uint32_t crc32c_sse42(const void* bytes, size_t length)
+{
+    const uint8_t* input = bytes;
+    uint64_t crc = UINT32_MAX;
+    while(length >= sizeof(uint64_t))
+    {
+        uint64_t word;
+        memcpy(&word, input, sizeof(word));
+        crc = _mm_crc32_u64(crc, word);
+        input += sizeof(word);
+        length -= sizeof(word);
+    }
+    while(length-- != 0)
+        crc = _mm_crc32_u8((uint32_t)crc, *input++);
+    return ~(uint32_t)crc;
+}
+#endif
+
+static uint32_t crc32c(const void* bytes, size_t length)
+{
+#if defined(__x86_64__)
+    if(__builtin_cpu_supports("sse4.2"))
+        return crc32c_sse42(bytes, length);
+#endif
+    return crc32c_software(bytes, length);
 }
 
 static size_t align_cacheline(size_t length)

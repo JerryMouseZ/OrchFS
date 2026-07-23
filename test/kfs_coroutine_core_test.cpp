@@ -580,6 +580,41 @@ int main() {
             "unaligned RMW changed protected bytes");
   }
 
+  reset_ssd(file_size);
+  const auto strata_before_large =
+      strata_ensure_count.load(std::memory_order_acquire);
+  std::vector<std::byte> large_partial(kBlockSize + 1, std::byte{0x63});
+  auto large_partial_write = run(
+      *runtime, core->write(kInode, 1, large_partial, false));
+  require(large_partial_write &&
+              large_partial_write.value().bytes == large_partial.size(),
+          "large SSD partial overwrite failed");
+  require(strata_ensure_count.load(std::memory_order_acquire) ==
+              strata_before_large,
+          "large SSD partial overwrite allocated STRATA metadata");
+  std::vector<std::byte> large_partial_readback(large_partial.size());
+  auto large_partial_read = run(
+      *runtime, core->read(kInode, 1, large_partial_readback));
+  require(large_partial_read && large_partial_readback == large_partial,
+          "large SSD partial overwrite readback differed");
+
+  constexpr std::size_t pipelined_file_size = 16 * kBlockSize;
+  reset_ssd(pipelined_file_size);
+  std::vector<std::byte> pipelined_expected(
+      device.begin(), device.begin() + pipelined_file_size);
+  std::vector<std::byte> pipelined_source(
+      10 * kBlockSize + 1, std::byte{0x2d});
+  auto pipelined_write = run(
+      *runtime, core->write(kInode, 1, pipelined_source, false));
+  require(pipelined_write &&
+              pipelined_write.value().bytes == pipelined_source.size(),
+          "pipelined SSD partial overwrite failed");
+  std::copy(pipelined_source.begin(), pipelined_source.end(),
+            pipelined_expected.begin() + 1);
+  require(read_file(*runtime, core, pipelined_file_size) ==
+              pipelined_expected,
+          "pipelined SSD partial overwrite changed protected bytes");
+
   for (const std::size_t length : {std::size_t{1024}, kPageSize}) {
     constexpr std::size_t exact_offset = 2854777;
     reset_ssd(4 * 1024 * 1024);
@@ -744,6 +779,27 @@ int main() {
           "aligned overwrite traversed the mutable block index");
 
   reset_virtual(kBlockSize);
+  block_query_count.store(0, std::memory_order_release);
+  (void)read_file(*runtime, core, kBlockSize);
+  const auto virtual_queries =
+      block_query_count.load(std::memory_order_acquire);
+  std::array<std::byte, kPageSize> partial_virtual{};
+  std::fill(partial_virtual.begin(), partial_virtual.end(), std::byte{0x4c});
+  auto partial_overwrite = run(
+      *runtime, core->write(kInode, kPageSize, partial_virtual, false));
+  require(partial_overwrite &&
+              partial_overwrite.value().bytes == partial_virtual.size(),
+          "partial virtual extent-cache overwrite failed");
+  require(block_query_count.load(std::memory_order_acquire) == virtual_queries,
+          "partial virtual overwrite traversed the mutable block index");
+  std::vector<std::byte> partial_readback(partial_virtual.size());
+  auto partial_read = run(
+      *runtime, core->read(kInode, kPageSize, partial_readback));
+  require(partial_read && partial_readback ==
+                              std::vector<std::byte>(partial_virtual.begin(),
+                                                     partial_virtual.end()),
+          "partial virtual overwrite readback differed");
+
   for (std::size_t offset = 0; offset < kBlockSize; ++offset) {
     pmem[offset] = pattern(offset);
   }
