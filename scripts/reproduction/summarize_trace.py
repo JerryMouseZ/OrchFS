@@ -8,6 +8,7 @@ import csv
 import math
 import pathlib
 import re
+import shlex
 import statistics
 from collections import defaultdict
 
@@ -17,6 +18,16 @@ STAGE_FIELDS = [
     "estimated_events", "total_ms", "mean_us", "p50_us", "p99_us",
     "bytes", "child_io_count", "errors", "sample_every", "dropped_records",
     "trace_file",
+]
+
+METADATA_FIELDS = [
+    "figure", "case", "version", "repeat", "namespace_events",
+    "namespace_wait_ns", "namespace_active_mean", "namespace_active_max",
+    "namespace_peak", "dirent_scan_events", "dirents_scanned",
+    "dirents_per_scan", "snapshot_copy_events", "snapshot_copy_items",
+    "range_copy_events", "range_copy_items", "journal_wait_events",
+    "journal_wait_ns", "journal_queue_wait_events", "journal_queue_wait_ns",
+    "sample_every", "dropped_records", "trace_file",
 ]
 
 
@@ -53,6 +64,38 @@ def read_trace(path: pathlib.Path) -> tuple[list[dict[str, str]], int]:
     return list(csv.DictReader(data)), dropped
 
 
+def measurement_records(path: pathlib.Path,
+                        records: list[dict[str, str]]) -> list[dict[str, str]]:
+    benchmark = path.with_name("benchmark.log")
+    if benchmark.exists():
+        for line in reversed(benchmark.read_text(
+                encoding="utf-8", errors="replace").splitlines()):
+            if not line.startswith("orchfs_metadata_result "):
+                continue
+            fields = dict(token.split("=", 1) for token in shlex.split(
+                line.removeprefix("orchfs_metadata_result ")) if "=" in token)
+            if "started_ns" in fields and "ended_ns" in fields:
+                try:
+                    window_start = int(fields["started_ns"])
+                    window_end = int(fields["ended_ns"])
+                except ValueError:
+                    break
+                return [record for record in records
+                        if int(record["started_ns"]) >= window_start and
+                        int(record["ended_ns"]) <= window_end]
+            break
+
+    dispatch = [record for record in records
+                if record["stage"] == "server_dispatch"]
+    if not dispatch:
+        return records
+    window_start = min(int(record["started_ns"]) for record in dispatch)
+    window_end = max(int(record["ended_ns"]) for record in dispatch)
+    return [record for record in records
+            if int(record["ended_ns"]) >= window_start and
+            int(record["started_ns"]) <= window_end]
+
+
 def summarize_async(result: pathlib.Path) -> tuple[list[dict[str, object]],
                                                     list[dict[str, object]]]:
     stage_rows: list[dict[str, object]] = []
@@ -62,16 +105,10 @@ def summarize_async(result: pathlib.Path) -> tuple[list[dict[str, object]],
     for server_path in trace_paths:
         figure, case, version, repeat = identity(server_path)
         server, server_dropped = read_trace(server_path)
+        server = measurement_records(server_path, server)
         client_path = server_path.with_name("client-trace.csv")
         client, client_dropped = read_trace(client_path) if client_path.exists() else ([], 0)
-
-        dispatch = [row for row in server if row["stage"] == "server_dispatch"]
-        if dispatch:
-            window_start = min(int(row["started_ns"]) for row in dispatch)
-            window_end = max(int(row["ended_ns"]) for row in dispatch)
-            server = [row for row in server
-                      if int(row["ended_ns"]) >= window_start and
-                      int(row["started_ns"]) <= window_end]
+        client = measurement_records(client_path, client)
 
         by_stage: dict[str, list[dict[str, str]]] = defaultdict(list)
         for row in server + client:
@@ -122,6 +159,88 @@ def summarize_async(result: pathlib.Path) -> tuple[list[dict[str, object]],
                 "error_number": row["error_number"],
             })
     return stage_rows, request_rows
+
+
+def summarize_metadata(result: pathlib.Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    metadata_stages = {
+        "namespace_wait", "dirent_scan", "snapshot_map_copy",
+        "range_map_copy", "journal_commit", "journal_queue_wait",
+    }
+    trace_paths = sorted((result / "raw").glob(
+        "async-current/fig*/*/run-*/server-trace.csv"))
+    for server_path in trace_paths:
+        figure, case, version, repeat = identity(server_path)
+        records, dropped = read_trace(server_path)
+        records = measurement_records(server_path, records)
+        by_stage: dict[str, list[dict[str, str]]] = defaultdict(list)
+        for record in records:
+            if record["stage"] in metadata_stages:
+                by_stage[record["stage"]].append(record)
+        if not by_stage:
+            continue
+
+        def values(stage: str, field: str) -> list[int]:
+            return [int(record[field]) for record in by_stage[stage]]
+
+        def sample(stage: str) -> int:
+            return max(values(stage, "sample_every"), default=1)
+
+        def scaled_sum(stage: str, field: str) -> int:
+            return sum(values(stage, field)) * sample(stage)
+
+        namespace_active = values("namespace_wait", "bytes")
+        namespace_peak = values("namespace_wait", "child_io_count")
+        dirents = values("dirent_scan", "bytes")
+        snapshot_items = values("snapshot_map_copy", "bytes")
+        range_items = values("range_map_copy", "bytes")
+        sample_every = max(
+            (int(record["sample_every"])
+             for stage_records in by_stage.values()
+             for record in stage_records),
+            default=1)
+        rows.append({
+            "figure": figure,
+            "case": case,
+            "version": version,
+            "repeat": repeat,
+            "namespace_events": (len(by_stage["namespace_wait"]) *
+                                 sample("namespace_wait")),
+            "namespace_wait_ns": scaled_sum(
+                "namespace_wait", "duration_ns"),
+            "namespace_active_mean": (
+                statistics.fmean(namespace_active)
+                if namespace_active else 0.0),
+            "namespace_active_max": max(namespace_active, default=0),
+            "namespace_peak": max(namespace_peak, default=0),
+            "dirent_scan_events": (len(by_stage["dirent_scan"]) *
+                                   sample("dirent_scan")),
+            "dirents_scanned": scaled_sum("dirent_scan", "bytes"),
+            "dirents_per_scan": (statistics.fmean(dirents)
+                                  if dirents else 0.0),
+            "snapshot_copy_events": (
+                len(by_stage["snapshot_map_copy"]) *
+                sample("snapshot_map_copy")),
+            "snapshot_copy_items": scaled_sum(
+                "snapshot_map_copy", "bytes"),
+            "range_copy_events": (len(by_stage["range_map_copy"]) *
+                                  sample("range_map_copy")),
+            "range_copy_items": scaled_sum("range_map_copy", "bytes"),
+            "journal_wait_events": (
+                len(by_stage["journal_commit"]) *
+                sample("journal_commit")),
+            "journal_wait_ns": scaled_sum(
+                "journal_commit", "duration_ns"),
+            "journal_queue_wait_events": (
+                len(by_stage["journal_queue_wait"]) *
+                sample("journal_queue_wait")),
+            "journal_queue_wait_ns": scaled_sum(
+                "journal_queue_wait", "duration_ns"),
+            "sample_every": sample_every,
+            "dropped_records": dropped,
+            "trace_file": str(server_path),
+        })
+    return rows
 
 
 def summarize_ebpf(result: pathlib.Path) -> list[dict[str, object]]:
@@ -188,6 +307,7 @@ def main() -> int:
     csv_dir = result / "csv"
     csv_dir.mkdir(exist_ok=True)
     stages, requests = summarize_async(result)
+    metadata = summarize_metadata(result)
     ebpf = summarize_ebpf(result)
     overhead = trace_overhead(result)
     write_csv(csv_dir / "trace_stages.csv", STAGE_FIELDS, stages)
@@ -195,6 +315,7 @@ def main() -> int:
         "figure", "case", "version", "repeat", "request_id",
         "client_round_trip_us", "server_dispatch_us", "outside_server_us",
         "bytes", "error_number"], requests)
+    write_csv(csv_dir / "metadata_trace.csv", METADATA_FIELDS, metadata)
     write_csv(csv_dir / "sync_ebpf.csv", [
         "figure", "case", "version", "repeat", "metric", "value",
         "profile_file"], ebpf)
@@ -202,6 +323,7 @@ def main() -> int:
         "version", "scale", "trace_off_MiB_per_s", "trace_on_MiB_per_s",
         "overhead_percent", "passes_3_percent_gate"], overhead)
     print(f"async stages={len(stages)} requests={len(requests)} "
+          f"metadata={len(metadata)} "
           f"sync eBPF metrics={len(ebpf)} overhead rows={len(overhead)}")
     return 0
 

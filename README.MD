@@ -109,6 +109,10 @@ The 2026-07-22 smoke execution, profiling evidence, functional blockers, and
 redrawn-output index are recorded separately in
 [docs/reproduction-results-20260722.md](docs/reproduction-results-20260722.md).
 
+Namespace-specific `open`/`stat`/`listdir`/`mkdir` measurement and the
+corresponding metadata trace fields are documented in
+[docs/metadata-benchmark.md](docs/metadata-benchmark.md).
+
 ## Using OrchFS:
 
 **1. Example of Micro-benchmark**

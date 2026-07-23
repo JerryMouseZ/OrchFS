@@ -1,5 +1,6 @@
 #include "orchfs/async/kfs_coroutine_core.hpp"
 #include "orchfs/async/runtime.hpp"
+#include "orchfs/repro_trace.h"
 
 extern "C" {
 #include "../KernelFS/async_device.h"
@@ -858,5 +859,6 @@ int main() {
   single_runtime->request_stop();
   require(static_cast<bool>(single_runtime->join()),
           "single-worker Runtime shutdown failed");
+  orchfs_repro_trace_flush();
   return 0;
 }

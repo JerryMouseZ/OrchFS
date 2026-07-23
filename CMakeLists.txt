@@ -382,6 +382,12 @@ target_compile_options(orchfs_repro_bench PRIVATE
   -O3 -Wall -Wextra -Wpedantic)
 target_link_libraries(orchfs_repro_bench PRIVATE Threads::Threads)
 
+add_executable(orchfs_metadata_bench
+  scripts/reproduction/orchfs_metadata_bench.c)
+target_compile_options(orchfs_metadata_bench PRIVATE
+  -O3 -Wall -Wextra -Wpedantic)
+target_link_libraries(orchfs_metadata_bench PRIVATE Threads::Threads)
+
 add_executable(orchfs_repro_mkdir
   scripts/reproduction/orchfs_repro_mkdir.c)
 
@@ -464,6 +470,22 @@ if(BUILD_TESTING)
     set_tests_properties(async_runtime PROPERTIES
       ENVIRONMENT "TSAN_OPTIONS=die_after_fork=0:halt_on_error=1")
   endif()
+
+  foreach(ORCHFS_METADATA_OPERATION open stat listdir mkdir)
+    add_test(NAME metadata_benchmark_${ORCHFS_METADATA_OPERATION}_host
+      COMMAND orchfs_metadata_bench
+        --path-prefix
+          "${CMAKE_CURRENT_BINARY_DIR}/metadata-${ORCHFS_METADATA_OPERATION}"
+        --operation ${ORCHFS_METADATA_OPERATION}
+        --threads 2
+        --operations-per-thread 8
+        --entries 4
+        --latency-samples 16
+        --allow-host-fs)
+    set_tests_properties(
+      metadata_benchmark_${ORCHFS_METADATA_OPERATION}_host PROPERTIES
+      TIMEOUT 30 LABELS "benchmark;metadata;host")
+  endforeach()
 
   add_executable(async_block_device_test test/async_block_device_test.cpp)
   target_link_libraries(async_block_device_test PRIVATE

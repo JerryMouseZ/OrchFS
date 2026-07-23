@@ -156,6 +156,16 @@ const char* stage_name(std::uint32_t stage) noexcept {
       return "strata_allocate";
     case ORCHFS_TRACE_STRATA_INSERT:
       return "strata_insert";
+    case ORCHFS_TRACE_NAMESPACE_WAIT:
+      return "namespace_wait";
+    case ORCHFS_TRACE_DIRENT_SCAN:
+      return "dirent_scan";
+    case ORCHFS_TRACE_SNAPSHOT_MAP_COPY:
+      return "snapshot_map_copy";
+    case ORCHFS_TRACE_RANGE_MAP_COPY:
+      return "range_map_copy";
+    case ORCHFS_TRACE_JOURNAL_QUEUE_WAIT:
+      return "journal_queue_wait";
   }
   return "unknown";
 }

@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <system_error>
 
 namespace orchfs::async::repro_trace {
@@ -34,6 +35,15 @@ class Span final {
 
   void finish(std::uint64_t bytes, std::error_code error) noexcept {
     finish(bytes, error ? error.value() : 0);
+  }
+
+  void add_bytes(std::uint64_t bytes) noexcept {
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (bytes_ > maximum - bytes) {
+      bytes_ = maximum;
+      return;
+    }
+    bytes_ += bytes;
   }
 
  private:

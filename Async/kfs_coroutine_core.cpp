@@ -339,6 +339,97 @@ class LogTransaction final {
   orchfs_log_transaction* transaction_{};
 };
 
+#ifdef ORCHFS_REPRO_TRACE_ENABLED
+
+class NamespaceAcquireAwaiter final {
+ public:
+  NamespaceAcquireAwaiter(RangeArbiter& gate,
+                          std::atomic<std::size_t>& peak,
+                          std::uint64_t offset, std::uint64_t length,
+                          RangeMode mode) noexcept
+      : gate_(&gate), peak_(&peak),
+        trace_started_ns_(orchfs_repro_trace_begin()),
+        acquire_(gate.acquire(offset, length, mode)) {}
+
+  NamespaceAcquireAwaiter(const NamespaceAcquireAwaiter&) = delete;
+  NamespaceAcquireAwaiter& operator=(const NamespaceAcquireAwaiter&) = delete;
+  NamespaceAcquireAwaiter(NamespaceAcquireAwaiter&& other) noexcept
+      : gate_(std::exchange(other.gate_, nullptr)),
+        peak_(std::exchange(other.peak_, nullptr)),
+        trace_started_ns_(std::exchange(other.trace_started_ns_, 0)),
+        acquire_(std::move(other.acquire_)) {}
+  NamespaceAcquireAwaiter& operator=(NamespaceAcquireAwaiter&&) = delete;
+
+  ~NamespaceAcquireAwaiter() { finish_trace(0, ECANCELED); }
+
+  [[nodiscard]] bool await_ready() const noexcept {
+    return acquire_.await_ready();
+  }
+
+  [[nodiscard]] bool await_suspend(
+      std::coroutine_handle<> continuation) noexcept {
+    return acquire_.await_suspend(continuation);
+  }
+
+  [[nodiscard]] Result<RangePermit> await_resume() noexcept {
+    auto acquired = acquire_.await_resume();
+    std::size_t active = 0;
+    if (acquired) {
+      active = gate_->active_count();
+      auto observed = peak_->load(std::memory_order_relaxed);
+      while (observed < active &&
+             !peak_->compare_exchange_weak(
+                 observed, active, std::memory_order_relaxed,
+                 std::memory_order_relaxed)) {
+      }
+    }
+    finish_trace(active, acquired ? 0 : acquired.error().value());
+    return acquired;
+  }
+
+ private:
+  void finish_trace(std::size_t active, int error) noexcept {
+    if (trace_started_ns_ == 0) {
+      return;
+    }
+    const auto peak = peak_ != nullptr
+                          ? peak_->load(std::memory_order_relaxed)
+                          : std::size_t{0};
+    orchfs_repro_trace_end(
+        ORCHFS_TRACE_NAMESPACE_WAIT, 0, trace_started_ns_, active,
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            peak, std::numeric_limits<std::uint32_t>::max())),
+        error);
+    trace_started_ns_ = 0;
+  }
+
+  RangeArbiter* gate_{};
+  std::atomic<std::size_t>* peak_{};
+  std::uint64_t trace_started_ns_{};
+  RangeAcquireAwaiter acquire_;
+};
+
+// Keep namespace observability at the same seam as arbitration so every
+// current and future caller records the same wait/active semantics.
+class NamespaceGate final {
+ public:
+  [[nodiscard]] NamespaceAcquireAwaiter acquire(
+      std::uint64_t offset, std::uint64_t length,
+      RangeMode mode) noexcept {
+    return NamespaceAcquireAwaiter(gate_, peak_, offset, length, mode);
+  }
+
+ private:
+  RangeArbiter gate_;
+  std::atomic<std::size_t> peak_{0};
+};
+
+#else
+
+using NamespaceGate = RangeArbiter;
+
+#endif
+
 class JournalService final {
  public:
   explicit JournalService(Runtime& runtime) : runtime_(&runtime) {
@@ -388,10 +479,18 @@ class JournalService final {
           error_ = std::error_code(error, std::generic_category());
         }
         finish_trace(error);
+      } else if (transaction_ != nullptr) {
+#ifdef ORCHFS_REPRO_TRACE_ENABLED
+        queue_trace_started_ns_ = orchfs_repro_trace_begin();
+#endif
       }
     }
 
-    ~CommitAwaiter() { finish_trace(error_ ? error_.value() : ECANCELED); }
+    ~CommitAwaiter() {
+      const int error = error_ ? error_.value() : ECANCELED;
+      finish_queue_trace(error);
+      finish_trace(error);
+    }
 
     bool await_ready() const noexcept { return transaction_ == nullptr; }
 
@@ -401,6 +500,7 @@ class JournalService final {
         error_ = make_error_code(Errc::not_in_runtime);
         orchfs_log_transaction_abort(
             std::exchange(transaction_, nullptr));
+        finish_queue_trace(error_.value());
         finish_trace(error_.value());
         return false;
       }
@@ -429,6 +529,7 @@ class JournalService final {
 
    private:
     orchfs_log_transaction* take_transaction() noexcept {
+      finish_queue_trace(0);
       return std::exchange(transaction_, nullptr);
     }
 
@@ -462,6 +563,19 @@ class JournalService final {
       trace_started_ns_ = 0;
     }
 
+    void finish_queue_trace(int error) noexcept {
+#ifdef ORCHFS_REPRO_TRACE_ENABLED
+      if (queue_trace_started_ns_ == 0) {
+        return;
+      }
+      orchfs_repro_trace_end(ORCHFS_TRACE_JOURNAL_QUEUE_WAIT, 0,
+                             queue_trace_started_ns_, 0, 1, error);
+      queue_trace_started_ns_ = 0;
+#else
+      (void)error;
+#endif
+    }
+
     JournalService* service_{};
     orchfs_log_transaction* transaction_{};
     CommitAwaiter* next_{};
@@ -469,6 +583,9 @@ class JournalService final {
     std::coroutine_handle<> continuation_{};
     std::error_code error_;
     std::uint64_t trace_started_ns_{};
+#ifdef ORCHFS_REPRO_TRACE_ENABLED
+    std::uint64_t queue_trace_started_ns_{};
+#endif
     std::atomic<State> state_{State::submitting};
 
     friend class JournalService;
@@ -557,7 +674,10 @@ class KfsCoroutineCore::Impl {
         return Result<std::shared_ptr<RangeArbiter>>::success(found->second);
       }
       try {
+        repro_trace::Span copy_trace(
+            ORCHFS_TRACE_RANGE_MAP_COPY, 0, current->size());
         auto updated = std::make_shared<RangeMap>(*current);
+        copy_trace.finish(current->size(), 0);
         auto range = std::make_shared<RangeArbiter>();
         updated->emplace(inode, range);
         std::shared_ptr<const RangeMap> published = std::move(updated);
@@ -577,7 +697,10 @@ class KfsCoroutineCore::Impl {
   void publish(const orchfs_core_inode& inode) {
     auto current = snapshots_.load(std::memory_order_acquire);
     for (;;) {
+      repro_trace::Span copy_trace(
+          ORCHFS_TRACE_SNAPSHOT_MAP_COPY, 0, current->size());
       auto updated = std::make_shared<SnapshotMap>(*current);
+      copy_trace.finish(current->size(), 0);
       (*updated)[inode.inode] = file_stat(inode);
       std::shared_ptr<const SnapshotMap> published = std::move(updated);
       if (snapshots_.compare_exchange_weak(
@@ -595,7 +718,10 @@ class KfsCoroutineCore::Impl {
       if (!current->contains(inode)) {
         return;
       }
+      repro_trace::Span copy_trace(
+          ORCHFS_TRACE_SNAPSHOT_MAP_COPY, 0, current->size());
       auto updated = std::make_shared<SnapshotMap>(*current);
+      copy_trace.finish(current->size(), 0);
       updated->erase(inode);
       std::shared_ptr<const SnapshotMap> published = std::move(updated);
       if (snapshots_.compare_exchange_weak(
@@ -933,6 +1059,7 @@ class KfsCoroutineCore::Impl {
 
   Task<Result<NamespaceEntry>> find_child(InodeNumber directory,
                                            std::string_view name) {
+    repro_trace::Span scan_trace(ORCHFS_TRACE_DIRENT_SCAN);
     orchfs_core_inode parent{};
     int error = orchfs_core_snapshot(directory, &parent);
     if (error != 0) {
@@ -960,6 +1087,7 @@ class KfsCoroutineCore::Impl {
       }
       for (std::size_t inside = 0; inside < length;
            inside += ORCHFS_CORE_DIRENT_SIZE) {
+        scan_trace.add_bytes(1);
         orchfs_core_dirent entry{};
         std::memcpy(&entry, window.data() + inside, sizeof(entry));
         if (entry.type == 0 ||
@@ -2119,7 +2247,7 @@ class KfsCoroutineCore::Impl {
   Runtime* runtime_;
   AsyncBlockDevice device_;
   JournalService journal_;
-  RangeArbiter namespace_gate_;
+  NamespaceGate namespace_gate_;
   std::atomic<std::shared_ptr<const RangeMap>> ranges_{
       std::make_shared<const RangeMap>()};
   std::atomic<std::shared_ptr<const SnapshotMap>> snapshots_{
