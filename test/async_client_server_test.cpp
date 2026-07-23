@@ -1,6 +1,7 @@
 #include "orchfs/async/client.hpp"
 #include "orchfs/async/filesystem.hpp"
 #include "orchfs/async/ipc_transport.hpp"
+#include "orchfs/async/repro_trace.hpp"
 #include "orchfs/async/rpc_protocol.hpp"
 #include "orchfs/async/runtime.hpp"
 #include "orchfs/async/server.hpp"
@@ -2648,6 +2649,11 @@ int orchfs_device_effective_write_durability(void) {
 }  // extern "C"
 
 int main(int argc, char* argv[]) {
+  require(orchfs::async::repro_trace::error_from_status(-EIO) == EIO &&
+              orchfs::async::repro_trace::error_from_status(
+                  std::numeric_limits<std::int32_t>::min()) ==
+                  static_cast<int>(std::errc::protocol_error),
+          "trace status conversion overflowed or changed errno magnitude");
   if (argc == 4 && std::strcmp(argv[1], "--benchmark-client") == 0) {
     char* end = nullptr;
     errno = 0;

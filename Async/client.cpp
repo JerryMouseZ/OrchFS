@@ -27,6 +27,20 @@
 namespace orchfs::async {
 namespace {
 
+inline void cpu_relax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
+// Releases a transport gate on scope exit.
+struct GateGuard final {
+  std::atomic_flag* gate;
+  ~GateGuard() { gate->clear(std::memory_order_release); }
+};
+
 struct RpcReply {
   IpcDescriptor descriptor;
   std::vector<std::byte> payload;
@@ -202,11 +216,7 @@ class Session final : public std::enable_shared_from_this<Session> {
     void wait(std::size_t spin_count) noexcept {
       bool completed = ready.load(std::memory_order_acquire);
       while (!completed && spin_count-- != 0) {
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#else
-        std::atomic_signal_fence(std::memory_order_seq_cst);
-#endif
+        cpu_relax();
         completed = ready.load(std::memory_order_acquire);
       }
       while (!completed) {
@@ -262,9 +272,12 @@ class Session final : public std::enable_shared_from_this<Session> {
     std::atomic_flag transport_gate = ATOMIC_FLAG_INIT;
     std::atomic<bool> peer_failure_checked{false};
     std::atomic<bool> drained{false};
-    std::pmr::unsynchronized_pool_resource pending_pool;
+    // The map is lane-owner local, but Pending control blocks can release on
+    // either the completion worker or the resumed coroutine's worker.
+    std::pmr::unsynchronized_pool_resource pending_map_pool;
+    std::pmr::synchronized_pool_resource pending_control_pool;
     std::pmr::unordered_map<std::uint64_t, std::shared_ptr<Pending>> pending{
-        &pending_pool};
+        &pending_map_pool};
     std::deque<std::shared_ptr<Pending>> outbound;
   };
 
@@ -495,17 +508,10 @@ class Session final : public std::enable_shared_from_this<Session> {
         return Result<ReceivedIpcSlot>::failure(
             std::make_error_code(std::errc::not_connected));
       }
-#if defined(__x86_64__) || defined(__i386__)
-      __builtin_ia32_pause();
-#else
-      std::atomic_signal_fence(std::memory_order_seq_cst);
-#endif
+      cpu_relax();
     }
     lane.direct_waiters.fetch_sub(1, std::memory_order_acq_rel);
-    struct GateGuard final {
-      std::atomic_flag* gate;
-      ~GateGuard() { gate->clear(std::memory_order_release); }
-    } gate_guard{&lane.transport_gate};
+    GateGuard gate_guard{&lane.transport_gate};
 
     if (!accepting_.load(std::memory_order_acquire)) {
       return Result<ReceivedIpcSlot>::failure(
@@ -544,11 +550,7 @@ class Session final : public std::enable_shared_from_this<Session> {
       error = transport_.try_submit_scattered(
           lane.lane, descriptor, request_head, request_tail, &request_id);
       if (error == make_error_code(TransportErrc::would_block)) {
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#else
-        std::atomic_signal_fence(std::memory_order_seq_cst);
-#endif
+        cpu_relax();
       }
     } while (error == make_error_code(TransportErrc::would_block) &&
              accepting_.load(std::memory_order_acquire));
@@ -567,11 +569,10 @@ class Session final : public std::enable_shared_from_this<Session> {
               std::make_error_code(std::errc::protocol_error));
         }
         if (trace_started_ns != 0) {
-          const int trace_error = incoming.status < 0
-              ? -incoming.status : incoming.status;
           orchfs_repro_trace_end(
               ORCHFS_TRACE_CLIENT_ROUND_TRIP, request_id, trace_started_ns,
-              incoming.result_length, 1, trace_error);
+              incoming.result_length, 1,
+              repro_trace::error_from_status(incoming.status));
         }
         std::uint64_t notifications = 0;
         (void)transport_.drain_completion_notifications(
@@ -585,11 +586,7 @@ class Session final : public std::enable_shared_from_this<Session> {
         return Result<ReceivedIpcSlot>::failure(
             std::make_error_code(std::errc::connection_reset));
       }
-#if defined(__x86_64__) || defined(__i386__)
-      __builtin_ia32_pause();
-#else
-      std::atomic_signal_fence(std::memory_order_seq_cst);
-#endif
+      cpu_relax();
     }
   }
 
@@ -635,7 +632,8 @@ class Session final : public std::enable_shared_from_this<Session> {
       if (worker != detail::no_worker && !lanes_.empty()) {
         auto& lane = *lanes_[worker % lanes_.size()];
         return std::allocate_shared<Pending>(
-            std::pmr::polymorphic_allocator<Pending>(&lane.pending_pool));
+            std::pmr::polymorphic_allocator<Pending>(
+                &lane.pending_control_pool));
       }
     }
     return std::make_shared<Pending>();
@@ -835,6 +833,22 @@ class Session final : public std::enable_shared_from_this<Session> {
     }
   }
 
+  void finish_round_trip_trace(const std::shared_ptr<Pending>& pending,
+                               const IpcDescriptor& descriptor,
+                               std::error_code error) noexcept {
+    if (pending->trace_started_ns == 0) {
+      return;
+    }
+    int trace_error = error ? error.value() : 0;
+    if (trace_error == 0 && descriptor.status != 0) {
+      trace_error = repro_trace::error_from_status(descriptor.status);
+    }
+    orchfs_repro_trace_end(
+        ORCHFS_TRACE_CLIENT_ROUND_TRIP, pending->descriptor.request_id,
+        pending->trace_started_ns, descriptor.result_length, 1, trace_error);
+    pending->trace_started_ns = 0;
+  }
+
   void finish_pending(const std::shared_ptr<Pending>& pending,
                       std::error_code error, IpcDescriptor descriptor = {},
                       std::vector<std::byte> payload = {},
@@ -843,18 +857,7 @@ class Session final : public std::enable_shared_from_this<Session> {
       finish_blocking_pending(pending, error, {});
       return;
     }
-    if (pending->trace_started_ns != 0) {
-      int trace_error = error ? error.value() : 0;
-      if (trace_error == 0 && descriptor.status != 0) {
-        trace_error = descriptor.status < 0 ? -descriptor.status
-                                             : descriptor.status;
-      }
-      orchfs_repro_trace_end(
-          ORCHFS_TRACE_CLIENT_ROUND_TRIP,
-          pending->descriptor.request_id, pending->trace_started_ns,
-          descriptor.result_length, 1, trace_error);
-      pending->trace_started_ns = 0;
-    }
+    finish_round_trip_trace(pending, descriptor, error);
     pending->error = error;
     pending->reply.descriptor = descriptor;
     pending->reply.payload = std::move(payload);
@@ -880,19 +883,7 @@ class Session final : public std::enable_shared_from_this<Session> {
     if (call == nullptr) {
       std::terminate();
     }
-    if (pending->trace_started_ns != 0) {
-      const auto descriptor = completion.descriptor();
-      int trace_error = error ? error.value() : 0;
-      if (trace_error == 0 && descriptor.status != 0) {
-        trace_error = descriptor.status < 0 ? -descriptor.status
-                                             : descriptor.status;
-      }
-      orchfs_repro_trace_end(
-          ORCHFS_TRACE_CLIENT_ROUND_TRIP,
-          pending->descriptor.request_id, pending->trace_started_ns,
-          descriptor.result_length, 1, trace_error);
-      pending->trace_started_ns = 0;
-    }
+    finish_round_trip_trace(pending, completion.descriptor(), error);
     call->error = error;
     call->completion = std::move(completion);
     outstanding_.fetch_sub(1, std::memory_order_acq_rel);
@@ -1067,10 +1058,10 @@ class Session final : public std::enable_shared_from_this<Session> {
         lane.transport_gate.test_and_set(std::memory_order_acquire)) {
       return Runtime::PollState::busy;
     }
-    struct GateGuard final {
-      std::atomic_flag* gate;
-      ~GateGuard() { gate->clear(std::memory_order_release); }
-    } gate_guard{&lane.transport_gate};
+    // Declared before gate_guard so a terminal-path pin is released only after
+    // the guard has finished its final access to LaneState.
+    std::shared_ptr<Session> terminal_pin;
+    GateGuard gate_guard{&lane.transport_gate};
     bool progress = drain_inbox(lane);
     progress |= pump_submissions(lane);
     progress |= pump_completions(lane);
@@ -1103,7 +1094,7 @@ class Session final : public std::enable_shared_from_this<Session> {
         // Control may release keep_alive_ as soon as every lane reports
         // drained. Pin only this terminal callback and publish drained after
         // clearing the owner-local registration member.
-        auto self = shared_from_this();
+        terminal_pin = shared_from_this();
         lane.registration.reset();
         (void)runtime_->notify(control_owner_);
         lane.drained.store(true, std::memory_order_release);

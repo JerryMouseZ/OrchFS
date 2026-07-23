@@ -1822,12 +1822,10 @@ DetachedTask run_request(std::shared_ptr<ServerSession> session,
   }
   auto completion = co_await session->dispatch(std::move(incoming));
   if (trace_started_ns != 0) {
-    const int trace_error = completion.descriptor.status < 0
-                                ? -completion.descriptor.status
-                                : completion.descriptor.status;
     orchfs_repro_trace_end(
         ORCHFS_TRACE_SERVER_DISPATCH, trace_request_id, trace_started_ns,
-        completion.descriptor.result_length, 1, trace_error);
+        completion.descriptor.result_length, 1,
+        repro_trace::error_from_status(completion.descriptor.status));
   }
   const auto lane = completion.lane;
   if (lane >= session->lanes_.size()) {

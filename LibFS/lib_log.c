@@ -8,6 +8,7 @@
 #include "../KernelFS/balloc.h"
 #include "../KernelFS/device.h"
 #include "../KernelFS/type.h"
+#include "orchfs/crc32c.h"
 
 #include <errno.h>
 #include <immintrin.h>
@@ -63,49 +64,6 @@ struct journal_state
 
 static struct journal_state journal;
 static _Thread_local struct orchfs_log_transaction* current_transaction;
-
-static uint32_t crc32c_software(const void* bytes, size_t length)
-{
-    const uint8_t* input = bytes;
-    uint32_t crc = UINT32_MAX;
-    while(length-- != 0)
-    {
-        crc ^= *input++;
-        for(int bit = 0; bit < 8; ++bit)
-            crc = (crc >> 1) ^ (UINT32_C(0x82f63b78) &
-                    (uint32_t)-(int32_t)(crc & 1U));
-    }
-    return ~crc;
-}
-
-#if defined(__x86_64__)
-__attribute__((target("sse4.2")))
-static uint32_t crc32c_sse42(const void* bytes, size_t length)
-{
-    const uint8_t* input = bytes;
-    uint64_t crc = UINT32_MAX;
-    while(length >= sizeof(uint64_t))
-    {
-        uint64_t word;
-        memcpy(&word, input, sizeof(word));
-        crc = _mm_crc32_u64(crc, word);
-        input += sizeof(word);
-        length -= sizeof(word);
-    }
-    while(length-- != 0)
-        crc = _mm_crc32_u8((uint32_t)crc, *input++);
-    return ~(uint32_t)crc;
-}
-#endif
-
-static uint32_t crc32c(const void* bytes, size_t length)
-{
-#if defined(__x86_64__)
-    if(__builtin_cpu_supports("sse4.2"))
-        return crc32c_sse42(bytes, length);
-#endif
-    return crc32c_software(bytes, length);
-}
 
 static size_t align_cacheline(size_t length)
 {
@@ -246,7 +204,7 @@ static uint32_t checkpoint_checksum(
 {
     struct orchfs_disk_checkpoint copy = *checkpoint;
     copy.checksum = 0;
-    return crc32c(&copy, sizeof(copy));
+    return orchfs_crc32c(&copy, sizeof(copy));
 }
 
 static int valid_checkpoint(const struct orchfs_disk_checkpoint* checkpoint)
@@ -373,24 +331,18 @@ static int build_frame(const struct orchfs_log_transaction* transaction,
         if(error != 0)
             return error;
     }
-    for(const struct allocation_record* allocation = transaction->allocations;
-        allocation != NULL; allocation = allocation->next)
+    for(int list = 0; list < 2; ++list)
     {
-        if(!valid_extent_block(allocation->type, allocation->block))
-            return EINVAL;
-        int error = add_frame_size(&payload_bytes, &record_count, 0);
-        if(error != 0)
-            return error;
-    }
-    for(const struct allocation_record* allocation =
-            transaction->deallocations;
-        allocation != NULL; allocation = allocation->next)
-    {
-        if(!valid_extent_block(allocation->type, allocation->block))
-            return EINVAL;
-        int error = add_frame_size(&payload_bytes, &record_count, 0);
-        if(error != 0)
-            return error;
+        const struct allocation_record* allocation = list == 0
+            ? transaction->allocations : transaction->deallocations;
+        for(; allocation != NULL; allocation = allocation->next)
+        {
+            if(!valid_extent_block(allocation->type, allocation->block))
+                return EINVAL;
+            int error = add_frame_size(&payload_bytes, &record_count, 0);
+            if(error != 0)
+                return error;
+        }
     }
 
     const size_t fixed = sizeof(struct orchfs_journal_frame_header) +
@@ -434,7 +386,7 @@ static int build_frame(const struct orchfs_log_transaction* transaction,
             .target = target,
             .length = (uint32_t)record->length,
             .record_bytes = (uint32_t)bytes,
-            .data_checksum = crc32c(record->data, (size_t)record->length),
+            .data_checksum = orchfs_crc32c(record->data, (size_t)record->length),
         };
         memcpy(cursor + sizeof(*disk_record), record->data,
                (size_t)record->length);
@@ -457,17 +409,17 @@ static int build_frame(const struct orchfs_log_transaction* transaction,
             cursor += disk_record->record_bytes;
         }
     }
-    header->payload_checksum = crc32c(
+    header->payload_checksum = orchfs_crc32c(
         frame + sizeof(*header), payload_bytes);
     header->header_checksum = 0;
-    header->header_checksum = crc32c(header, sizeof(*header));
+    header->header_checksum = orchfs_crc32c(header, sizeof(*header));
     struct orchfs_journal_commit* commit =
         (void*)(frame + frame_bytes - sizeof(*commit));
     *commit = (struct orchfs_journal_commit){
         .magic = ORCHFS_JOURNAL_COMMIT_MAGIC,
         .txid = txid,
         .frame_bytes = frame_bytes,
-        .frame_checksum = crc32c(frame, frame_bytes - sizeof(*commit)),
+        .frame_checksum = orchfs_crc32c(frame, frame_bytes - sizeof(*commit)),
     };
     *output = frame;
     *output_length = frame_bytes;
@@ -489,16 +441,16 @@ static int validate_frame(const unsigned char* frame, size_t frame_bytes)
     struct orchfs_journal_frame_header header_copy = *header;
     const uint32_t header_checksum = header_copy.header_checksum;
     header_copy.header_checksum = 0;
-    if(header_checksum != crc32c(&header_copy, sizeof(header_copy)))
+    if(header_checksum != orchfs_crc32c(&header_copy, sizeof(header_copy)))
         return EINVAL;
     const struct orchfs_journal_commit* commit = (const void*)(
         frame + frame_bytes - sizeof(*commit));
     if(commit->magic != ORCHFS_JOURNAL_COMMIT_MAGIC ||
        commit->txid != header->txid || commit->frame_bytes != frame_bytes ||
-       commit->frame_checksum != crc32c(frame, frame_bytes - sizeof(*commit)))
+       commit->frame_checksum != orchfs_crc32c(frame, frame_bytes - sizeof(*commit)))
         return EINVAL;
     const size_t payload_bytes = frame_bytes - sizeof(*header) - sizeof(*commit);
-    if(header->payload_checksum != crc32c(frame + sizeof(*header),
+    if(header->payload_checksum != orchfs_crc32c(frame + sizeof(*header),
                                          payload_bytes))
         return EINVAL;
 
@@ -519,7 +471,7 @@ static int validate_frame(const unsigned char* frame, size_t frame_bytes)
             if(record->target < 0 || record->offset != 0 ||
                (uint64_t)record->target > PMEM_LEN ||
                record->length > PMEM_LEN - (uint64_t)record->target ||
-               record->data_checksum != crc32c(cursor + sizeof(*record),
+               record->data_checksum != orchfs_crc32c(cursor + sizeof(*record),
                                                 record->length))
                 return EINVAL;
         }

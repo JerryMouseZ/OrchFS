@@ -10,6 +10,17 @@
 
 namespace orchfs::async::repro_trace {
 
+// A signed descriptor/reply status carries the error as its magnitude; trace
+// records store the positive errno.
+inline int error_from_status(std::int32_t status) noexcept {
+  const std::int64_t magnitude = status < 0
+      ? -static_cast<std::int64_t>(status)
+      : static_cast<std::int64_t>(status);
+  return magnitude > std::numeric_limits<int>::max()
+      ? static_cast<int>(std::errc::protocol_error)
+      : static_cast<int>(magnitude);
+}
+
 class Span final {
  public:
   explicit Span(orchfs_repro_trace_stage stage, std::uint64_t request_id = 0,

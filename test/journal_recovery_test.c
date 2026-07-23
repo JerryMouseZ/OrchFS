@@ -5,6 +5,7 @@
 #include "../KernelFS/device.h"
 #include "../KernelFS/type.h"
 #include "../config/log_config.h"
+#include "orchfs/crc32c.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -34,18 +35,18 @@ static void fail(const char* message)
     exit(1);
 }
 
-static uint32_t crc32c(const void* bytes, size_t length)
+static void test_crc32c_contract(void)
 {
-    const uint8_t* input = bytes;
-    uint32_t crc = UINT32_MAX;
-    while(length-- != 0)
-    {
-        crc ^= *input++;
-        for(int bit = 0; bit < 8; ++bit)
-            crc = (crc >> 1) ^ (UINT32_C(0x82f63b78) &
-                    (uint32_t)-(int32_t)(crc & 1U));
-    }
-    return ~crc;
+    static const unsigned char input[] = "123456789";
+    const uint32_t expected = UINT32_C(0xe3069283);
+    if(orchfs_crc32c_software(input, sizeof(input) - 1) != expected ||
+       orchfs_crc32c(input, sizeof(input) - 1) != expected)
+        fail("CRC32C fixed vector changed");
+#if defined(__x86_64__)
+    if(__builtin_cpu_supports("sse4.2") &&
+       orchfs_crc32c_hardware(input, sizeof(input) - 1) != expected)
+        fail("hardware CRC32C differs from the on-media contract");
+#endif
 }
 
 static void initialize_media(void)
@@ -59,7 +60,7 @@ static void initialize_media(void)
     superblock->feature_flags = ORCHFS_DISK_FEATURE_WAL;
     superblock->checkpoints[0].generation = 1;
     superblock->checkpoints[0].checksum = 0;
-    superblock->checkpoints[0].checksum = crc32c(
+    superblock->checkpoints[0].checksum = orchfs_crc32c(
         &superblock->checkpoints[0], sizeof(superblock->checkpoints[0]));
     memset(&inode_cache, 0, sizeof(inode_cache));
     inode_cache.i_number = 0;
@@ -196,6 +197,7 @@ static void run_crashing_transaction(const char* point, unsigned char marker,
 
 int main(void)
 {
+    test_crc32c_contract();
     media = mmap(NULL, sizeof(*media), PROT_READ | PROT_WRITE,
                  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if(media == MAP_FAILED)

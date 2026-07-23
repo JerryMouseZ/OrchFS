@@ -57,6 +57,8 @@ FileState file_state;
 std::vector<std::byte> pmem(kPmemSize);
 std::vector<std::byte> device(4 * 1024 * 1024);
 std::atomic<int> device_error{0};
+std::atomic<int> device_durability{ORCHFS_DEVICE_DURABILITY_COMPLETION};
+std::atomic<std::size_t> device_flush_count{0};
 std::atomic<bool> fail_allocation{false};
 std::atomic<bool> migration_candidate{false};
 std::atomic<std::size_t> block_query_count{0};
@@ -114,6 +116,9 @@ void reset_ssd(std::size_t size) {
     device[i] = pattern(i);
   }
   device_error.store(0, std::memory_order_release);
+  device_durability.store(ORCHFS_DEVICE_DURABILITY_COMPLETION,
+                          std::memory_order_release);
+  device_flush_count.store(0, std::memory_order_release);
   fail_allocation.store(false, std::memory_order_release);
   strata_ensure_count.store(0, std::memory_order_release);
 }
@@ -128,6 +133,9 @@ void reset_virtual(std::size_t size) {
     file_state.blocks[block] = virtual_block(block);
   }
   device_error.store(0, std::memory_order_release);
+  device_durability.store(ORCHFS_DEVICE_DURABILITY_COMPLETION,
+                          std::memory_order_release);
+  device_flush_count.store(0, std::memory_order_release);
   fail_allocation.store(false, std::memory_order_release);
   strata_ensure_count.store(0, std::memory_order_release);
 }
@@ -482,12 +490,13 @@ extern "C" int submit_device_sync(
   if (error != 0) {
     return error;
   }
+  device_flush_count.fetch_add(1, std::memory_order_relaxed);
   completion(context, 0, 0);
   return 0;
 }
 
 extern "C" int orchfs_device_effective_write_durability() {
-  return ORCHFS_DEVICE_DURABILITY_COMPLETION;
+  return device_durability.load(std::memory_order_acquire);
 }
 
 extern "C" int orchfs_prepare_migration(orchfs_migration_plan** output) {
@@ -601,6 +610,8 @@ int main() {
 
   constexpr std::size_t pipelined_file_size = 16 * kBlockSize;
   reset_ssd(pipelined_file_size);
+  device_durability.store(ORCHFS_DEVICE_DURABILITY_FLUSH,
+                          std::memory_order_release);
   std::vector<std::byte> pipelined_expected(
       device.begin(), device.begin() + pipelined_file_size);
   std::vector<std::byte> pipelined_source(
@@ -610,6 +621,8 @@ int main() {
   require(pipelined_write &&
               pipelined_write.value().bytes == pipelined_source.size(),
           "pipelined SSD partial overwrite failed");
+  require(device_flush_count.load(std::memory_order_acquire) == 1,
+          "pipelined SSD partial overwrite was not covered by one flush");
   std::copy(pipelined_source.begin(), pipelined_source.end(),
             pipelined_expected.begin() + 1);
   require(read_file(*runtime, core, pipelined_file_size) ==

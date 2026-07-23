@@ -7,22 +7,9 @@
 #include "kindex.h"
 #include "../config/protocol.h"
 #include "../config/config.h"
+#include "orchfs/crc32c.h"
 
 // #define KERNEL_FUNC_DEBUG
-
-static uint32_t checkpoint_crc32c(const void* bytes, size_t length)
-{
-    const uint8_t* input = bytes;
-    uint32_t crc = UINT32_MAX;
-    while(length-- != 0)
-    {
-        crc ^= *input++;
-        for(int bit = 0; bit < 8; ++bit)
-            crc = (crc >> 1) ^ (UINT32_C(0x82f63b78) &
-                    (uint32_t)-(int32_t)(crc & 1U));
-    }
-    return ~crc;
-}
 
 void korch_time_stamp(struct timespec * time)
 {
@@ -126,7 +113,7 @@ void init_super_block()
     sb_pt->format_version = ORCHFS_DISK_FORMAT_VERSION;
     sb_pt->feature_flags = ORCHFS_DISK_FEATURE_WAL;
     sb_pt->checkpoints[0].generation = 1;
-    sb_pt->checkpoints[0].checksum = checkpoint_crc32c(
+    sb_pt->checkpoints[0].checksum = orchfs_crc32c(
         &sb_pt->checkpoints[0], sizeof(sb_pt->checkpoints[0]));
     for(int i = START_BMP_ID; i <= END_BMP_ID; i++)
     {

@@ -4,6 +4,7 @@
 
 #if defined(ORCHFS_ENABLE_SPDK) && defined(ORCHFS_KFS_SERVER)
 #include "spdk_device_service.h"
+#include "spdk_nvme_bridge.h"
 #define ORCHFS_USE_SPDK_DEVICE 1
 #endif
 
@@ -556,6 +557,16 @@ int orchfs_device_unregister_dma_region(void* address, size_t length)
 int orchfs_device_effective_write_durability(void)
 {
 #ifdef ORCHFS_USE_SPDK_DEVICE
+    // The SPDK layer resolves policy in its own enum; forwarding the value
+    // unchanged is only valid while the two encodings coincide.
+    _Static_assert(
+        (int)ORCHFS_SPDK_DURABILITY_COMPLETION ==
+                (int)ORCHFS_DEVICE_DURABILITY_COMPLETION &&
+            (int)ORCHFS_SPDK_DURABILITY_FUA ==
+                (int)ORCHFS_DEVICE_DURABILITY_FUA &&
+            (int)ORCHFS_SPDK_DURABILITY_FLUSH ==
+                (int)ORCHFS_DEVICE_DURABILITY_FLUSH,
+        "SPDK and device write-durability enums must stay aligned");
     return orchfs_spdk_device_effective_write_durability();
 #else
     return ORCHFS_DEVICE_DURABILITY_FLUSH;
