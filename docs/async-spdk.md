@@ -8,9 +8,159 @@ execution process:
 - KFS owns a separate runtime and all authoritative filesystem state;
 - coroutine handles and pointers never cross the process boundary; the IPC
   transport carries fixed wire descriptors and copied request metadata;
-- only KFS opens the NVMe controller through SPDK. LibFS has no SPDK qpair;
+- on the production serving path, only KFS opens the NVMe controller through
+  SPDK. LibFS has no SPDK qpair; the offline formatter is a separate exception;
 - the existing POSIX/`LD_PRELOAD` surface is a blocking compatibility adapter
-  over `Runtime::submit()` plus `JoinHandle::join()`.
+  over `Runtime::block_on()`, with a direct blocking session seam for
+  positioned I/O.
+
+## Architecture and request lifecycle
+
+![OrchFS request lifecycle across the application process, shared-memory IPC, the KFS Runtime, PMEM, and SPDK-backed NVMe](images/orchfs-async-request-flow.svg)
+
+The diagram is generated from the checked-in
+[Graphviz source](images/orchfs-async-request-flow.dot). Solid teal arrows show
+request submission and selected data phases, dashed orange arrows show
+completion and resume flow, purple arrows show a conditional journal commit,
+and dotted gray arrows show session control or independent background work. It
+describes the production client/KFS serving path. Offline `mkfs`, recovery and
+device tests, and direct layered benchmarks do not traverse the complete
+Client → SHM → Server → Core path.
+
+### 1. Application entry and client ownership
+
+`LibFS/orchfs_wrapper.c` retains the original application boundary. Pathname
+operations select `/Or`; after `open`, descriptor operations route by the
+OrchFS virtual descriptor rather than repeating pathname selection. A routed
+call enters `LibFS/async_adapter.cpp`; native C++ code can instead call
+`Client`, `File`, or `Directory` directly. The preload DSO constructor attempts
+to initialize the adapter eagerly. A routed call reconnects lazily after an
+initial failure or in a post-`fork()` child, while preserving the invariant of
+one Runtime per process. A separate KFS process owns its own `Runtime` and all
+authoritative filesystem state.
+
+Only an external application thread may block at the POSIX compatibility
+boundary. The adapter takes short lifecycle/slot leases, releases its
+process-wide ownership gate before remote I/O, and then waits for the operation
+without blocking a Runtime worker. General compatibility operations use
+`Runtime::block_on()`. When a direct blocking lane is available, including the
+default adapter configuration, positioned I/O publishes and waits from the
+external caller thread instead. Native callers retain the `Task`/`JoinHandle`
+interface and suspend.
+
+### 2. Session setup and shared-memory transport
+
+`Client::connect()` uses the Unix-domain control socket to create and monitor a
+session. Steady-state requests do not send coroutine frames or raw pointers
+through that socket. `Async/ipc_transport.cpp` carries fixed wire descriptors,
+paths and request metadata, plus request/result payloads, through per-lane
+shared-memory submission and completion rings. Large I/O is chunked to the
+configured data-slot size.
+
+The client Runtime polls the ordinary asynchronous completion lanes. A direct
+blocking positioned-I/O caller instead drives its leased SQ/CQ lane from the
+external thread. The KFS Runtime polls the matching submission lanes and
+reserves a CQ slot before accepting work, so a request always has a place to
+publish its result. The transported descriptor is the process boundary:
+coroutine handles, C++ object addresses, and borrowed application-buffer
+addresses remain local to their owner.
+
+### 3. KFS dispatch and concurrency ownership
+
+`Async/server.cpp` validates the wire request and resolves its remote handle.
+Namespace operations enter worker 0; open-file data operations are reassigned
+to the stable owner derived from the inode. Some handle lifecycle operations
+also funnel through worker 0; handle lifetime/offset coordination and inode
+range arbitration then protect the relevant state and overlapping ranges. The
+server calls the injected `AsyncFilesystem`; production injects
+`KfsCoroutineCore`, while tests may inject an in-memory implementation.
+
+This ownership step is separate from the IPC lane. A client can use more lanes
+than it has client Runtime workers, and a KFS request can move from its lane
+owner to its inode owner before touching filesystem state.
+
+### 4. Foreground heterogeneous data plan and durability
+
+`Async/kfs_coroutine_core.cpp` is the authoritative coroutine orchestration
+layer over the retained C on-media layout core (`kfs_core_api.c`,
+`kfs_data_plan.c`, `lib_inode.c`, `lib_log.c`, `libspace.c`, and `migrate.c`).
+It snapshots or updates mappings, acquires an inode-range permit, and builds
+explicit PMEM and SSD phases:
+
+- PMEM holds virtual-block payload, STRATA overlays, and persistent
+  mapping/journal metadata;
+- SSD reads and writes go through `AsyncBlockDevice`, which submits to the
+  process-owned device service and suspends the coroutine;
+- each configured SPDK qpair is owned and polled by one KFS Runtime worker;
+  requests from any KFS worker map to one of those qpair owners, so callbacks
+  resume work without a second service-thread pool;
+- partial SSD overwrites use asynchronous read-modify-write when required, and
+  independent device operations may be submitted as a batch.
+
+The PMEM and SSD branches in the figure are phases selected by a foreground
+file request's mapping and alignment plan; they are not both mandatory and the
+figure does not assert that they always run concurrently. A successful
+foreground write waits for every applicable phase: SSD I/O, if selected,
+reaches the configured completion/FUA/flush durability point; changed PMEM data
+or metadata is persisted on the worker that issued it; and a mapping or
+inode-size transaction, if needed, commits only after the corresponding data is
+durable. A stable overwrite that changes no mapping does not invent an empty
+journal transaction. The server publishes success only after all phases
+selected for that request have completed.
+
+The migration scheduler independently calls `KfsCoroutineCore::migrate()` on
+the same KFS Runtime, outside client SQ/CQ completion. It shares the core's
+range arbitration, allocation, and device interfaces, but it has a separate
+commit sequence. In the current tree, migration awaits device-write completion
+before committing its mapping transaction; unlike the foreground write path,
+it does not add an explicit `device_.flush()` when the selected policy is
+`flush`. The foreground ordering above must therefore not be read as a
+migration durability guarantee.
+
+### 5. Completion and return
+
+After an inline PMEM phase finishes or an SPDK callback makes a suspended core
+graph runnable again, control returns from the core to the server lane owner,
+which encodes status and result data into the reserved CQ slot. The client
+Runtime poller matches an ordinary asynchronous response to its pending
+request, and native callers resume their coroutine. A general POSIX call blocks
+through `Runtime::block_on()`; the positioned-I/O fast path directly waits on a
+leased CQ slot and copies any read payload from that slot on the external caller
+thread.
+
+The reverse path in the diagram is therefore a completion path, not a second
+filesystem execution path: KFS remains the only owner of authoritative state
+and, on the serving path, the only process that opens the NVMe controller.
+
+### Relationship to the original OrchFS implementation
+
+| Preserved contract or mechanism | Asynchronous production replacement |
+| --- | --- |
+| `/Or` routing and the documented POSIX/`LD_PRELOAD` subset | Blocking is confined to the external adapter boundary; internal APIs return coroutine tasks |
+| Heterogeneous PMEM/SSD layout and alignment-based write partition | `KfsCoroutineCore` orchestrates the retained C layout core as suspendable PMEM, SSD, and journal phases |
+| On-media mappings, allocator, journal, recovery, and migration | KFS Runtime ownership and range arbitration coordinate them without LibFS/KFS I/O pools |
+| Cross-process client/KFS split | Fixed SHM SQ/CQ wire descriptors replace the legacy request/service-thread bridge |
+| SSD data path | Production KFS uses Runtime-owned SPDK qpairs; LibFS never opens the controller |
+
+The offline `mkfs` formatter remains a deliberate exception: it owns SPDK on
+its calling thread and polls synchronously. A default non-SPDK build supplies
+the async interfaces and hardware-independent tests, but does not build the
+production KFS executable.
+
+### Code map
+
+| Stage | Primary implementation |
+| --- | --- |
+| POSIX interception and `/Or` routing | `LibFS/orchfs_wrapper.c` |
+| Blocking compatibility, descriptor leases, client Runtime lifecycle | `LibFS/async_adapter.cpp` |
+| Native proxy API and client completion polling | `Async/client.cpp`, `include/orchfs/async/client.hpp` |
+| Control socket and SHM SQ/CQ transport | `Async/ipc_transport.cpp` |
+| KFS lane polling, owner routing, remote handles, CQ publication | `Async/server.cpp` |
+| Coroutine orchestration, range arbitration, PMEM/SSD plans, journal ordering | `Async/kfs_coroutine_core.cpp` |
+| Retained on-media mapping, allocation, log, and migration mechanics | `LibFS/kfs_core_api.c`, `LibFS/kfs_data_plan.c`, `LibFS/lib_inode.c`, `LibFS/lib_log.c`, `LibFS/libspace.c`, `LibFS/migrate.c` |
+| Coroutine-to-device suspension and batched completion | `Async/block_device.cpp` |
+| KFS Runtime/server/migration lifecycle | `KernelFS/async_server_bridge.cpp` |
+| SPDK qpair ownership and NVMe commands | `KernelFS/spdk_device_service.cpp`, `KernelFS/spdk_nvme_backend.cpp` |
 
 The supported SPDK baseline is **v26.01**. Keep SPDK in a fixed external prefix
 instead of copying its headers or libraries into this repository. The default
@@ -247,8 +397,9 @@ The adapter preserves the original synchronous OrchFS operations that had a
 real backing implementation: descriptor and positioned I/O, `openat`, seek,
 truncate, metadata/statfs queries, directory iteration, namespace mutation,
 stdio cookies, `fsync`/`fdatasync`, and `sync_file_range`. Every successful
-write response now includes SSD persistence under the selected policy, the
-inode-owner PMEM fence, and the metadata journal commit. Consequently
+write response waits for the durability phases selected by its data plan: any
+SSD persistence action, any inode-owner PMEM fence, and any required metadata
+journal commit. Consequently
 `fsync`/`fdatasync` validate the descriptor and return locally without a second
 SHM RPC; `O_SYNC` and `O_DSYNC` do not add another flush. The legacy
 wrapper's `link()` success-without-a-namespace-change and generic `fcntl()`
@@ -270,16 +421,20 @@ The shared-memory footprint grows approximately with
 worker counts and IPC sizing explicit. The protocol currently supports at most
 120 lanes per client.
 
-Each KFS Runtime worker owns one SPDK qpair. Submission, completion polling,
-and qpair destruction stay on that worker; SPDK creates no OrchFS service
-thread. The backend uses DMA bounce buffers
+Each configured SPDK qpair is owned by one KFS Runtime worker. The poller count
+is capped by the Runtime worker count; submissions from every KFS worker map to
+one of those qpair owners. Submission, completion polling, and qpair destruction
+stay with the selected owner, and SPDK creates no OrchFS service thread. The
+backend uses DMA bounce buffers
 for unaligned reads and read-modify-write, splits transfers at the configured
-maximum, retries transient queue pressure, and maps filesystem sync to a real
-NVMe flush. A physical LBA-range reservation spans the complete logical write,
-so overlapping RMW operations serialize while non-overlapping writes remain
-concurrent. Flush captures a global write fence and waits for every logical
-write accepted through that fence on every worker before issuing the namespace
-flush.
+maximum, retries transient queue pressure, and exposes a real NVMe flush for
+the selected write-durability policy and direct device callers. The native
+`File::sync()` path persists KFS PMEM state; the POSIX adapter's `fsync` does not
+issue a second RPC after a successful write. A physical LBA-range reservation
+spans the complete logical write, so overlapping RMW operations serialize while
+non-overlapping writes remain concurrent. Flush captures a global write fence
+and waits for every logical write accepted through that fence on every worker
+before issuing the namespace flush.
 
 SSD write durability is selected once at startup. `auto` uses ordinary NVMe
 write completion only when Identify Controller reports that no volatile write

@@ -23,14 +23,51 @@ month = feb
 }
 ```
 
+## Architecture and asynchronous request flow
+
+![OrchFS request flow from the application process through shared-memory IPC and the KFS coroutine Runtime to PMEM or SPDK-backed NVMe, with completions returning through the CQ](docs/images/orchfs-async-request-flow.svg)
+
+The current tree keeps the original `/Or` routing and the documented
+POSIX/`LD_PRELOAD` compatibility boundary, while the production request path
+behind that boundary is coroutine-native:
+
+1. `libOrchFS.so` selects `/Or` pathname operations and routes later operations
+   on OrchFS virtual descriptors to the blocking adapter; native users may
+   instead enter through `Client`, `File`, and `Directory`. Each LibFS process
+   owns one client `Runtime`, while KFS owns a distinct `Runtime` in a separate
+   process.
+2. The Unix socket establishes and monitors a session. Requests and results use
+   shared-memory SQ/CQ lanes containing fixed wire descriptors and copied
+   metadata; coroutine handles and process-local pointers never cross IPC.
+3. The KFS `Server` polls the SQ, routes namespace work to worker 0 and inode
+   data work to a stable owner, then dispatches into `KfsCoroutineCore`.
+4. `KfsCoroutineCore` orchestrates the retained OrchFS heterogeneous data plan:
+   virtual-block/STRATA fragments and metadata use PMEM, while SSD phases suspend through
+   `AsyncBlockDevice` and Runtime-owned SPDK qpairs. Mapping-changing writes
+   in the foreground request path commit journal metadata only after the
+   corresponding data is durable.
+5. Completion callbacks resume the suspended graph, KFS publishes the CQ
+   result, and the client either resumes a native coroutine or returns from the
+   external POSIX caller's blocking boundary.
+
+Solid teal arrows in the diagram are submission/data flow, dashed orange
+arrows are completion/resume flow, purple arrows are conditional journal work,
+and dotted gray arrows are control or independent background dependencies. See
+the [detailed lifecycle and code map](docs/async-spdk.md#architecture-and-request-lifecycle),
+or edit the checked-in [Graphviz source](docs/images/orchfs-async-request-flow.dot)
+and regenerate the SVG/PNG.
+
 ## Structure:
 
 ```
 root
-|---- KernelFS      (OrchFS KernelFS module)
-|---- LibFS     (OrchFS LibFS module)
-|---- config        (OrchFS config module)
-|---- util      (OrchFS other optimization module)
+|---- Async                  (Runtime, IPC, client/server, KFS coroutine core)
+|---- include/orchfs/async   (public coroutine-facing interfaces)
+|---- LibFS                  (LD_PRELOAD/POSIX adapter and layout helpers)
+|---- KernelFS               (KFS startup, allocator, journal, SPDK service)
+|---- config                 (build-time and host-local configuration templates)
+|---- docs                   (architecture, operation, benchmark, and reproduction guides)
+|---- util                   (shared data structures and helpers)
 ```
 Before running OrchFS, it is necessary to ensure that there is a persistent memory (e.g., Intel Optane PM) and a high-bandwidth SSD available. The persistent memory require at least 32GiB of space and need to be configured in dax mode. We encourage the users to employ enterprise SSDs for evaluation.
 Python 3.x is required on the server to run scripts that modify configuration files.
@@ -38,9 +75,10 @@ Python 3.x is required on the server to run scripts that modify configuration fi
 ## Building OrchFS:
 Assume current directory is a project root directory.
 
-The production implementation uses one C++20 Runtime for KFS, client sessions,
-SPDK completions, migration, allocation, and journal work. The old LibFS/KFS
-I/O pools and blocking service bridge are no longer built.
+Each LibFS process uses one C++20 client Runtime. KFS uses a separate C++20
+Runtime for authoritative filesystem requests, SPDK completions, migration,
+allocation, and journal work. The old LibFS/KFS I/O pools and blocking service
+bridge are no longer built.
 
 **1. Change persistent-memory configuration**
 ```

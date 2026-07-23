@@ -1,0 +1,244 @@
+// Regenerate from the repository root with:
+//   dot -Tsvg docs/images/orchfs-async-request-flow.dot \
+//     -o docs/images/orchfs-async-request-flow.svg
+//   dot -Gdpi=180 -Tpng docs/images/orchfs-async-request-flow.dot \
+//     -o docs/images/orchfs-async-request-flow.png
+digraph orchfs_async_request_flow {
+  graph [
+    rankdir=LR,
+    compound=true,
+    newrank=true,
+    splines=spline,
+    nodesep=0.42,
+    ranksep=0.64,
+    pad=0.20,
+    margin=0,
+    bgcolor="white",
+    fontname="DejaVu Sans",
+    fontsize=22,
+    labelloc=t,
+    label="Production OrchFS client/KFS request flow",
+    ratio=fill,
+    size="13.333,7.5!",
+    // Graphviz 2.43 applies non-72 DPI to SVG transforms but not its viewBox.
+    // Keep SVG at 72 DPI; override DPI only for the raster command above.
+    dpi=72
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    color="#36556f",
+    fillcolor="white",
+    fontcolor="#102a43",
+    fontname="DejaVu Sans",
+    fontsize=11,
+    margin="0.16,0.11",
+    penwidth=1.25
+  ];
+
+  edge [
+    color="#0f8b8d",
+    fontcolor="#0b6f70",
+    fontname="DejaVu Sans",
+    fontsize=10,
+    penwidth=2.1,
+    arrowsize=0.76
+  ];
+
+  subgraph cluster_application {
+    label="APPLICATION PROCESS";
+    color="#90b8dc";
+    fillcolor="#edf6ff";
+    fontcolor="#244a68";
+    fontname="DejaVu Sans Bold";
+    fontsize=12;
+    style="rounded,filled";
+    penwidth=1.3;
+    margin=18;
+
+    posix_path [
+      label="OrchFS-routed POSIX call\n↓\nLD_PRELOAD\npath / virtual-fd routing\n↓\nPOSIX adapter\nblocking boundary"
+    ];
+    async_api [label="Native async API\nClient / File / Directory"];
+    client_runtime [
+      label="Client Runtime\nrequest submission\ncompletion pollers",
+      fillcolor="#dceeff"
+    ];
+
+    { rank=same; posix_path; async_api; }
+
+    posix_path -> client_runtime [label="1  general submit"];
+    async_api -> client_runtime [label="1  async submit"];
+  }
+
+  subgraph cluster_ipc {
+    label="CLIENT–KFS IPC";
+    color="#b8c2cc";
+    fillcolor="#f4f6f8";
+    fontcolor="#425466";
+    fontname="DejaVu Sans Bold";
+    fontsize=12;
+    style="rounded,filled";
+    penwidth=1.3;
+    margin=18;
+
+    control [label="Unix control socket\nsession setup", fillcolor="#ffffff"];
+    shm_sq [label="SHM SQ lanes\nrequest descriptor + data", fillcolor="#e8f5f5"];
+    shm_cq [label="SHM CQ lanes\nstatus + result data", fillcolor="#fff1e6"];
+
+    { rank=same; control; shm_sq; shm_cq; }
+  }
+
+  subgraph cluster_kfs {
+    label="KFS PROCESS — KFS Runtime";
+    color="#7da8d4";
+    fillcolor="#eaf3fb";
+    fontcolor="#244a68";
+    fontname="DejaVu Sans Bold";
+    fontsize=12;
+    style="rounded,filled";
+    penwidth=1.3;
+    margin=18;
+
+    server [
+      label="Server + owner routing\nnamespace → worker 0\ninode I/O → stable owner"
+    ];
+    core [
+      label="KfsCoroutineCore\ncoroutine orchestration over\nretained C layout core + co_await",
+      fillcolor="#dceeff"
+    ];
+    journal [label="Foreground journal\ncommit after data durability\nif metadata changes", fillcolor="#f7f4ff"];
+    migration [label="Migration\nindependent background work", fillcolor="#f7f4ff"];
+
+    { rank=same; core; journal; migration; }
+
+    server -> core [label="4  dispatch"];
+    core -> journal [
+      color="#7c5cc4",
+      fontcolor="#6842b8",
+      penwidth=1.8,
+      constraint=false
+    ];
+    journal -> core [
+      color="#e36b2c",
+      fontcolor="#c6531d",
+      style=dashed,
+      penwidth=1.8,
+      constraint=false
+    ];
+    migration -> core [
+      color="#7b8794",
+      fontcolor="#616e7c",
+      style=dotted,
+      penwidth=1.4,
+      label="same core path; no client SQ/CQ",
+      constraint=false
+    ];
+  }
+
+  subgraph cluster_storage {
+    label="STORAGE DATA PATHS";
+    color="#8ebf83";
+    fillcolor="#f0f8ed";
+    fontcolor="#356832";
+    fontname="DejaVu Sans Bold";
+    fontsize=12;
+    style="rounded,filled";
+    penwidth=1.3;
+    margin=18;
+
+    pmem [
+      label="PMEM\nvirtual-block payload\nSTRATA overlays + metadata",
+      fillcolor="#ffffff"
+    ];
+    nvme_path [
+      label="AsyncBlockDevice\n↓\nRuntime-owned SPDK qpairs\n↓\nNVMe SSD",
+      fillcolor="#ffffff"
+    ];
+
+    { rank=same; pmem; nvme_path; }
+  }
+
+  client_runtime -> control [
+    color="#7b8794",
+    fontcolor="#616e7c",
+    style=dotted,
+    penwidth=1.4,
+    label="handshake",
+    constraint=false
+  ];
+  control -> server [
+    color="#7b8794",
+    fontcolor="#616e7c",
+    style=dotted,
+    penwidth=1.4,
+    label="session",
+    constraint=false
+  ];
+
+  client_runtime -> shm_sq [label="2  ordinary SQ publish"];
+  posix_path -> shm_sq [
+    label="1  positioned I/O direct SQ",
+    constraint=false
+  ];
+  shm_sq -> server [label="3  lane poll"];
+
+  core -> pmem [label="5a  PMEM phase (if selected; inline)"];
+  core -> nvme_path [label="5b  SSD phase (if selected; async)"];
+
+  pmem -> core [
+    color="#e36b2c",
+    fontcolor="#c6531d",
+    style=dashed,
+    constraint=false
+  ];
+  nvme_path -> core [
+    color="#e36b2c",
+    fontcolor="#c6531d",
+    style=dashed,
+    constraint=false
+  ];
+  core -> server [
+    color="#e36b2c",
+    fontcolor="#c6531d",
+    style=dashed,
+    label="6  operation complete",
+    constraint=false
+  ];
+  server -> shm_cq [
+    color="#e36b2c",
+    fontcolor="#c6531d",
+    style=dashed,
+    label="CQ publish",
+    constraint=false
+  ];
+  shm_cq -> client_runtime [
+    color="#e36b2c",
+    fontcolor="#c6531d",
+    style=dashed,
+    label="7  ordinary resume / copy",
+    constraint=false
+  ];
+  shm_cq -> posix_path [
+    color="#e36b2c",
+    fontcolor="#c6531d",
+    style=dashed,
+    label="direct leased CQ",
+    constraint=false
+  ];
+  client_runtime -> posix_path [
+    color="#e36b2c",
+    fontcolor="#c6531d",
+    style=dashed,
+    label="return",
+    constraint=false
+  ];
+  client_runtime -> async_api [
+    color="#e36b2c",
+    fontcolor="#c6531d",
+    style=dashed,
+    label="resume",
+    constraint=false
+  ];
+}
