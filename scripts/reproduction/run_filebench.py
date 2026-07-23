@@ -19,7 +19,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from generate_filebench_workload import generate
-from run_reproduction import Case, ROOT, Runner, append_manifest
+from run_reproduction import (
+    Case, ROOT, Runner, append_manifest, worktree_fingerprint,
+)
 
 
 FIELDS = [
@@ -205,12 +207,13 @@ def run_sample(runner: Runner, args: argparse.Namespace, filebench_bin: str,
         # exec(2), so FILEBENCH's parent-only metadata writeback is skipped.
         assignments = [f"{key}={value}" for key, value in environment.items()]
         command = [
-            "sudo", "-n", "-E", "setarch",
+            "sudo", "-n", "-E", "timeout", "--signal=TERM",
+            "--kill-after=10s", f"{args.case_timeout}s", "setarch",
             subprocess.check_output(["uname", "-m"], text=True).strip(), "-R",
             "env", *assignments, filebench_bin, "-f", str(workload_path),
         ]
         completed = runner.logged_run(
-            command, check=False, timeout=args.case_timeout,
+            command, check=False, timeout=args.case_timeout + 20,
             stdout=run_dir / "filebench.log")
         exit_code = completed.returncode
         runner.stop_server(version, process)
@@ -280,6 +283,7 @@ def main() -> int:
         f"filebench_version\t{version_lines[0] if version_lines else 'unavailable'}\n"
         f"sync_build\t{args.sync_build.resolve()}\n"
         f"async_build\t{args.async_build.resolve()}\n"
+        f"async_worktree_sha256\t{worktree_fingerprint(ROOT)}\n"
         f"bdf\t{args.bdf}\nnsid\t{args.nsid}\ndax\t{args.dax}\n"
         "interleave\tper-case, direction reversed by case and repeat\n"
         "namespace_boundary\tfresh format per sample; restart after root creation\n",

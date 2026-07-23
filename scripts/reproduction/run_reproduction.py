@@ -566,8 +566,9 @@ class Runner:
         self.command_log.write(
             f"{dt.datetime.now(dt.timezone.utc).isoformat()}\t{shlex.join(command)} &\n")
         self.command_log.flush()
-        process = subprocess.Popen(command, text=True, stdout=stream,
-                                   stderr=subprocess.STDOUT)
+        process = subprocess.Popen(
+            command, text=True, stdout=stream, stderr=subprocess.STDOUT,
+            start_new_session=True)
         process._orchfs_log_stream = stream  # type: ignore[attr-defined]
         if version == "sync-fair":
             time.sleep(1.0)
@@ -584,13 +585,14 @@ class Runner:
             stream.close()
             raise RuntimeError(f"KFS exited early; see {log_path}")
         if version != "sync-fair" and not pathlib.Path(str(endpoint)).is_socket():
-            subprocess.run(["sudo", "-n", "kill", "-TERM", str(process.pid)],
+            subprocess.run(["sudo", "-n", "kill", "-TERM", "--",
+                            f"-{process.pid}"],
                            check=False, capture_output=True)
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                subprocess.run(["sudo", "-n", "kill", "-KILL",
-                                str(process.pid)], check=False,
+                subprocess.run(["sudo", "-n", "kill", "-KILL", "--",
+                                f"-{process.pid}"], check=False,
                                capture_output=True)
                 process.wait(timeout=10)
             stream.close()
@@ -608,13 +610,13 @@ class Runner:
                     self.logged_run(["sudo", "-n", "kill", "-USR1",
                                      str(process.pid)], check=False, timeout=10)
                     time.sleep(0.2)
-                self.logged_run(["sudo", "-n", "kill", "-TERM",
-                                 str(process.pid)], check=False, timeout=10)
+                self.logged_run(["sudo", "-n", "kill", "-TERM", "--",
+                                 f"-{process.pid}"], check=False, timeout=10)
             try:
                 process.wait(timeout=60)
             except subprocess.TimeoutExpired:
-                self.logged_run(["sudo", "-n", "kill", "-KILL",
-                                 str(process.pid)], check=False, timeout=10)
+                self.logged_run(["sudo", "-n", "kill", "-KILL", "--",
+                                 f"-{process.pid}"], check=False, timeout=10)
                 process.wait(timeout=10)
         finally:
             stream = getattr(process, "_orchfs_log_stream", None)
